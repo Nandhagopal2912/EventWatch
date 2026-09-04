@@ -51,14 +51,31 @@ Stop either service with `Ctrl+C`.
 Send a `GET` request to the Go ingress with PowerShell:
 
 ```powershell
-curl.exe "http://localhost:8082/capture?level=ERROR&msg=Database%20connection%20failed"
+curl.exe "http://localhost:8082/capture?level=ERROR&msg=Database%20transaction%20deadlock"
+```
+
+More examples:
+
+```powershell
+curl.exe "http://localhost:8082/capture?level=ERROR&msg=Unauthorized%20API%20access%20attempt"
+curl.exe "http://localhost:8082/capture?level=INFO&msg=User%20login%20successful"
 ```
 
 The Go service forwards the event to Java. The Java terminal displays the total number of processed logs and counts repeated `ERROR` messages.
 
 If `level` or `msg` is omitted, the Go service uses `INFO` and `Default cloud event` respectively.
 
-The Java `/receive` endpoint is intended for the Go service and expects URL-encoded `POST` data with `level` and `msg` fields.
+The Java `/receive` endpoint is intended for the Go service and receives JSON with `level`, `msg`, and `timestamp` fields.
+
+## Run the stress test
+
+After both services are running, send 500 test requests through the Go service:
+
+```powershell
+curl.exe http://localhost:8082/stress
+```
+
+The stress handler adds a unique `(Log #N)` suffix to each message. Because the Java dashboard groups by the complete message, each generated message currently appears with a count of `1`.
 
 ## Notes
 

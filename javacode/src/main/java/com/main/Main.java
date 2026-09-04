@@ -7,6 +7,8 @@ import java.net.InetSocketAddress;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 
+import com.fasterxml.jackson.databind.*;
+
 import java.util.*;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.stream.Collectors;
@@ -37,10 +39,14 @@ public class Main {
                     String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
 
                     // String the information from the body we got from the request using a helper
-                    // function parseQuery.
-                    Map<String, String> params = parseQuery(body);
-                    String level = params.getOrDefault("level", "INFO");
-                    String msg = params.getOrDefault("msg", "Unknown Event");
+                    // extractJsonValue
+                    ObjectMapper objectMapper = new ObjectMapper();
+                    JsonNode json = objectMapper.readTree(body);
+
+                    String level = json.path("level").asText("INFO");
+                    String msg = json.path("msg").asText("Unknown Event");
+
+
 
                     // Store the logs in a temporory storage.
                     logStorage.add(new LogEntry(level, msg));
@@ -101,18 +107,17 @@ public class Main {
 
     }
 
-    // helper for parse Incoming parameters
-    private static Map<String, String> parseQuery(String query) {
-        Map<String, String> result = new HashMap<>();
-        for (String param : query.split("&")) {
-            String[] entry = param.split("=");
-            if (entry.length > 1) {
-                result.put(
-                        URLDecoder.decode(entry[0], StandardCharsets.UTF_8),
-                        URLDecoder.decode(entry[1], StandardCharsets.UTF_8));
-            }
-        }
-        return result;
-    }
+    // // helper for extracting string values out of a simple json falt string
+
+    // private static String extractJsonValue(String json , String key){
+    //     try{
+    //         String pattern = "\"" + key + "\":\"";
+    //         int start = json.indexOf(pattern)+pattern.length();
+    //         int end = json.indexOf("\"", start);
+    //         return json.substring(start, end);
+    //     } catch(Exception e){
+    //         return "Unknown";
+    //     }
+    // }
 
 }
