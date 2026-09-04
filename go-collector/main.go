@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+
+	"github.com/shirou/gopsutil/v4/cpu"
+	"github.com/shirou/gopsutil/v4/mem"
 )
 
 // java backend url
@@ -14,9 +17,25 @@ const javaBackendURL = "http://localhost:8080/receive"
 
 // Payload Structure
 type LogPayload struct {
-	Level    string `json:"level"`
-	Messages string `json:"msg"`
-	Time     string `json:"timestamp"`
+	Level    string  `json:"level"`
+	Messages string  `json:"msg"`
+	Time     string  `json:"timestamp"`
+	CPUUsage float64 `json:"cpu_usage"`
+	RAMUsage float64 `json:"ram_usage"`
+}
+
+func readHostMetrics() (float64, float64, error) {
+	cpuPercent, err := cpu.Percent(100*time.Millisecond, false)
+	if err != nil || len(cpuPercent) == 0 {
+		return 0, 0, fmt.Errorf("read CPU usage: %w", err)
+	}
+
+	memory, err := mem.VirtualMemory()
+	if err != nil {
+		return 0, 0, fmt.Errorf("read memory usage: %w", err)
+	}
+
+	return cpuPercent[0], memory.UsedPercent, nil
 }
 
 func logHandler(w http.ResponseWriter, r *http.Request) {
@@ -37,6 +56,11 @@ func logHandler(w http.ResponseWriter, r *http.Request) {
 	if msg == "" {
 		msg = "Default cloud event"
 	}
+	cpuUsage, ramUsage, err := readHostMetrics()
+	if err != nil {
+		http.Error(w, "Host metrics unavailable", http.StatusInternalServerError)
+		return
+	}
 
 	fmt.Printf("[%s]  🐹 Go Ingress: Captured log (%s , %s)\n", time.Now().Format("15:04:05"), level, msg)
 
@@ -45,6 +69,8 @@ func logHandler(w http.ResponseWriter, r *http.Request) {
 		Level:    level,
 		Messages: msg,
 		Time:     time.Now().Format(time.RFC3339),
+		CPUUsage: cpuUsage,
+		RAMUsage: ramUsage,
 	}
 	//convert the go struct into a raw JSON byte array
 
@@ -89,6 +115,11 @@ func stressHandler(w http.ResponseWriter, r *http.Request) {
 		"Unauthorized API access attempt",
 		"Out of memory error in payment service",
 	}
+	cpuUsage, ramUsage, err := readHostMetrics()
+	if err != nil {
+		http.Error(w, "Host metrics unavailable", http.StatusInternalServerError)
+		return
+	}
 
 	for i := 0; i < 500; i++ {
 		errorMsg := fakeErrors[i%3]
@@ -97,6 +128,8 @@ func stressHandler(w http.ResponseWriter, r *http.Request) {
 			Level:    "ERROR",
 			Messages: fmt.Sprintf("%s (Log #%d)", errorMsg, i),
 			Time:     time.Now().Format(time.RFC3339),
+			CPUUsage: cpuUsage,
+			RAMUsage: ramUsage,
 		}
 		jsonBytes, _ := json.Marshal(payload)
 		go func(data []byte) {

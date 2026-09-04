@@ -1,0 +1,7 @@
+[ {
+  "level" : "ERROR",
+  "msg" : "Disk usage high",
+  "timestamp" : "2026-09-04T20:26:40+05:30",
+  "cpu_usage" : 0,
+  "ram_usage" : 68
+} ]
