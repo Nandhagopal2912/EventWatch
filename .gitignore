@@ -3,3 +3,4 @@ java-analytics/target/
 java-analytics/events.db
 java-analytics/events.db-shm
 java-analytics/events.db-wal
+.env

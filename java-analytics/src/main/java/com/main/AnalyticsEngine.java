@@ -7,20 +7,45 @@ import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.sql.*;
+import java.security.MessageDigest;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.*;
+import io.github.cdimascio.dotenv.Dotenv;
 
 import java.util.*;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 public class AnalyticsEngine {
     private static final int MOVING_AVERAGE_WINDOW = 5;
     private static final int MAX_REQUEST_BYTES = 64 * 1024;
+    private static final int MAX_MESSAGE_LENGTH = 1000;
+    private static final int MAX_REQUESTS_PER_MINUTE = 100;
     private static final String DATABASE_URL = "jdbc:sqlite:events.db";
+    private static String apiKey;
 
     private static final List<LogEntry> logStorage = new CopyOnWriteArrayList<>();
+    private static final Map<String, RateWindow> rateWindows = new ConcurrentHashMap<>();
+
+    private static class RateWindow {
+        long startedAt = System.currentTimeMillis();
+        int requestCount;
+
+        synchronized boolean allow() {
+            long now = System.currentTimeMillis();
+            if (now - startedAt >= 60_000) {
+                startedAt = now;
+                requestCount = 0;
+            }
+            if (requestCount >= MAX_REQUESTS_PER_MINUTE) {
+                return false;
+            }
+            requestCount++;
+            return true;
+        }
+    }
 
     static class LogEntry {
         String level;
@@ -39,6 +64,16 @@ public class AnalyticsEngine {
     }
 
     public static void main(String[] args) throws IOException {
+        // Load the shared secret before opening the ingestion endpoint.
+        Dotenv dotenv = Dotenv.configure()
+                .directory("..")
+                .ignoreIfMissing()
+                .load();
+        apiKey = dotenv.get("EVENTWATCH_API_KEY", System.getenv("EVENTWATCH_API_KEY"));
+        if (apiKey == null || apiKey.isBlank()) {
+            throw new IOException("EVENTWATCH_API_KEY is required");
+        }
+
         try {
             initializeDatabase();
             loadStoredEvents();
@@ -52,6 +87,24 @@ public class AnalyticsEngine {
             @Override
             public void handle(HttpExchange exchange) throws IOException {
                 if ("POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+                    // Authenticate and reject abusive requests before parsing or storing data.
+                    String receivedKey = exchange.getRequestHeaders().getFirst("X-EventWatch-Key");
+                    if (!isValidApiKey(receivedKey)) {
+                        sendResponse(exchange, 401, "Unauthorized");
+                        return;
+                    }
+                    String clientAddress = exchange.getRemoteAddress().getAddress().getHostAddress();
+                    if (!rateWindows.computeIfAbsent(clientAddress, key -> new RateWindow()).allow()) {
+                        sendResponse(exchange, 429, "Rate limit exceeded");
+                        return;
+                    }
+
+                    String contentType = exchange.getRequestHeaders().getFirst("Content-Type");
+                    if (contentType == null || !contentType.toLowerCase(Locale.ROOT).startsWith("application/json")) {
+                        sendResponse(exchange, 415, "Content-Type must be application/json");
+                        return;
+                    }
+
                     byte[] bodyBytes = exchange.getRequestBody().readNBytes(MAX_REQUEST_BYTES + 1);
                     if (bodyBytes.length > MAX_REQUEST_BYTES) {
                         sendResponse(exchange, 413, "Request body too large");
@@ -59,8 +112,6 @@ public class AnalyticsEngine {
                     }
                     String body = new String(bodyBytes, StandardCharsets.UTF_8);
 
-                    // String the information from the body we got from the request using a helper
-                    // extractJsonValue
                     ObjectMapper objectMapper = new ObjectMapper();
                     JsonNode json;
                     try {
@@ -74,11 +125,17 @@ public class AnalyticsEngine {
                         return;
                     }
 
-                    String level = json.path("level").asText("INFO");
-                    String msg = json.path("msg").asText("Unknown Event");
-                    Instant timestamp = parseTimestamp(json.path("timestamp").asText(null));
-                    double cpuUsage = json.path("cpu_usage").asDouble(0.0);
-                    double ramUsage = json.path("ram_usage").asDouble(0.0);
+                    String validationError = validateEvent(json);
+                    if (validationError != null) {
+                        sendResponse(exchange, 400, validationError);
+                        return;
+                    }
+
+                    String level = json.path("level").asText().toUpperCase(Locale.ROOT);
+                    String msg = json.path("msg").asText();
+                    Instant timestamp = Instant.parse(json.path("timestamp").asText());
+                    double cpuUsage = json.path("cpu_usage").asDouble();
+                    double ramUsage = json.path("ram_usage").asDouble();
 
                     try {
                         storeEvent(new LogEntry(level, msg, timestamp, cpuUsage, ramUsage));
@@ -87,10 +144,8 @@ public class AnalyticsEngine {
                         return;
                     }
 
-                    // generate the dashborad in terminal using a helper function.
                     generateDashboardReport();
 
-                    // Send a success message to the browser or endpoint.
                     sendResponse(exchange, 200, "Log processed successfully");
                 }
 
@@ -117,29 +172,54 @@ public class AnalyticsEngine {
         }
     }
 
-    // helper function to create the dashbord
+    private static String validateEvent(JsonNode json) {
+        Set<String> allowedLevels = Set.of("INFO", "WARN", "ERROR", "CRITICAL");
+        if (!json.hasNonNull("level") || !json.path("level").isTextual()
+                || !allowedLevels.contains(json.path("level").asText().toUpperCase(Locale.ROOT))) {
+            return "level must be INFO, WARN, ERROR, or CRITICAL";
+        }
+        if (!json.hasNonNull("msg") || !json.path("msg").isTextual()) {
+            return "msg must be a text value";
+        }
+        String message = json.path("msg").asText();
+        if (message.isBlank() || message.length() > MAX_MESSAGE_LENGTH) {
+            return "msg must contain 1-1000 characters";
+        }
+        if (!json.hasNonNull("timestamp") || !json.path("timestamp").isTextual()) {
+            return "timestamp must be an ISO-8601 value";
+        }
+        try {
+            Instant.parse(json.path("timestamp").asText());
+        } catch (RuntimeException exception) {
+            return "timestamp must be an ISO-8601 value";
+        }
+        if (!isValidPercentage(json, "cpu_usage") || !isValidPercentage(json, "ram_usage")) {
+            return "cpu_usage and ram_usage must be numbers between 0 and 100";
+        }
+        return null;
+    }
+
+    private static boolean isValidPercentage(JsonNode json, String fieldName) {
+        if (!json.hasNonNull(fieldName) || !json.path(fieldName).isNumber()) {
+            return false;
+        }
+        double value = json.path(fieldName).asDouble();
+        return Double.isFinite(value) && value >= 0 && value <= 100;
+    }
 
     private static void generateDashboardReport() {
-        // 1.Filter out non-errors
-        // 2.Group by messages text
-        // 3.Count occurences of each error
-
         Map<String, Long> errorCounts = logStorage.stream()
                 .filter(log -> "ERROR".equalsIgnoreCase(log.level))
                 .collect(Collectors.groupingBy(log -> log.message, Collectors.counting()));
 
-        // Get the total count of logs processed
-
         long totalProcessed = logStorage.size();
         List<LogEntry> logSnapshot = new ArrayList<>(logStorage);
+        // Limit the trend calculation to the most recent events.
         int windowStart = Math.max(0, logSnapshot.size() - MOVING_AVERAGE_WINDOW);
         List<LogEntry> recentLogs = logSnapshot.subList(windowStart, logSnapshot.size());
         double averageCpu = recentLogs.stream().mapToDouble(log -> log.cpuUsage).average().orElse(0.0);
         double averageRam = recentLogs.stream().mapToDouble(log -> log.ramUsage).average().orElse(0.0);
 
-        // Print the dashboard in terminal
-
-        // Print the dashboard directly to the terminal
         System.out.println("\n================ LIVE CLOUD ALERT DASHBOARD ================");
         System.out.println("Total Logs Processed (All Types): " + totalProcessed);
         System.out.printf("Last %d-event average: CPU %.1f%% | RAM %.1f%%%n",
@@ -156,6 +236,7 @@ public class AnalyticsEngine {
     }
 
     private static void initializeDatabase() throws SQLException {
+        // Create the schema on first startup so no manual database setup is required.
         try (Connection connection = DriverManager.getConnection(DATABASE_URL);
                 Statement statement = connection.createStatement()) {
             statement.executeUpdate("""
@@ -173,6 +254,7 @@ public class AnalyticsEngine {
     }
 
     private static void loadStoredEvents() throws SQLException {
+        // Rebuild the in-memory analytics window from durable SQLite records.
         String query = "SELECT level, message, event_timestamp, cpu_usage, ram_usage "
                 + "FROM telemetry_events ORDER BY id";
         try (Connection connection = DriverManager.getConnection(DATABASE_URL);
@@ -190,6 +272,8 @@ public class AnalyticsEngine {
     }
 
     private static synchronized void storeEvent(LogEntry event) throws SQLException {
+        // Commit to SQLite before adding the event to memory, preventing acknowledged
+        // data loss.
         String query = "INSERT INTO telemetry_events "
                 + "(level, message, event_timestamp, cpu_usage, ram_usage) VALUES (?, ?, ?, ?, ?)";
         try (Connection connection = DriverManager.getConnection(DATABASE_URL);
@@ -213,6 +297,12 @@ public class AnalyticsEngine {
         try (OutputStream output = exchange.getResponseBody()) {
             output.write(responseBytes);
         }
+    }
+
+    private static boolean isValidApiKey(String receivedKey) {
+        return receivedKey != null && MessageDigest.isEqual(
+                apiKey.getBytes(StandardCharsets.UTF_8),
+                receivedKey.getBytes(StandardCharsets.UTF_8));
     }
 
 }

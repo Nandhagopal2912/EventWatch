@@ -5,17 +5,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"time"
 
+	"github.com/joho/godotenv"
 	"github.com/shirou/gopsutil/v4/cpu"
 	"github.com/shirou/gopsutil/v4/mem"
 )
 
-// java backend url
-
-const javaBackendURL = "http://localhost:8080/receive"
-
-// Payload Structure
+// LogPayload is the JSON contract shared with the Java analytics service.
 type LogPayload struct {
 	Level    string  `json:"level"`
 	Messages string  `json:"msg"`
@@ -23,6 +21,8 @@ type LogPayload struct {
 	CPUUsage float64 `json:"cpu_usage"`
 	RAMUsage float64 `json:"ram_usage"`
 }
+
+const maxBackendAttempts = 3
 
 func readHostMetrics() (float64, float64, error) {
 	cpuPercent, err := cpu.Percent(100*time.Millisecond, false)
@@ -39,14 +39,13 @@ func readHostMetrics() (float64, float64, error) {
 }
 
 func logHandler(w http.ResponseWriter, r *http.Request) {
-	//allow only the get method
+	// The public collector endpoint accepts query parameters and creates a telemetry event.
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed",
 			http.StatusMethodNotAllowed)
 		return
 	}
 
-	//Extract the parameters from the http Request
 	level := r.URL.Query().Get("level")
 	msg := r.URL.Query().Get("msg")
 
@@ -64,7 +63,6 @@ func logHandler(w http.ResponseWriter, r *http.Request) {
 
 	fmt.Printf("[%s]  🐹 Go Ingress: Captured log (%s , %s)\n", time.Now().Format("15:04:05"), level, msg)
 
-	//creating the payload for the respones
 	payload := LogPayload{
 		Level:    level,
 		Messages: msg,
@@ -72,8 +70,6 @@ func logHandler(w http.ResponseWriter, r *http.Request) {
 		CPUUsage: cpuUsage,
 		RAMUsage: ramUsage,
 	}
-	//convert the go struct into a raw JSON byte array
-
 	jsonBytes, err := json.Marshal(payload)
 
 	if err != nil {
@@ -82,8 +78,7 @@ func logHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	//send the data to java as "application/json"
-	resp, err := http.Post(javaBackendURL, "application/json", bytes.NewBuffer(jsonBytes))
+	resp, err := forwardToJava(jsonBytes)
 
 	if err != nil {
 		fmt.Printf("❌ Error forwarding to Java: %v\n", err)
@@ -133,7 +128,7 @@ func stressHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		jsonBytes, _ := json.Marshal(payload)
 		go func(data []byte) {
-			resp, err := http.Post(javaBackendURL, "application/json", bytes.NewBuffer(data))
+			resp, err := forwardToJava(data)
 
 			if err == nil {
 				resp.Body.Close()
@@ -145,7 +140,22 @@ func stressHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	// Set up the Go server
+	// Both services read the same root .env file for local configuration.
+	_ = godotenv.Load("../.env", ".env")
+	javaBackendURL := os.Getenv("JAVA_BACKEND_URL")
+	if javaBackendURL == "" {
+		javaBackendURL = "http://localhost:8080/receive"
+	}
+	apiKey := os.Getenv("EVENTWATCH_API_KEY")
+	if apiKey == "" {
+		fmt.Println("EVENTWATCH_API_KEY is required")
+		return
+	}
+
+	backendClient = &http.Client{Timeout: 5 * time.Second}
+	configuredBackendURL = javaBackendURL
+	configuredAPIKey = apiKey
+
 	http.HandleFunc("/capture", logHandler)
 
 	http.HandleFunc("/stress", stressHandler)
@@ -156,4 +166,37 @@ func main() {
 	if err := http.ListenAndServe(":8082", nil); err != nil {
 		fmt.Printf("Server failed to start: %v\n", err)
 	}
+}
+
+var backendClient *http.Client
+var configuredBackendURL string
+var configuredAPIKey string
+
+func forwardToJava(jsonBytes []byte) (*http.Response, error) {
+	var lastError error
+	for attempt := 1; attempt <= maxBackendAttempts; attempt++ {
+		// Retry only transient transport/server failures; client errors are returned immediately.
+		request, err := http.NewRequest(http.MethodPost, configuredBackendURL, bytes.NewReader(jsonBytes))
+		if err != nil {
+			return nil, err
+		}
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("X-EventWatch-Key", configuredAPIKey)
+
+		response, err := backendClient.Do(request)
+		if err == nil && response.StatusCode < http.StatusInternalServerError {
+			return response, nil
+		}
+		if response != nil {
+			response.Body.Close()
+			lastError = fmt.Errorf("Java backend returned status %d", response.StatusCode)
+		} else {
+			lastError = err
+		}
+
+		if attempt < maxBackendAttempts {
+			time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
+		}
+	}
+	return nil, lastError
 }

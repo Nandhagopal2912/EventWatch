@@ -50,27 +50,28 @@ To guarantee data integrity across both language ecosystems, Go and Java communi
 - **Concurrent Writes:** Database writes are serialized and committed before events are added to the in-memory analytics window.
 - **Known Limitation:** The current Go stress route still launches 500 requests without bounded retries or a durable queue; that is a post-Phase 3 reliability task.
 
-### 🟦 Post-Phase 3: Production-Ready Improvements
+### 🟦 Phase 4–11: Production-Ready Roadmap
 
-The following roadmap turns the learning project into a usable monitoring and alerting system. Implement each stage in order, keeping the Go and Java JSON contract backward-compatible.
+The following phases turn the learning project into a usable monitoring and alerting system. Implement them in order, keeping the Go and Java JSON contract backward-compatible.
 
-#### 1. Security and Input Protection
+#### Phase 4: Security and Input Protection (Completed)
 
-- Require an API key or JWT for collector-to-analytics requests.
-- Add HTTPS/TLS for network communication.
-- Validate required fields, allowed log levels, numeric ranges, timestamps, and maximum message size.
-- Add rate limiting per client and reject oversized request bodies.
-- Move ports, database paths, credentials, and thresholds into environment variables or configuration files.
+- Shared `.env` configuration is loaded by both services.
+- Go sends an API key and Java validates it using constant-time comparison.
+- Java validates required fields, allowed log levels, numeric ranges, timestamps, content type, and maximum message size.
+- Java applies a per-client rate limit of 100 requests per minute.
+- Go uses a five-second timeout and up to three bounded retries for temporary backend failures.
+- HTTPS/TLS remains a deployment task for communication outside localhost.
 
-#### 2. Reliability and Failure Handling
+#### Phase 5: Reliability and Failure Handling
 
 - Add `/health` endpoints to both services.
-- Add Go request timeouts, bounded retries, and a local queue for temporary Java outages.
+- Add a durable local queue for events collected during temporary Java outages.
 - Add Java backpressure and bounded worker queues so traffic cannot exhaust memory.
 - Return consistent JSON error responses with HTTP status codes.
 - Make database writes transactional and handle shutdown signals gracefully.
 
-#### 3. Analytics and Alert Rules
+#### Phase 6: Analytics and Alert Rules
 
 - Define configurable thresholds for CPU, RAM, error frequency, and repeated failures.
 - Detect sustained conditions using time windows instead of alerting on a single spike.
@@ -78,27 +79,27 @@ The following roadmap turns the learning project into a usable monitoring and al
 - Record hostname, service name, environment, and correlation ID in every event.
 - Provide queries for recent events, historical trends, and active alerts.
 
-#### 4. Query API and Dashboard
+#### Phase 7: Query API and Dashboard
 
 - Add a Java REST API for querying events and alerts by time, severity, host, and service.
 - Build a web dashboard showing current CPU/RAM values, moving averages, recent errors, and active alerts.
 - Add charts for time-series trends and controls for filtering and time ranges.
 - Add an alert acknowledgement workflow so operators can track incidents.
 
-#### 5. Notifications
+#### Phase 8: Notifications
 
 - Add email, webhook, Slack, or Microsoft Teams notifications.
 - Notify only when an alert changes state or passes its cooldown period.
 - Record notification attempts, delivery status, and failures.
 
-#### 6. Observability of EventWatch
+#### Phase 9: Observability of EventWatch
 
 - Use structured JSON logs in both services.
 - Expose Prometheus metrics such as received events, rejected events, processing latency, queue depth, and database failures.
 - Add OpenTelemetry tracing across Go ingestion and Java processing.
 - Include a request or correlation ID in logs and responses.
 
-#### 7. Testing and Delivery
+#### Phase 10: Testing and Delivery
 
 - Add Go unit tests for metric collection, request validation, retries, and queue behavior.
 - Add Java unit tests for parsing, moving averages, alert thresholds, deduplication, and persistence.
@@ -106,7 +107,7 @@ The following roadmap turns the learning project into a usable monitoring and al
 - Add load tests for `/stress` and failure tests for unavailable services and corrupted input.
 - Add Dockerfiles, Docker Compose, and CI checks for tests, formatting, dependency vulnerabilities, and builds.
 
-#### 8. Scaling Beyond SQLite
+#### Phase 11: Scaling Beyond SQLite
 
 - Keep SQLite for a single-host deployment and development.
 - Move to PostgreSQL or a time-series database when multiple collectors or long retention are required.
@@ -115,14 +116,13 @@ The following roadmap turns the learning project into a usable monitoring and al
 
 ## Recommended Implementation Order
 
-1. Finish SQLite persistence and database migrations.
-2. Add input validation, health endpoints, timeouts, and consistent errors.
-3. Implement configurable alert rules, deduplication, and alert state transitions.
-4. Add the query API and a basic dashboard.
-5. Add notifications and notification history.
-6. Add authentication, TLS, rate limiting, and secret management.
-7. Add tests, Docker, CI, metrics, and tracing.
-8. Introduce a message queue or larger database only when measured load requires it.
+1. Complete Phase 5: reliability and failure handling.
+2. Complete Phase 6: configurable alert rules and alert state transitions.
+3. Complete Phase 7: query API and dashboard.
+4. Complete Phase 8: notifications and notification history.
+5. Complete Phase 9: metrics, logs, and tracing.
+6. Complete Phase 10: tests, Docker, and CI/CD.
+7. Complete Phase 11: scaling beyond SQLite when measured load requires it.
 
 ## Intended Real-World Use Case
 

@@ -2,15 +2,23 @@
 
 EventWatch is a two-service host telemetry and event-monitoring pipeline. A Go collector captures application events together with CPU and RAM usage, then forwards them to a Java analytics engine for processing, persistence, and reporting.
 
-The current implementation completes Phases 1–3. Future improvements are documented in `agent.md`.
+The current implementation completes Phases 1–4. Future improvements are documented in `agent.md`.
 
-## Current Phase Status
+## Project Phase Status
 
-| Phase       | Focus                        | Completed capabilities                                                                                                                  | Result                                                    |
-| ----------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------- |
-| **Phase 1** | JSON event pipeline          | Go-to-Java HTTP forwarding, JSON parsing, error filtering, grouped error counts, and a 500-event stress route                           | Events move successfully between both services            |
-| **Phase 2** | Host telemetry and analytics | Live CPU/RAM collection, timestamps, five-event moving averages, and the intermediate JSON archive                                      | The dashboard shows recent system health trends           |
-| **Phase 3** | Persistence and hardening    | SQLite storage, transactional inserts, startup recovery, malformed JSON handling, request-size limits, and correct HTTP error responses | Events survive restarts and invalid requests are rejected |
+| Phase        | Status           | Focus                            | Scope / outcome                                                                                                                                       |
+| ------------ | ---------------- | -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Phase 1**  | **✅ Completed** | JSON event pipeline              | Go-to-Java HTTP forwarding, JSON parsing, error filtering, grouped error counts, and a 500-event stress route.                                        |
+| **Phase 2**  | **✅ Completed** | Host telemetry and analytics     | Live CPU/RAM collection, timestamps, five-event moving averages, and the intermediate JSON archive.                                                   |
+| **Phase 3**  | **✅ Completed** | Persistence and hardening        | SQLite storage, transactional inserts, startup recovery, malformed JSON handling, request-size limits, and correct HTTP error responses.              |
+| **Phase 4**  | **✅ Completed** | Security and input protection    | Dotenv configuration, API-key authentication, JSON validation, content-type checks, request limits, per-client rate limiting, and bounded Go retries. |
+| **Phase 5**  | 🗓️ Planned       | Reliability and failure handling | Health endpoints, durable local queuing, backpressure, consistent errors, and graceful shutdown.                                                      |
+| **Phase 6**  | 🗓️ Planned       | Analytics and alert rules        | Configurable thresholds, sustained-condition detection, deduplication, cooldowns, and alert states.                                                   |
+| **Phase 7**  | 🗓️ Planned       | Query API and dashboard          | Searchable event APIs, charts, resource trends, active alerts, and alert acknowledgement.                                                             |
+| **Phase 8**  | 🗓️ Planned       | Notifications                    | Email and webhook integrations with delivery tracking and duplicate-alert prevention.                                                                 |
+| **Phase 9**  | 🗓️ Planned       | Observability                    | Structured logs, Prometheus metrics, OpenTelemetry tracing, and correlation IDs.                                                                      |
+| **Phase 10** | 🗓️ Planned       | Testing and delivery             | Unit, integration, load, and failure tests plus Docker and CI/CD automation.                                                                          |
+| **Phase 11** | 🗓️ Planned       | Scaling beyond SQLite            | PostgreSQL or time-series storage, durable messaging, and independently scalable services when required.                                              |
 
 **Current state:** EventWatch is a working local telemetry and event-monitoring system. Go collects and forwards events, Java analyzes and persists them, and the terminal dashboard reports errors and recent resource averages.
 
@@ -38,6 +46,8 @@ java-analytics/                 Maven Java analytics service
 - Apache Maven
 - Internet access on the first Maven/Go dependency download
 
+The repository root contains a local `.env` file with the shared API key and Java backend URL. It is ignored by Git. Copy `.env.example` to `.env` and change the values when setting up a new checkout.
+
 ## Run
 
 Start the Java service first with Maven:
@@ -54,7 +64,7 @@ cd go-collector
 go run .
 ```
 
-Both services must remain running. The Go service listens on port `8082`; the Java service listens on port `8080`.
+Both services load the root `.env` file automatically and must remain running. The Go service listens on port `8082`; the Java service listens on port `8080`. The Go collector sends `X-EventWatch-Key`, and Java rejects requests with a missing or incorrect key.
 
 Stop either service with `Ctrl+C`.
 
@@ -96,5 +106,5 @@ The stress handler adds a unique `(Log #N)` suffix to each message. Because the 
 - Telemetry is stored in `java-analytics/events.db` and loaded when the Java service restarts.
 - `alerts_history.json` is a legacy Phase 2 archive and is no longer written by the service.
 - Maven build output and the runtime SQLite database are generated files and should not be committed.
-- The services currently communicate over `localhost` without authentication.
+- The services currently communicate over `localhost`; HTTPS/TLS remains a future deployment task.
 - Future improvements and the long-term roadmap are documented in `agent.md`.
