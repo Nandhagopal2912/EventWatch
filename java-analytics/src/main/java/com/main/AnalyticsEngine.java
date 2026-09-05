@@ -11,11 +11,15 @@ import java.security.MessageDigest;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.*;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.cdimascio.dotenv.Dotenv;
 
 import java.util.*;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 public class AnalyticsEngine {
@@ -23,7 +27,11 @@ public class AnalyticsEngine {
     private static final int MAX_REQUEST_BYTES = 64 * 1024;
     private static final int MAX_MESSAGE_LENGTH = 1000;
     private static final int MAX_REQUESTS_PER_MINUTE = 100;
+    private static final int WORKER_THREADS = 8;
+    private static final int WORK_QUEUE_CAPACITY = 500;
     private static final String DATABASE_URL = "jdbc:sqlite:events.db";
+    private static final String DATABASE_UNIQUE_INDEX = "idx_telemetry_events_event_id";
+    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
     private static String apiKey;
 
     private static final List<LogEntry> logStorage = new CopyOnWriteArrayList<>();
@@ -50,11 +58,13 @@ public class AnalyticsEngine {
     static class LogEntry {
         String level;
         String message;
+        String eventId;
         Instant timestamp;
         double cpuUsage;
         double ramUsage;
 
-        LogEntry(String level, String message, Instant timestamp, double cpuUsage, double ramUsage) {
+        LogEntry(String eventId, String level, String message, Instant timestamp, double cpuUsage, double ramUsage) {
+            this.eventId = eventId;
             this.level = level;
             this.message = message;
             this.timestamp = timestamp;
@@ -112,10 +122,9 @@ public class AnalyticsEngine {
                     }
                     String body = new String(bodyBytes, StandardCharsets.UTF_8);
 
-                    ObjectMapper objectMapper = new ObjectMapper();
                     JsonNode json;
                     try {
-                        json = objectMapper.readTree(body);
+                        json = OBJECT_MAPPER.readTree(body);
                     } catch (JsonProcessingException exception) {
                         sendResponse(exchange, 400, "Invalid JSON");
                         return;
@@ -131,6 +140,7 @@ public class AnalyticsEngine {
                         return;
                     }
 
+                    String eventId = json.path("event_id").asText();
                     String level = json.path("level").asText().toUpperCase(Locale.ROOT);
                     String msg = json.path("msg").asText();
                     Instant timestamp = Instant.parse(json.path("timestamp").asText());
@@ -138,7 +148,7 @@ public class AnalyticsEngine {
                     double ramUsage = json.path("ram_usage").asDouble();
 
                     try {
-                        storeEvent(new LogEntry(level, msg, timestamp, cpuUsage, ramUsage));
+                        storeEvent(new LogEntry(eventId, level, msg, timestamp, cpuUsage, ramUsage));
                     } catch (SQLException exception) {
                         sendResponse(exchange, 503, "Database unavailable");
                         return;
@@ -157,7 +167,45 @@ public class AnalyticsEngine {
             }
         });
 
-        server.setExecutor(null); // created default executer
+        server.createContext("/health", exchange -> {
+            if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+                sendResponse(exchange, 405, "Method not allowed");
+                return;
+            }
+            try (Connection ignored = DriverManager.getConnection(DATABASE_URL)) {
+                sendJsonResponse(exchange, 200,
+                        "{\"status\":\"ok\",\"service\":\"java-analytics\","
+                                + "\"message\":\"service is healthy\"}");
+            } catch (SQLException exception) {
+                sendJsonResponse(exchange, 503,
+                        "{\"status\":\"error\",\"service\":\"java-analytics\","
+                                + "\"message\":\"database unavailable\"}");
+            }
+        });
+
+        // Bound worker threads and queued requests to apply backpressure during spikes.
+        ThreadPoolExecutor requestExecutor = new ThreadPoolExecutor(
+                WORKER_THREADS,
+                WORKER_THREADS,
+                0L,
+                TimeUnit.MILLISECONDS,
+                new ArrayBlockingQueue<>(WORK_QUEUE_CAPACITY),
+                new ThreadPoolExecutor.CallerRunsPolicy());
+        server.setExecutor(requestExecutor);
+
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            System.out.println("Shutting down Java analytics engine...");
+            server.stop(5);
+            requestExecutor.shutdown();
+            try {
+                if (!requestExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+                    requestExecutor.shutdownNow();
+                }
+            } catch (InterruptedException exception) {
+                requestExecutor.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
+        }));
 
         System.out.println("Waiting for logs....(Test with one or two entries first)\n");
 
@@ -174,6 +222,10 @@ public class AnalyticsEngine {
 
     private static String validateEvent(JsonNode json) {
         Set<String> allowedLevels = Set.of("INFO", "WARN", "ERROR", "CRITICAL");
+        if (!json.hasNonNull("event_id") || !json.path("event_id").isTextual()
+                || json.path("event_id").asText().isBlank() || json.path("event_id").asText().length() > 128) {
+            return "event_id must contain 1-128 characters";
+        }
         if (!json.hasNonNull("level") || !json.path("level").isTextual()
                 || !allowedLevels.contains(json.path("level").asText().toUpperCase(Locale.ROOT))) {
             return "level must be INFO, WARN, ERROR, or CRITICAL";
@@ -242,6 +294,7 @@ public class AnalyticsEngine {
             statement.executeUpdate("""
                     CREATE TABLE IF NOT EXISTS telemetry_events (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        event_id TEXT,
                         level TEXT NOT NULL,
                         message TEXT NOT NULL,
                         event_timestamp TEXT NOT NULL,
@@ -250,18 +303,28 @@ public class AnalyticsEngine {
                         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                     )
                     """);
+            try {
+                statement.executeUpdate("ALTER TABLE telemetry_events ADD COLUMN event_id TEXT");
+            } catch (SQLException exception) {
+                if (!exception.getMessage().toLowerCase(Locale.ROOT).contains("duplicate column")) {
+                    throw exception;
+                }
+            }
+            statement.executeUpdate("CREATE UNIQUE INDEX IF NOT EXISTS " + DATABASE_UNIQUE_INDEX
+                    + " ON telemetry_events(event_id) WHERE event_id IS NOT NULL");
         }
     }
 
     private static void loadStoredEvents() throws SQLException {
         // Rebuild the in-memory analytics window from durable SQLite records.
-        String query = "SELECT level, message, event_timestamp, cpu_usage, ram_usage "
+        String query = "SELECT event_id, level, message, event_timestamp, cpu_usage, ram_usage "
                 + "FROM telemetry_events ORDER BY id";
         try (Connection connection = DriverManager.getConnection(DATABASE_URL);
                 PreparedStatement statement = connection.prepareStatement(query);
                 ResultSet results = statement.executeQuery()) {
             while (results.next()) {
                 logStorage.add(new LogEntry(
+                        results.getString("event_id"),
                         results.getString("level"),
                         results.getString("message"),
                         parseTimestamp(results.getString("event_timestamp")),
@@ -274,25 +337,40 @@ public class AnalyticsEngine {
     private static synchronized void storeEvent(LogEntry event) throws SQLException {
         // Commit to SQLite before adding the event to memory, preventing acknowledged
         // data loss.
-        String query = "INSERT INTO telemetry_events "
-                + "(level, message, event_timestamp, cpu_usage, ram_usage) VALUES (?, ?, ?, ?, ?)";
+        String query = "INSERT OR IGNORE INTO telemetry_events "
+                + "(event_id, level, message, event_timestamp, cpu_usage, ram_usage) VALUES (?, ?, ?, ?, ?, ?)";
         try (Connection connection = DriverManager.getConnection(DATABASE_URL);
                 PreparedStatement statement = connection.prepareStatement(query)) {
             connection.setAutoCommit(false);
-            statement.setString(1, event.level);
-            statement.setString(2, event.message);
-            statement.setString(3, event.timestamp.toString());
-            statement.setDouble(4, event.cpuUsage);
-            statement.setDouble(5, event.ramUsage);
-            statement.executeUpdate();
+            statement.setString(1, event.eventId);
+            statement.setString(2, event.level);
+            statement.setString(3, event.message);
+            statement.setString(4, event.timestamp.toString());
+            statement.setDouble(5, event.cpuUsage);
+            statement.setDouble(6, event.ramUsage);
+            int inserted = statement.executeUpdate();
             connection.commit();
-            logStorage.add(event);
+            if (inserted > 0) {
+                logStorage.add(event);
+            }
         }
     }
 
     private static void sendResponse(HttpExchange exchange, int status, String response) throws IOException {
+        ObjectNode body = OBJECT_MAPPER.createObjectNode();
+        body.put("status", status >= 400 ? "error" : "ok");
+        body.put("message", response);
+        byte[] responseBytes = OBJECT_MAPPER.writeValueAsBytes(body);
+        exchange.getResponseHeaders().set("Content-Type", "application/json; charset=UTF-8");
+        exchange.sendResponseHeaders(status, responseBytes.length);
+        try (OutputStream output = exchange.getResponseBody()) {
+            output.write(responseBytes);
+        }
+    }
+
+    private static void sendJsonResponse(HttpExchange exchange, int status, String response) throws IOException {
         byte[] responseBytes = response.getBytes(StandardCharsets.UTF_8);
-        exchange.getResponseHeaders().set("Content-Type", "text/plain; charset=UTF-8");
+        exchange.getResponseHeaders().set("Content-Type", "application/json; charset=UTF-8");
         exchange.sendResponseHeaders(status, responseBytes.length);
         try (OutputStream output = exchange.getResponseBody()) {
             output.write(responseBytes);

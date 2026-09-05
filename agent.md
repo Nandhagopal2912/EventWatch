@@ -19,6 +19,7 @@ To guarantee data integrity across both language ecosystems, Go and Java communi
 
 ```json
 {
+  "event_id": "unique-event-id",
   "level": "ERROR",
   "msg": "High CPU Saturation Alert",
   "timestamp": "2026-09-04T18:46:00Z",
@@ -48,7 +49,7 @@ To guarantee data integrity across both language ecosystems, Go and Java communi
 - **SQLite Relational Engine:** The Java service persists telemetry transactionally in `events.db` through the SQLite JDBC driver and reloads it at startup.
 - **Request Safeguards:** The Java endpoint rejects malformed JSON, non-object JSON, oversized request bodies, and unsupported HTTP methods with appropriate status codes.
 - **Concurrent Writes:** Database writes are serialized and committed before events are added to the in-memory analytics window.
-- **Known Limitation:** The current Go stress route still launches 500 requests without bounded retries or a durable queue; that is a post-Phase 3 reliability task.
+- **Known Limitation:** The current system remains local-host oriented and does not yet provide HTTPS/TLS for multi-machine deployments.
 
 ### 🟦 Phase 4–11: Production-Ready Roadmap
 
@@ -63,13 +64,16 @@ The following phases turn the learning project into a usable monitoring and aler
 - Go uses a five-second timeout and up to three bounded retries for temporary backend failures.
 - HTTPS/TLS remains a deployment task for communication outside localhost.
 
-#### Phase 5: Reliability and Failure Handling
+#### Phase 5: Reliability and Failure Handling (Completed)
 
-- Add `/health` endpoints to both services.
-- Add a durable local queue for events collected during temporary Java outages.
-- Add Java backpressure and bounded worker queues so traffic cannot exhaust memory.
-- Return consistent JSON error responses with HTTP status codes.
-- Make database writes transactional and handle shutdown signals gracefully.
+- Add `/health` endpoints to both services. (Completed.)
+- Add a durable local queue for events collected during temporary Java outages. (Completed with atomic JSON files.)
+- Add Java backpressure and bounded worker queues so traffic cannot exhaust memory. (Completed with eight workers and a 500-request queue.)
+- Add Go queue capacity and retry interval configuration through `.env`. (Completed.)
+- Permanent 4xx queue failures move to `rejected-events`; transport errors, 5xx responses, and 429 responses remain pending.
+- Event IDs and a SQLite unique index make retry delivery idempotent. Duplicate deliveries return success without adding another row.
+- All HTTP endpoints return readable JSON responses with consistent status and message fields. (Completed.)
+- Graceful shutdown stops accepting requests, drains the Java executor, and performs a final pending-queue delivery pass in Go.
 
 #### Phase 6: Analytics and Alert Rules
 
@@ -116,13 +120,12 @@ The following phases turn the learning project into a usable monitoring and aler
 
 ## Recommended Implementation Order
 
-1. Complete Phase 5: reliability and failure handling.
-2. Complete Phase 6: configurable alert rules and alert state transitions.
-3. Complete Phase 7: query API and dashboard.
-4. Complete Phase 8: notifications and notification history.
-5. Complete Phase 9: metrics, logs, and tracing.
-6. Complete Phase 10: tests, Docker, and CI/CD.
-7. Complete Phase 11: scaling beyond SQLite when measured load requires it.
+1. Complete Phase 6: configurable alert rules and alert state transitions.
+2. Complete Phase 7: query API and dashboard.
+3. Complete Phase 8: notifications and notification history.
+4. Complete Phase 9: metrics, logs, and tracing.
+5. Complete Phase 10: tests, Docker, and CI/CD.
+6. Complete Phase 11: scaling beyond SQLite when measured load requires it.
 
 ## Intended Real-World Use Case
 

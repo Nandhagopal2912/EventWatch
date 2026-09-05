@@ -2,23 +2,23 @@
 
 EventWatch is a two-service host telemetry and event-monitoring pipeline. A Go collector captures application events together with CPU and RAM usage, then forwards them to a Java analytics engine for processing, persistence, and reporting.
 
-The current implementation completes Phases 1–4. Future improvements are documented in `agent.md`.
+The current implementation completes Phases 1–5. Future improvements are documented in `agent.md`.
 
 ## Project Phase Status
 
-| Phase        | Status           | Focus                            | Scope / outcome                                                                                                                                       |
-| ------------ | ---------------- | -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Phase 1**  | **✅ Completed** | JSON event pipeline              | Go-to-Java HTTP forwarding, JSON parsing, error filtering, grouped error counts, and a 500-event stress route.                                        |
-| **Phase 2**  | **✅ Completed** | Host telemetry and analytics     | Live CPU/RAM collection, timestamps, five-event moving averages, and the intermediate JSON archive.                                                   |
-| **Phase 3**  | **✅ Completed** | Persistence and hardening        | SQLite storage, transactional inserts, startup recovery, malformed JSON handling, request-size limits, and correct HTTP error responses.              |
-| **Phase 4**  | **✅ Completed** | Security and input protection    | Dotenv configuration, API-key authentication, JSON validation, content-type checks, request limits, per-client rate limiting, and bounded Go retries. |
-| **Phase 5**  | 🗓️ Planned       | Reliability and failure handling | Health endpoints, durable local queuing, backpressure, consistent errors, and graceful shutdown.                                                      |
-| **Phase 6**  | 🗓️ Planned       | Analytics and alert rules        | Configurable thresholds, sustained-condition detection, deduplication, cooldowns, and alert states.                                                   |
-| **Phase 7**  | 🗓️ Planned       | Query API and dashboard          | Searchable event APIs, charts, resource trends, active alerts, and alert acknowledgement.                                                             |
-| **Phase 8**  | 🗓️ Planned       | Notifications                    | Email and webhook integrations with delivery tracking and duplicate-alert prevention.                                                                 |
-| **Phase 9**  | 🗓️ Planned       | Observability                    | Structured logs, Prometheus metrics, OpenTelemetry tracing, and correlation IDs.                                                                      |
-| **Phase 10** | 🗓️ Planned       | Testing and delivery             | Unit, integration, load, and failure tests plus Docker and CI/CD automation.                                                                          |
-| **Phase 11** | 🗓️ Planned       | Scaling beyond SQLite            | PostgreSQL or time-series storage, durable messaging, and independently scalable services when required.                                              |
+| Phase        | Status           | Focus                            | Scope / outcome                                                                                                                                                                                            |
+| ------------ | ---------------- | -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Phase 1**  | **✅ Completed** | JSON event pipeline              | Go-to-Java HTTP forwarding, JSON parsing, error filtering, grouped error counts, and a 500-event stress route.                                                                                             |
+| **Phase 2**  | **✅ Completed** | Host telemetry and analytics     | Live CPU/RAM collection, timestamps, five-event moving averages, and the intermediate JSON archive.                                                                                                        |
+| **Phase 3**  | **✅ Completed** | Persistence and hardening        | SQLite storage, transactional inserts, startup recovery, malformed JSON handling, request-size limits, and correct HTTP error responses.                                                                   |
+| **Phase 4**  | **✅ Completed** | Security and input protection    | Dotenv configuration, API-key authentication, JSON validation, content-type checks, request limits, per-client rate limiting, and bounded Go retries.                                                      |
+| **Phase 5**  | **✅ Completed** | Reliability and failure handling | Go health endpoint, atomic durable JSON queue, recovery worker, queue limits, retry configuration, event-ID deduplication, Java health endpoint, bounded request execution, and consistent JSON responses. |
+| **Phase 6**  | 🗓️ Planned       | Analytics and alert rules        | Configurable thresholds, sustained-condition detection, deduplication, cooldowns, and alert states.                                                                                                        |
+| **Phase 7**  | 🗓️ Planned       | Query API and dashboard          | Searchable event APIs, charts, resource trends, active alerts, and alert acknowledgement.                                                                                                                  |
+| **Phase 8**  | 🗓️ Planned       | Notifications                    | Email and webhook integrations with delivery tracking and duplicate-alert prevention.                                                                                                                      |
+| **Phase 9**  | 🗓️ Planned       | Observability                    | Structured logs, Prometheus metrics, OpenTelemetry tracing, and correlation IDs.                                                                                                                           |
+| **Phase 10** | 🗓️ Planned       | Testing and delivery             | Unit, integration, load, and failure tests plus Docker and CI/CD automation.                                                                                                                               |
+| **Phase 11** | 🗓️ Planned       | Scaling beyond SQLite            | PostgreSQL or time-series storage, durable messaging, and independently scalable services when required.                                                                                                   |
 
 **Current state:** EventWatch is a working local telemetry and event-monitoring system. Go collects and forwards events, Java analyzes and persists them, and the terminal dashboard reports errors and recent resource averages.
 
@@ -37,6 +37,8 @@ java-analytics/                 Maven Java analytics service
 
 - **Go ingress** (`go-collector/`): accepts `GET` requests at `http://localhost:8082/capture`, samples host CPU/RAM usage, and forwards each event to the Java service.
 - **Java analytics engine** (`java-analytics/`): accepts `POST` requests at `http://localhost:8080/receive`, stores telemetry in SQLite, reloads events after restart, and prints error counts plus a five-event CPU/RAM moving average.
+- **Reliability queue** (`go-collector/pending-events/`): stores events when Java is temporarily unavailable and removes them only after a successful `2xx` response. Event IDs prevent duplicate database rows when retries occur. Permanent client failures move to `rejected-events/`.
+- **Health checks:** `GET http://localhost:8082/health` and `GET http://localhost:8080/health` report service availability without authentication.
 - **SQLite database** (`java-analytics/events.db`): stores telemetry in the `telemetry_events` table. The database is created automatically when the Java service starts.
 
 ## Requirements
@@ -66,6 +68,10 @@ go run .
 
 Both services load the root `.env` file automatically and must remain running. The Go service listens on port `8082`; the Java service listens on port `8080`. The Go collector sends `X-EventWatch-Key`, and Java rejects requests with a missing or incorrect key.
 
+Queue settings are controlled by `PENDING_EVENTS_DIR`, `QUEUE_CAPACITY`, and `QUEUE_RETRY_SECONDS` in `.env`.
+
+When Java is unavailable, the Go collector retries the request and writes the event atomically as a JSON file. A single background worker retries pending files. Successfully delivered files disappear; temporary failures remain pending; permanent `4xx` failures move to `pending-events/rejected-events/` for inspection. On shutdown, Go stops accepting requests and performs a final pending-queue delivery pass; Java drains its request executor before stopping.
+
 Stop either service with `Ctrl+C`.
 
 ## Send a log event
@@ -87,9 +93,18 @@ The Go service forwards the event to Java. The Java terminal displays the total 
 
 If `level` or `msg` is omitted, the Go service uses `INFO` and `Default cloud event` respectively.
 
-The Java `/receive` endpoint is intended for the Go service and receives JSON with `level`, `msg`, `timestamp`, `cpu_usage`, and `ram_usage` fields.
+The Java `/receive` endpoint is intended for the Go service and receives JSON with `event_id`, `level`, `msg`, `timestamp`, `cpu_usage`, and `ram_usage` fields.
 
 The Java service rejects malformed JSON, non-object JSON, request bodies larger than 64 KiB, and unsupported HTTP methods.
+
+All HTTP endpoints return JSON. Successful responses use `status: "ok"`; errors use `status: "error"` with a readable `message`. Example:
+
+```json
+{
+  "status": "ok",
+  "message": "log forwarded to analytics engine successfully"
+}
+```
 
 ## Run the stress test
 
@@ -107,4 +122,5 @@ The stress handler adds a unique `(Log #N)` suffix to each message. Because the 
 - `alerts_history.json` is a legacy Phase 2 archive and is no longer written by the service.
 - Maven build output and the runtime SQLite database are generated files and should not be committed.
 - The services currently communicate over `localhost`; HTTPS/TLS remains a future deployment task.
+- If Java is unavailable, Go returns `503` after bounded retries and saves the event in the pending JSON queue for background recovery.
 - Future improvements and the long-term roadmap are documented in `agent.md`.
