@@ -12,6 +12,7 @@ import java.security.MessageDigest;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.*;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import io.github.cdimascio.dotenv.Dotenv;
 
 import java.util.*;
@@ -33,6 +34,8 @@ public class AnalyticsEngine {
     private static final String DATABASE_UNIQUE_INDEX = "idx_telemetry_events_event_id";
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
     private static String apiKey;
+    private static AlertRepository alertRepository;
+    private static AlertEngine alertEngine;
 
     private static final List<LogEntry> logStorage = new CopyOnWriteArrayList<>();
     private static final Map<String, RateWindow> rateWindows = new ConcurrentHashMap<>();
@@ -87,6 +90,13 @@ public class AnalyticsEngine {
         try {
             initializeDatabase();
             loadStoredEvents();
+            alertRepository = new AlertRepository(DATABASE_URL);
+            alertEngine = new AlertEngine(
+                    alertRepository,
+                    MOVING_AVERAGE_WINDOW,
+                    getDoubleConfig(dotenv, "CPU_ALERT_THRESHOLD", 85.0),
+                    getDoubleConfig(dotenv, "RAM_ALERT_THRESHOLD", 80.0),
+                    getIntConfig(dotenv, "REPEATED_ERROR_THRESHOLD", 5));
         } catch (SQLException exception) {
             throw new IOException("Unable to initialize SQLite database", exception);
         }
@@ -149,6 +159,7 @@ public class AnalyticsEngine {
 
                     try {
                         storeEvent(new LogEntry(eventId, level, msg, timestamp, cpuUsage, ramUsage));
+                        alertEngine.evaluate(new ArrayList<>(logStorage));
                     } catch (SQLException exception) {
                         sendResponse(exchange, 503, "Database unavailable");
                         return;
@@ -180,6 +191,68 @@ public class AnalyticsEngine {
                 sendJsonResponse(exchange, 503,
                         "{\"status\":\"error\",\"service\":\"java-analytics\","
                                 + "\"message\":\"database unavailable\"}");
+            }
+        });
+
+        server.createContext("/alerts", exchange -> {
+            if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+                sendResponse(exchange, 405, "Method not allowed");
+                return;
+            }
+            try {
+                ArrayNode alerts = OBJECT_MAPPER.createArrayNode();
+                for (AlertRecord alert : alertRepository.findActive()) {
+                    ObjectNode alertJson = alerts.addObject();
+                    alertJson.put("alert_key", alert.getAlertKey());
+                    alertJson.put("alert_type", alert.getAlertType());
+                    alertJson.put("message", alert.getMessage());
+                    alertJson.put("status", alert.getStatus().name());
+                    alertJson.put("first_seen", alert.getFirstSeen().toString());
+                    alertJson.put("last_seen", alert.getLastSeen().toString());
+                    alertJson.put("occurrence_count", alert.getOccurrenceCount());
+                }
+                sendJsonResponse(exchange, 200, alerts.toString());
+            } catch (SQLException exception) {
+                sendResponse(exchange, 503, "Alert storage unavailable");
+            }
+        });
+
+        server.createContext("/alerts/", exchange -> {
+            if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+                sendResponse(exchange, 405, "Method not allowed");
+                return;
+            }
+            if (!isValidApiKey(exchange.getRequestHeaders().getFirst("X-EventWatch-Key"))) {
+                sendResponse(exchange, 401, "Unauthorized");
+                return;
+            }
+            String path = exchange.getRequestURI().getPath();
+            String prefix = "/alerts/";
+            String acknowledgeSuffix = "/acknowledge";
+            String resolveSuffix = "/resolve";
+            String suffix = path.endsWith(acknowledgeSuffix) ? acknowledgeSuffix : resolveSuffix;
+            if (!path.startsWith(prefix) || (!path.endsWith(acknowledgeSuffix) && !path.endsWith(resolveSuffix))) {
+                sendResponse(exchange, 404, "Alert route not found");
+                return;
+            }
+            String alertKey = path.substring(prefix.length(), path.length() - suffix.length());
+            try {
+                boolean changed;
+                String action;
+                if (acknowledgeSuffix.equals(suffix)) {
+                    changed = alertRepository.acknowledge(alertKey);
+                    action = "acknowledged";
+                } else {
+                    changed = alertRepository.resolve(alertKey, Instant.now());
+                    action = "resolved";
+                }
+                if (changed) {
+                    sendResponse(exchange, 200, "Alert " + action);
+                } else {
+                    sendResponse(exchange, 404, "Alert not found or already " + action);
+                }
+            } catch (SQLException exception) {
+                sendResponse(exchange, 503, "Alert storage unavailable");
             }
         });
 
@@ -381,6 +454,26 @@ public class AnalyticsEngine {
         return receivedKey != null && MessageDigest.isEqual(
                 apiKey.getBytes(StandardCharsets.UTF_8),
                 receivedKey.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static String getConfig(Dotenv dotenv, String name, String fallback) {
+        return dotenv.get(name, System.getenv().getOrDefault(name, fallback));
+    }
+
+    private static double getDoubleConfig(Dotenv dotenv, String name, double fallback) {
+        try {
+            return Double.parseDouble(getConfig(dotenv, name, Double.toString(fallback)));
+        } catch (NumberFormatException exception) {
+            return fallback;
+        }
+    }
+
+    private static int getIntConfig(Dotenv dotenv, String name, int fallback) {
+        try {
+            return Integer.parseInt(getConfig(dotenv, name, Integer.toString(fallback)));
+        } catch (NumberFormatException exception) {
+            return fallback;
+        }
     }
 
 }

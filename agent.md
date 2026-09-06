@@ -75,20 +75,74 @@ The following phases turn the learning project into a usable monitoring and aler
 - All HTTP endpoints return readable JSON responses with consistent status and message fields. (Completed.)
 - Graceful shutdown stops accepting requests, drains the Java executor, and performs a final pending-queue delivery pass in Go.
 
-#### Phase 6: Analytics and Alert Rules
+#### Phase 6: Analytics and Alert Rules (Completed)
 
-- Define configurable thresholds for CPU, RAM, error frequency, and repeated failures.
-- Detect sustained conditions using time windows instead of alerting on a single spike.
-- Add alert deduplication, cooldown periods, and alert states: `OPEN`, `ACKNOWLEDGED`, and `RESOLVED`.
-- Record hostname, service name, environment, and correlation ID in every event.
-- Provide queries for recent events, historical trends, and active alerts.
+- Configurable CPU, RAM, and repeated-error thresholds are loaded from `.env`.
+- The alert engine evaluates the latest five telemetry events instead of alerting on one spike.
+- SQLite stores deduplicated alert records with `OPEN`, `ACKNOWLEDGED`, and `RESOLVED` lifecycle states.
+- `GET /alerts` returns active alerts for inspection.
+- Operator acknowledgement is available through `POST /alerts/{alert_key}/acknowledge`.
+- Remaining work: cooldown policies and richer time-based queries belong to later dashboard and notification work.
 
-#### Phase 7: Query API and Dashboard
+#### Phase 7: Query API and Dashboard (Next)
 
-- Add a Java REST API for querying events and alerts by time, severity, host, and service.
-- Build a web dashboard showing current CPU/RAM values, moving averages, recent errors, and active alerts.
-- Add charts for time-series trends and controls for filtering and time ranges.
-- Add an alert acknowledgement workflow so operators can track incidents.
+Phase 7 should make the existing telemetry and alert data easy to inspect without changing the Go ingestion contract or the durable queue.
+
+##### Phase 7 Flow
+
+```text
+Browser dashboard
+  ↓
+Java query endpoints
+  ↓
+SQLite repository queries
+  ↓
+JSON event, trend, and alert data
+  ↓
+Dashboard tables, charts, and filters
+```
+
+##### Phase 7 API Surface
+
+- `GET /events`: return recent telemetry events.
+- `GET /events?level=ERROR&limit=50`: filter events by level and limit result size.
+- `GET /events?from=...&to=...`: query events by ISO-8601 time range.
+- `GET /alerts`: return active alerts, with optional status and type filters.
+- `GET /alerts/{alert_key}`: return one alert and its current lifecycle state.
+- `GET /summary`: return total events, active alert count, latest telemetry values, and moving averages.
+- Keep `POST /alerts/{alert_key}/acknowledge` and `POST /alerts/{alert_key}/resolve` as the existing operator actions.
+
+All query endpoints should return JSON, validate query parameters, apply a maximum limit, and use parameterized SQLite statements.
+
+##### Phase 7 Java Structure
+
+```text
+src/main/java/com/main/
+├── AnalyticsEngine.java       # HTTP server and request routing
+├── EventRepository.java       # Event history queries
+├── AlertRepository.java       # Alert queries and lifecycle updates
+├── QueryService.java          # Filters, summaries, and pagination rules
+└── ResponseModels.java        # JSON response DTOs when responses grow
+```
+
+If the dashboard is served separately, keep it under a distinct directory such as `dashboard/` rather than adding frontend code to the Java analytics classes.
+
+##### Phase 7 Dashboard Views
+
+- **Overview:** total events, active alerts, current CPU/RAM, and five-event averages.
+- **Events:** paginated table with level, message, timestamp, CPU, RAM, and event ID.
+- **Alerts:** active and historical alerts with acknowledge and resolve actions.
+- **Trends:** CPU/RAM charts selected by time range.
+- **Filters:** level, alert status, alert type, time range, and result limit.
+
+##### Phase 7 Completion Criteria
+
+- Query results are paginated and bounded.
+- Event and alert filters are validated and parameterized.
+- The dashboard uses the existing JSON APIs rather than reading SQLite directly.
+- Operators can inspect, acknowledge, and resolve alerts from the dashboard.
+- Empty results and invalid filters return readable JSON responses.
+- Existing Go ingestion, queue recovery, and alert evaluation continue to pass unchanged.
 
 #### Phase 8: Notifications
 
@@ -120,12 +174,11 @@ The following phases turn the learning project into a usable monitoring and aler
 
 ## Recommended Implementation Order
 
-1. Complete Phase 6: configurable alert rules and alert state transitions.
-2. Complete Phase 7: query API and dashboard.
-3. Complete Phase 8: notifications and notification history.
-4. Complete Phase 9: metrics, logs, and tracing.
-5. Complete Phase 10: tests, Docker, and CI/CD.
-6. Complete Phase 11: scaling beyond SQLite when measured load requires it.
+1. Complete Phase 7: query API and dashboard.
+2. Complete Phase 8: notifications and notification history.
+3. Complete Phase 9: metrics, logs, and tracing.
+4. Complete Phase 10: tests, Docker, and CI/CD.
+5. Complete Phase 11: scaling beyond SQLite when measured load requires it.
 
 ## Intended Real-World Use Case
 

@@ -2,7 +2,7 @@
 
 EventWatch is a two-service host telemetry and event-monitoring pipeline. A Go collector captures application events together with CPU and RAM usage, then forwards them to a Java analytics engine for processing, persistence, and reporting.
 
-The current implementation completes Phases 1–5. Future improvements are documented in `agent.md`.
+The current implementation completes Phases 1–6. Future improvements are documented in `agent.md`.
 
 ## Project Phase Status
 
@@ -13,8 +13,8 @@ The current implementation completes Phases 1–5. Future improvements are docum
 | **Phase 3**  | **✅ Completed** | Persistence and hardening        | SQLite storage, transactional inserts, startup recovery, malformed JSON handling, request-size limits, and correct HTTP error responses.                                                                   |
 | **Phase 4**  | **✅ Completed** | Security and input protection    | Dotenv configuration, API-key authentication, JSON validation, content-type checks, request limits, per-client rate limiting, and bounded Go retries.                                                      |
 | **Phase 5**  | **✅ Completed** | Reliability and failure handling | Go health endpoint, atomic durable JSON queue, recovery worker, queue limits, retry configuration, event-ID deduplication, Java health endpoint, bounded request execution, and consistent JSON responses. |
-| **Phase 6**  | 🗓️ Planned       | Analytics and alert rules        | Configurable thresholds, sustained-condition detection, deduplication, cooldowns, and alert states.                                                                                                        |
-| **Phase 7**  | 🗓️ Planned       | Query API and dashboard          | Searchable event APIs, charts, resource trends, active alerts, and alert acknowledgement.                                                                                                                  |
+| **Phase 6**  | **✅ Completed** | Analytics and alert rules        | Configurable CPU/RAM thresholds, moving-window detection, repeated-error alerts, SQLite alert state, deduplication, and the active-alerts endpoint.                                                        |
+| **Phase 7**  | 🗓️ Planned       | Query API and dashboard          | Searchable event APIs, charts, resource trends, active-alert filtering, and operator workflows.                                                                                                            |
 | **Phase 8**  | 🗓️ Planned       | Notifications                    | Email and webhook integrations with delivery tracking and duplicate-alert prevention.                                                                                                                      |
 | **Phase 9**  | 🗓️ Planned       | Observability                    | Structured logs, Prometheus metrics, OpenTelemetry tracing, and correlation IDs.                                                                                                                           |
 | **Phase 10** | 🗓️ Planned       | Testing and delivery             | Unit, integration, load, and failure tests plus Docker and CI/CD automation.                                                                                                                               |
@@ -30,7 +30,12 @@ go-collector/                   Go HTTP ingress
 	go.mod
 java-analytics/                 Maven Java analytics service
 	pom.xml
-	src/main/java/com/main/AnalyticsEngine.java
+	src/main/java/com/main/
+		AnalyticsEngine.java
+		AlertEngine.java
+		AlertRecord.java
+		AlertRepository.java
+		AlertStatus.java
 ```
 
 ## Architecture
@@ -39,7 +44,53 @@ java-analytics/                 Maven Java analytics service
 - **Java analytics engine** (`java-analytics/`): accepts `POST` requests at `http://localhost:8080/receive`, stores telemetry in SQLite, reloads events after restart, and prints error counts plus a five-event CPU/RAM moving average.
 - **Reliability queue** (`go-collector/pending-events/`): stores events when Java is temporarily unavailable and removes them only after a successful `2xx` response. Event IDs prevent duplicate database rows when retries occur. Permanent client failures move to `rejected-events/`.
 - **Health checks:** `GET http://localhost:8082/health` and `GET http://localhost:8080/health` report service availability without authentication.
+- **Alert API:** `GET http://localhost:8080/alerts` returns active `OPEN` and `ACKNOWLEDGED` alerts as JSON.
+- **Alert acknowledgement:** `POST http://localhost:8080/alerts/{alert_key}/acknowledge` changes an `OPEN` alert to `ACKNOWLEDGED`.
+- **Alert resolution:** `POST http://localhost:8080/alerts/{alert_key}/resolve` changes an alert to `RESOLVED`, removing it from the active alerts response.
+- **Phase 7 target:** add read-only event history queries and a browser dashboard without changing the ingestion or queue contracts.
 - **SQLite database** (`java-analytics/events.db`): stores telemetry in the `telemetry_events` table. The database is created automatically when the Java service starts.
+
+## End-to-End Flow
+
+```text
+Client request
+	↓
+Go collector: captures event and host CPU/RAM metrics
+	↓
+Go creates event_id and serializes the shared JSON payload
+	↓
+Authenticated HTTP request to Java
+	↓
+Java validates API key, content type, size, fields, and value ranges
+	↓
+Java commits telemetry to SQLite
+	↓
+Alert engine evaluates the latest five-event window
+	↓
+SQLite stores or updates alert state
+	↓
+JSON response and terminal dashboard output
+```
+
+If Java is temporarily unavailable, Go retries the request and writes the same event to `pending-events/`. A background worker retries those files later. A queued file is deleted only after Java returns `2xx`; permanent client errors move to `rejected-events/`.
+
+## Feature Contributions
+
+| Feature                     | What it does                                                                                      | Why it matters                                                                |
+| --------------------------- | ------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| **Host telemetry**          | Collects CPU and RAM usage with each event.                                                       | Connects application errors to the health of the machine producing them.      |
+| **Shared JSON contract**    | Uses the same `event_id`, level, message, timestamp, CPU, and RAM fields across Go and Java.      | Keeps both services interoperable and makes events easy to inspect or replay. |
+| **API-key authentication**  | Requires the configured `X-EventWatch-Key` header for Java ingestion.                             | Prevents unauthenticated clients from submitting telemetry.                   |
+| **Input validation**        | Rejects invalid JSON, fields, content types, ranges, oversized requests, and unsupported methods. | Prevents malformed data from reaching analytics or SQLite.                    |
+| **SQLite persistence**      | Stores telemetry and alert records in local tables and reloads them after restart.                | Preserves history without requiring a separate database server.               |
+| **Durable JSON queue**      | Saves events when Java is unavailable and retries them later.                                     | Prevents temporary backend outages from silently losing events.               |
+| **Event-ID deduplication**  | Uses a unique event ID in SQLite.                                                                 | Makes retries safe when Java stores an event but the response is lost.        |
+| **Bounded processing**      | Limits Java workers and queued requests.                                                          | Applies backpressure and prevents traffic spikes from exhausting memory.      |
+| **Moving-window analytics** | Evaluates the latest five events for CPU and RAM trends.                                          | Detects sustained pressure instead of reacting to one momentary spike.        |
+| **Alert engine**            | Creates and updates `HIGH_CPU`, `HIGH_RAM`, and `REPEATED_ERROR` alerts.                          | Turns raw telemetry into actionable incidents.                                |
+| **Alert lifecycle**         | Supports `OPEN`, `ACKNOWLEDGED`, and `RESOLVED` states.                                           | Shows whether an issue is new, being handled, or no longer active.            |
+| **Health endpoints**        | Reports Go availability and Java availability plus SQLite reachability.                           | Gives operators and future deployment tools a simple readiness check.         |
+| **Graceful shutdown**       | Stops new work, drains Java workers, and flushes the Go queue once.                               | Leaves the system in a recoverable state during restarts or deployments.      |
 
 ## Requirements
 
@@ -68,7 +119,7 @@ go run .
 
 Both services load the root `.env` file automatically and must remain running. The Go service listens on port `8082`; the Java service listens on port `8080`. The Go collector sends `X-EventWatch-Key`, and Java rejects requests with a missing or incorrect key.
 
-Queue settings are controlled by `PENDING_EVENTS_DIR`, `QUEUE_CAPACITY`, and `QUEUE_RETRY_SECONDS` in `.env`.
+Queue settings are controlled by `PENDING_EVENTS_DIR`, `QUEUE_CAPACITY`, and `QUEUE_RETRY_SECONDS` in `.env`. Alert settings are controlled by `CPU_ALERT_THRESHOLD`, `RAM_ALERT_THRESHOLD`, and `REPEATED_ERROR_THRESHOLD`.
 
 When Java is unavailable, the Go collector retries the request and writes the event atomically as a JSON file. A single background worker retries pending files. Successfully delivered files disappear; temporary failures remain pending; permanent `4xx` failures move to `pending-events/rejected-events/` for inspection. On shutdown, Go stops accepting requests and performs a final pending-queue delivery pass; Java drains its request executor before stopping.
 
@@ -104,6 +155,20 @@ All HTTP endpoints return JSON. Successful responses use `status: "ok"`; errors 
   "status": "ok",
   "message": "log forwarded to analytics engine successfully"
 }
+```
+
+When the configured CPU or RAM average exceeds its threshold, or an error repeats enough times within the moving window, Java creates or updates an alert in SQLite. Repeated deliveries update the existing alert instead of creating duplicate alert rows.
+
+Use the API key to acknowledge an alert:
+
+```powershell
+curl.exe -i -X POST "http://localhost:8080/alerts/cpu-high/acknowledge" -H "X-EventWatch-Key: local-secret"
+```
+
+Acknowledged alerts remain visible because they are still active. Resolve them after the underlying issue is fixed:
+
+```powershell
+curl.exe -i -X POST "http://localhost:8080/alerts/cpu-high/resolve" -H "X-EventWatch-Key: local-secret"
 ```
 
 ## Run the stress test
