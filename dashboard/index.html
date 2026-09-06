@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EventWatch Dashboard</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="header">
+      <div>
+        <p class="eyebrow">EVENTWATCH / LOCAL OPERATIONS</p>
+        <h1>Telemetry control room</h1>
+        <p class="subhead">Inspect system events, resource trends, and active alerts.</p>
+      </div>
+      <form id="config-form" class="config" autocomplete="off">
+        <label for="api-key">API key</label>
+        <input id="api-key" name="api-key" type="password" placeholder="EVENTWATCH_API_KEY">
+        <button type="submit">Connect</button>
+      </form>
+    </header>
+
+    <section id="connection" class="notice" aria-live="polite">Enter the API key to load telemetry.</section>
+
+    <section class="metrics" aria-label="Telemetry summary">
+      <article class="metric"><span>Total events</span><strong id="total-events">--</strong></article>
+      <article class="metric"><span>Active alerts</span><strong id="active-alerts">--</strong></article>
+      <article class="metric"><span>Average CPU</span><strong id="average-cpu">--</strong></article>
+      <article class="metric"><span>Average RAM</span><strong id="average-ram">--</strong></article>
+    </section>
+
+    <section class="grid">
+      <article class="panel events-panel">
+        <div class="panel-heading"><div><p class="eyebrow">RECENT TELEMETRY</p><h2>Events</h2></div><button id="refresh" class="quiet" type="button">Refresh</button></div>
+        <div class="table-wrap"><table><thead><tr><th>Level</th><th>Message</th><th>Timestamp</th><th>CPU</th><th>RAM</th></tr></thead><tbody id="events-body"></tbody></table></div>
+      </article>
+      <article class="panel alerts-panel">
+        <div class="panel-heading"><div><p class="eyebrow">RESPONSE QUEUE</p><h2>Active alerts</h2></div></div>
+        <div id="alerts-list" class="alerts-list"></div>
+      </article>
+    </section>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>

@@ -4,6 +4,7 @@ import com.sun.net.httpserver.*;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
+import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.sql.*;
@@ -36,6 +37,7 @@ public class AnalyticsEngine {
     private static String apiKey;
     private static AlertRepository alertRepository;
     private static AlertEngine alertEngine;
+    private static QueryService queryService;
 
     private static final List<LogEntry> logStorage = new CopyOnWriteArrayList<>();
     private static final Map<String, RateWindow> rateWindows = new ConcurrentHashMap<>();
@@ -97,6 +99,8 @@ public class AnalyticsEngine {
                     getDoubleConfig(dotenv, "CPU_ALERT_THRESHOLD", 85.0),
                     getDoubleConfig(dotenv, "RAM_ALERT_THRESHOLD", 80.0),
                     getIntConfig(dotenv, "REPEATED_ERROR_THRESHOLD", 5));
+            queryService = new QueryService(
+                    new EventRepository(DATABASE_URL), alertRepository, OBJECT_MAPPER, MOVING_AVERAGE_WINDOW);
         } catch (SQLException exception) {
             throw new IOException("Unable to initialize SQLite database", exception);
         }
@@ -195,21 +199,22 @@ public class AnalyticsEngine {
         });
 
         server.createContext("/alerts", exchange -> {
+            if (handleCorsPreflight(exchange)) {
+                return;
+            }
             if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
                 sendResponse(exchange, 405, "Method not allowed");
                 return;
             }
             try {
+                Map<String, String> parameters = queryParameters(exchange.getRequestURI().getRawQuery());
+                String status = optionalUpper(parameters.get("status"));
                 ArrayNode alerts = OBJECT_MAPPER.createArrayNode();
-                for (AlertRecord alert : alertRepository.findActive()) {
-                    ObjectNode alertJson = alerts.addObject();
-                    alertJson.put("alert_key", alert.getAlertKey());
-                    alertJson.put("alert_type", alert.getAlertType());
-                    alertJson.put("message", alert.getMessage());
-                    alertJson.put("status", alert.getStatus().name());
-                    alertJson.put("first_seen", alert.getFirstSeen().toString());
-                    alertJson.put("last_seen", alert.getLastSeen().toString());
-                    alertJson.put("occurrence_count", alert.getOccurrenceCount());
+                for (AlertRecord alert : alertRepository.find(null, status)) {
+                    String type = parameters.get("type");
+                    if (type == null || type.equalsIgnoreCase(alert.getAlertType())) {
+                        alerts.add(queryService.alertJson(alert));
+                    }
                 }
                 sendJsonResponse(exchange, 200, alerts.toString());
             } catch (SQLException exception) {
@@ -217,8 +222,69 @@ public class AnalyticsEngine {
             }
         });
 
+        server.createContext("/events", exchange -> {
+            if (handleCorsPreflight(exchange)) {
+                return;
+            }
+            if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+                sendResponse(exchange, 405, "Method not allowed");
+                return;
+            }
+            if (!isValidApiKey(exchange.getRequestHeaders().getFirst("X-EventWatch-Key"))) {
+                sendResponse(exchange, 401, "Unauthorized");
+                return;
+            }
+            try {
+                Map<String, String> parameters = queryParameters(exchange.getRequestURI().getRawQuery());
+                int limit = boundedInteger(parameters.get("limit"), QueryService.DEFAULT_LIMIT, QueryService.MAX_LIMIT);
+                int offset = boundedInteger(parameters.get("offset"), 0, Integer.MAX_VALUE);
+                Instant from = optionalInstant(parameters.get("from"));
+                Instant to = optionalInstant(parameters.get("to"));
+                String level = optionalUpper(parameters.get("level"));
+                if (level != null && !Set.of("INFO", "WARN", "ERROR", "CRITICAL").contains(level)) {
+                    sendResponse(exchange, 400, "level must be INFO, WARN, ERROR, or CRITICAL");
+                    return;
+                }
+                if (from != null && to != null && from.isAfter(to)) {
+                    sendResponse(exchange, 400, "from must be before to");
+                    return;
+                }
+                sendJsonResponse(exchange, 200, queryService.events(level, from, to, limit, offset).toString());
+            } catch (IllegalArgumentException exception) {
+                sendResponse(exchange, 400, exception.getMessage());
+            } catch (SQLException exception) {
+                sendResponse(exchange, 503, "Event storage unavailable");
+            }
+        });
+
+        server.createContext("/summary", exchange -> {
+            if (handleCorsPreflight(exchange)) {
+                return;
+            }
+            if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+                sendResponse(exchange, 405, "Method not allowed");
+                return;
+            }
+            if (!isValidApiKey(exchange.getRequestHeaders().getFirst("X-EventWatch-Key"))) {
+                sendResponse(exchange, 401, "Unauthorized");
+                return;
+            }
+            try {
+                sendJsonResponse(exchange, 200, queryService.summary().toString());
+            } catch (SQLException exception) {
+                sendResponse(exchange, 503, "Summary storage unavailable");
+            }
+        });
+
         server.createContext("/alerts/", exchange -> {
-            if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+            if ("OPTIONS".equalsIgnoreCase(exchange.getRequestMethod())) {
+                addCorsHeaders(exchange);
+                exchange.getResponseHeaders().set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+                exchange.sendResponseHeaders(204, -1);
+                return;
+            }
+            if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())
+                    && !"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
                 sendResponse(exchange, 405, "Method not allowed");
                 return;
             }
@@ -230,16 +296,34 @@ public class AnalyticsEngine {
             String prefix = "/alerts/";
             String acknowledgeSuffix = "/acknowledge";
             String resolveSuffix = "/resolve";
-            String suffix = path.endsWith(acknowledgeSuffix) ? acknowledgeSuffix : resolveSuffix;
-            if (!path.startsWith(prefix) || (!path.endsWith(acknowledgeSuffix) && !path.endsWith(resolveSuffix))) {
+            if (!path.startsWith(prefix)) {
                 sendResponse(exchange, 404, "Alert route not found");
                 return;
             }
-            String alertKey = path.substring(prefix.length(), path.length() - suffix.length());
+            boolean acknowledgeRoute = path.endsWith(acknowledgeSuffix);
+            boolean resolveRoute = path.endsWith(resolveSuffix);
+            String suffix = acknowledgeRoute ? acknowledgeSuffix : resolveSuffix;
+            String alertKey = "GET".equalsIgnoreCase(exchange.getRequestMethod())
+                    ? path.substring(prefix.length())
+                    : path.substring(prefix.length(), path.length() - suffix.length());
+            if (alertKey.isBlank() || ("POST".equalsIgnoreCase(exchange.getRequestMethod())
+                    && !acknowledgeRoute && !resolveRoute)) {
+                sendResponse(exchange, 404, "Alert route not found");
+                return;
+            }
             try {
+                if ("GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+                    AlertRecord alert = alertRepository.findByKey(alertKey);
+                    if (alert == null) {
+                        sendResponse(exchange, 404, "Alert not found");
+                    } else {
+                        sendJsonResponse(exchange, 200, queryService.alertJson(alert).toString());
+                    }
+                    return;
+                }
                 boolean changed;
                 String action;
-                if (acknowledgeSuffix.equals(suffix)) {
+                if (acknowledgeRoute) {
                     changed = alertRepository.acknowledge(alertKey);
                     action = "acknowledged";
                 } else {
@@ -434,6 +518,7 @@ public class AnalyticsEngine {
         body.put("status", status >= 400 ? "error" : "ok");
         body.put("message", response);
         byte[] responseBytes = OBJECT_MAPPER.writeValueAsBytes(body);
+        addCorsHeaders(exchange);
         exchange.getResponseHeaders().set("Content-Type", "application/json; charset=UTF-8");
         exchange.sendResponseHeaders(status, responseBytes.length);
         try (OutputStream output = exchange.getResponseBody()) {
@@ -443,6 +528,7 @@ public class AnalyticsEngine {
 
     private static void sendJsonResponse(HttpExchange exchange, int status, String response) throws IOException {
         byte[] responseBytes = response.getBytes(StandardCharsets.UTF_8);
+        addCorsHeaders(exchange);
         exchange.getResponseHeaders().set("Content-Type", "application/json; charset=UTF-8");
         exchange.sendResponseHeaders(status, responseBytes.length);
         try (OutputStream output = exchange.getResponseBody()) {
@@ -450,10 +536,72 @@ public class AnalyticsEngine {
         }
     }
 
+    private static void addCorsHeaders(HttpExchange exchange) {
+        String origin = exchange.getRequestHeaders().getFirst("Origin");
+        if ("http://localhost:3000".equals(origin) || "http://127.0.0.1:3000".equals(origin)) {
+            exchange.getResponseHeaders().set("Access-Control-Allow-Origin", origin);
+        }
+        exchange.getResponseHeaders().set("Access-Control-Allow-Headers", "Content-Type, X-EventWatch-Key");
+    }
+
+    private static boolean handleCorsPreflight(HttpExchange exchange) throws IOException {
+        if (!"OPTIONS".equalsIgnoreCase(exchange.getRequestMethod())) {
+            return false;
+        }
+        addCorsHeaders(exchange);
+        exchange.getResponseHeaders().set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        exchange.sendResponseHeaders(204, -1);
+        return true;
+    }
+
     private static boolean isValidApiKey(String receivedKey) {
         return receivedKey != null && MessageDigest.isEqual(
                 apiKey.getBytes(StandardCharsets.UTF_8),
                 receivedKey.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static Map<String, String> queryParameters(String rawQuery) {
+        Map<String, String> parameters = new HashMap<>();
+        if (rawQuery == null || rawQuery.isBlank()) {
+            return parameters;
+        }
+        for (String pair : rawQuery.split("&")) {
+            String[] parts = pair.split("=", 2);
+            String key = URLDecoder.decode(parts[0], StandardCharsets.UTF_8);
+            String value = parts.length == 2 ? URLDecoder.decode(parts[1], StandardCharsets.UTF_8) : "";
+            parameters.put(key, value);
+        }
+        return parameters;
+    }
+
+    private static String optionalUpper(String value) {
+        return value == null || value.isBlank() ? null : value.toUpperCase(Locale.ROOT);
+    }
+
+    private static Instant optionalInstant(String value) {
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        try {
+            return Instant.parse(value);
+        } catch (RuntimeException exception) {
+            throw new IllegalArgumentException("time filters must be ISO-8601 values");
+        }
+    }
+
+    private static int boundedInteger(String value, int fallback, int maximum) {
+        if (value == null || value.isBlank()) {
+            return fallback;
+        }
+        try {
+            int parsed = Integer.parseInt(value);
+            if (parsed < 0 || parsed > maximum || (maximum == QueryService.MAX_LIMIT && parsed == 0)) {
+                throw new IllegalArgumentException("query limit or offset is outside the allowed range");
+            }
+            return parsed;
+        } catch (NumberFormatException exception) {
+            throw new IllegalArgumentException("query limit and offset must be numbers");
+        }
     }
 
     private static String getConfig(Dotenv dotenv, String name, String fallback) {

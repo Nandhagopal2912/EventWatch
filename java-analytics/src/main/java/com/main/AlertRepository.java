@@ -63,23 +63,47 @@ public class AlertRepository {
     }
 
     public List<AlertRecord> findActive() throws SQLException {
+        return find(null, null);
+    }
+
+    public AlertRecord findByKey(String alertKey) throws SQLException {
+        List<AlertRecord> alerts = find(alertKey, null);
+        return alerts.isEmpty() ? null : alerts.get(0);
+    }
+
+    public List<AlertRecord> find(String alertKey, String status) throws SQLException {
         List<AlertRecord> alerts = new ArrayList<>();
-        String query = "SELECT alert_key, alert_type, message, status, first_seen, "
-                + "last_seen, occurrence_count FROM alerts WHERE status <> 'RESOLVED' "
-                + "ORDER BY last_seen DESC";
+        StringBuilder query = new StringBuilder("SELECT alert_key, alert_type, message, status, first_seen, "
+                + "last_seen, occurrence_count FROM alerts WHERE 1 = 1");
+        List<String> parameters = new ArrayList<>();
+        if (alertKey != null) {
+            query.append(" AND alert_key = ?");
+            parameters.add(alertKey);
+        }
+        if (status != null) {
+            query.append(" AND status = ?");
+            parameters.add(status);
+        } else if (alertKey == null) {
+            query.append(" AND status <> 'RESOLVED'");
+        }
+        query.append(" ORDER BY last_seen DESC");
         try (Connection connection = DriverManager.getConnection(databaseUrl);
-                PreparedStatement statement = connection.prepareStatement(query);
-                ResultSet results = statement.executeQuery()) {
-            while (results.next()) {
-                AlertRecord alert = new AlertRecord(
-                        results.getString("alert_key"),
-                        results.getString("alert_type"),
-                        results.getString("message"),
-                        AlertStatus.valueOf(results.getString("status")),
-                        Instant.parse(results.getString("first_seen")),
-                        Instant.parse(results.getString("last_seen")),
-                        results.getInt("occurrence_count"));
-                alerts.add(alert);
+                PreparedStatement statement = connection.prepareStatement(query.toString())) {
+            for (int index = 0; index < parameters.size(); index++) {
+                statement.setString(index + 1, parameters.get(index));
+            }
+            try (ResultSet results = statement.executeQuery()) {
+                while (results.next()) {
+                    AlertRecord alert = new AlertRecord(
+                            results.getString("alert_key"),
+                            results.getString("alert_type"),
+                            results.getString("message"),
+                            AlertStatus.valueOf(results.getString("status")),
+                            Instant.parse(results.getString("first_seen")),
+                            Instant.parse(results.getString("last_seen")),
+                            results.getInt("occurrence_count"));
+                    alerts.add(alert);
+                }
             }
         }
         return alerts;

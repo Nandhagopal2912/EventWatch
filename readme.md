@@ -14,7 +14,7 @@ The current implementation completes Phases 1–6. Future improvements are docum
 | **Phase 4**  | **✅ Completed** | Security and input protection    | Dotenv configuration, API-key authentication, JSON validation, content-type checks, request limits, per-client rate limiting, and bounded Go retries.                                                      |
 | **Phase 5**  | **✅ Completed** | Reliability and failure handling | Go health endpoint, atomic durable JSON queue, recovery worker, queue limits, retry configuration, event-ID deduplication, Java health endpoint, bounded request execution, and consistent JSON responses. |
 | **Phase 6**  | **✅ Completed** | Analytics and alert rules        | Configurable CPU/RAM thresholds, moving-window detection, repeated-error alerts, SQLite alert state, deduplication, and the active-alerts endpoint.                                                        |
-| **Phase 7**  | 🗓️ Planned       | Query API and dashboard          | Searchable event APIs, charts, resource trends, active-alert filtering, and operator workflows.                                                                                                            |
+| **Phase 7**  | **✅ Completed** | Query API and dashboard          | Bounded event queries, summaries, alert lookup/filtering, a separate local dashboard, and operator alert workflows.                                                                                        |
 | **Phase 8**  | 🗓️ Planned       | Notifications                    | Email and webhook integrations with delivery tracking and duplicate-alert prevention.                                                                                                                      |
 | **Phase 9**  | 🗓️ Planned       | Observability                    | Structured logs, Prometheus metrics, OpenTelemetry tracing, and correlation IDs.                                                                                                                           |
 | **Phase 10** | 🗓️ Planned       | Testing and delivery             | Unit, integration, load, and failure tests plus Docker and CI/CD automation.                                                                                                                               |
@@ -30,12 +30,17 @@ go-collector/                   Go HTTP ingress
 	go.mod
 java-analytics/                 Maven Java analytics service
 	pom.xml
+	.mvn/jvm.config                Automatic Maven JVM memory settings
 	src/main/java/com/main/
 		AnalyticsEngine.java
 		AlertEngine.java
 		AlertRecord.java
 		AlertRepository.java
 		AlertStatus.java
+dashboard/                      Local browser dashboard
+	index.html
+	app.js
+	styles.css
 ```
 
 ## Architecture
@@ -47,7 +52,8 @@ java-analytics/                 Maven Java analytics service
 - **Alert API:** `GET http://localhost:8080/alerts` returns active `OPEN` and `ACKNOWLEDGED` alerts as JSON.
 - **Alert acknowledgement:** `POST http://localhost:8080/alerts/{alert_key}/acknowledge` changes an `OPEN` alert to `ACKNOWLEDGED`.
 - **Alert resolution:** `POST http://localhost:8080/alerts/{alert_key}/resolve` changes an alert to `RESOLVED`, removing it from the active alerts response.
-- **Phase 7 target:** add read-only event history queries and a browser dashboard without changing the ingestion or queue contracts.
+- **Phase 7 query API:** `GET /events`, `GET /summary`, `GET /alerts`, and `GET /alerts/{alert_key}` provide bounded JSON data for the dashboard.
+- **Dashboard:** `dashboard/index.html` displays summaries, recent events, and active alerts. It reads the API key in the browser and never accesses SQLite directly.
 - **SQLite database** (`java-analytics/events.db`): stores telemetry in the `telemetry_events` table. The database is created automatically when the Java service starts.
 
 ## End-to-End Flow
@@ -99,7 +105,9 @@ If Java is temporarily unavailable, Go retries the request and writes the same e
 - Apache Maven
 - Internet access on the first Maven/Go dependency download
 
-The repository root contains a local `.env` file with the shared API key and Java backend URL. It is ignored by Git. Copy `.env.example` to `.env` and change the values when setting up a new checkout.
+The repository root contains a local `.env` file with the shared API key, service settings, alert thresholds, queue settings, and documented Maven memory settings. It is ignored by Git. Copy `.env.example` to `.env` and change the values when setting up a new checkout.
+
+Maven does not automatically read `.env` files. The committed `.mvn/jvm.config` file applies `-Xms64m` and `-Xmx128m` automatically to every Maven command in this repository, so you do not need to run `$env:MAVEN_OPTS=...` manually. The matching `MAVEN_OPTS` entry in `.env` documents the intended setting for tools or scripts that explicitly load dotenv values.
 
 ## Run
 
@@ -109,6 +117,8 @@ Start the Java service first with Maven:
 cd java-analytics
 mvn compile exec:java
 ```
+
+The command above compiles the Java sources and starts the analytics service on port `8080`. On machines with a small Windows paging file, the project-level `.mvn/jvm.config` keeps Maven within the configured memory budget.
 
 In a second terminal, start the Go service:
 
@@ -124,6 +134,16 @@ Queue settings are controlled by `PENDING_EVENTS_DIR`, `QUEUE_CAPACITY`, and `QU
 When Java is unavailable, the Go collector retries the request and writes the event atomically as a JSON file. A single background worker retries pending files. Successfully delivered files disappear; temporary failures remain pending; permanent `4xx` failures move to `pending-events/rejected-events/` for inspection. On shutdown, Go stops accepting requests and performs a final pending-queue delivery pass; Java drains its request executor before stopping.
 
 Stop either service with `Ctrl+C`.
+
+To run the local dashboard, keep both services running and start a third terminal from the repository root:
+
+```powershell
+python -m http.server 3000 -d dashboard
+```
+
+Open `http://localhost:3000` and enter the value of `EVENTWATCH_API_KEY` from `.env`.
+
+Use the exact host shown in the browser URL. For example, open `http://localhost:3000` rather than a different hostname so the Java CORS policy can allow the dashboard API requests. The dashboard calls Java's `/summary`, `/events`, and `/alerts` endpoints with the entered API key; it never reads `events.db` directly.
 
 ## Send a log event
 

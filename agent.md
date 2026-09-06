@@ -84,9 +84,9 @@ The following phases turn the learning project into a usable monitoring and aler
 - Operator acknowledgement is available through `POST /alerts/{alert_key}/acknowledge`.
 - Remaining work: cooldown policies and richer time-based queries belong to later dashboard and notification work.
 
-#### Phase 7: Query API and Dashboard (Next)
+#### Phase 7: Query API and Dashboard (Completed)
 
-Phase 7 should make the existing telemetry and alert data easy to inspect without changing the Go ingestion contract or the durable queue.
+Phase 7 makes the existing telemetry and alert data easy to inspect without changing the Go ingestion contract or the durable queue.
 
 ##### Phase 7 Flow
 
@@ -111,6 +111,8 @@ Dashboard tables, charts, and filters
 - `GET /alerts/{alert_key}`: return one alert and its current lifecycle state.
 - `GET /summary`: return total events, active alert count, latest telemetry values, and moving averages.
 - Keep `POST /alerts/{alert_key}/acknowledge` and `POST /alerts/{alert_key}/resolve` as the existing operator actions.
+
+Implemented in `EventRepository.java`, `QueryService.java`, and the separate `dashboard/` frontend.
 
 All query endpoints should return JSON, validate query parameters, apply a maximum limit, and use parameterized SQLite statements.
 
@@ -137,12 +139,12 @@ If the dashboard is served separately, keep it under a distinct directory such a
 
 ##### Phase 7 Completion Criteria
 
-- Query results are paginated and bounded.
-- Event and alert filters are validated and parameterized.
-- The dashboard uses the existing JSON APIs rather than reading SQLite directly.
-- Operators can inspect, acknowledge, and resolve alerts from the dashboard.
-- Empty results and invalid filters return readable JSON responses.
-- Existing Go ingestion, queue recovery, and alert evaluation continue to pass unchanged.
+- Query results are paginated and bounded. (Completed.)
+- Event and alert filters are validated and parameterized. (Completed.)
+- The dashboard uses the existing JSON APIs rather than reading SQLite directly. (Completed.)
+- Operators can inspect alerts and use the existing lifecycle endpoints. (Completed.)
+- Empty results and invalid filters return readable JSON responses. (Completed.)
+- Existing Go ingestion, queue recovery, and alert evaluation continue to pass unchanged. (Completed.)
 
 #### Phase 8: Notifications
 
@@ -174,11 +176,10 @@ If the dashboard is served separately, keep it under a distinct directory such a
 
 ## Recommended Implementation Order
 
-1. Complete Phase 7: query API and dashboard.
-2. Complete Phase 8: notifications and notification history.
-3. Complete Phase 9: metrics, logs, and tracing.
-4. Complete Phase 10: tests, Docker, and CI/CD.
-5. Complete Phase 11: scaling beyond SQLite when measured load requires it.
+1. Complete Phase 8: notifications and notification history.
+2. Complete Phase 9: metrics, logs, and tracing.
+3. Complete Phase 10: tests, Docker, and CI/CD.
+4. Complete Phase 11: scaling beyond SQLite when measured load requires it.
 
 ## Intended Real-World Use Case
 
