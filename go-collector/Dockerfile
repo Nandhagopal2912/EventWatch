@@ -20,8 +20,12 @@ RUN mkdir -p /queue && chown -R eventwatch:eventwatch /app /queue
 VOLUME ["/queue"]
 USER eventwatch
 
+# A published container port is reachable, so the agent binds to every interface and the
+# security model then requires CAPTURE_API_KEY to be supplied.
 ENV COLLECTOR_PORT=8082 \
+    COLLECTOR_BIND=0.0.0.0 \
     PENDING_EVENTS_DIR=/queue \
+    HOST_ID_FILE=/queue/host-id \
     JAVA_BACKEND_URL=http://analytics:8080/receive \
     LOG_FORMAT=json
 

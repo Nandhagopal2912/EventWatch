@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.sun.net.httpserver.HttpServer;
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -42,7 +43,8 @@ class EngineLifecycleTest {
         return new EngineConfiguration(0,
                 TestSupport.databaseUrl(temporaryDirectory, fileName), API_KEY, "text",
                 85.0, 80.0, 5, false, "", 1, 1, 1, 0,
-                shutdownGraceSeconds, "", "", poolSize, 0, 60, rateLimit);
+                shutdownGraceSeconds, "", "", poolSize, 0, 60, rateLimit,
+                false, "", "", "PKCS12", List.of("http://localhost:3000"), false);
     }
 
     @Test
@@ -59,7 +61,8 @@ class EngineLifecycleTest {
     void aMissingApiKeyIsRejectedWithoutOpeningAPool() {
         EngineConfiguration withoutKey = new EngineConfiguration(0,
                 TestSupport.databaseUrl(temporaryDirectory, "nokey.db"), "  ", "text",
-                85.0, 80.0, 5, false, "", 1, 1, 1, 0, 0, "", "", 4, 0, 60, 100);
+                85.0, 80.0, 5, false, "", 1, 1, 1, 0, 0, "", "", 4, 0, 60, 100,
+                false, "", "", "PKCS12", List.of("http://localhost:3000"), false);
 
         IOException failure = assertThrows(IOException.class, () -> AnalyticsEngine.start(withoutKey));
         assertTrue(failure.getMessage().contains("EVENTWATCH_API_KEY"), failure.getMessage());
@@ -70,7 +73,8 @@ class EngineLifecycleTest {
     void anUnusableDatabaseUrlFailsWithoutLeakingAPool() {
         EngineConfiguration unusable = new EngineConfiguration(0,
                 "jdbc:mysql://localhost/eventwatch", API_KEY, "text",
-                85.0, 80.0, 5, false, "", 1, 1, 1, 0, 0, "", "", 4, 0, 60, 100);
+                85.0, 80.0, 5, false, "", 1, 1, 1, 0, 0, "", "", 4, 0, 60, 100,
+                false, "", "", "PKCS12", List.of("http://localhost:3000"), false);
 
         assertThrows(IOException.class, () -> AnalyticsEngine.start(unusable));
         assertNull(AnalyticsEngine.database(), "a failed start must not leave a pool open");
@@ -82,7 +86,8 @@ class EngineLifecycleTest {
         // a non-positive delay, so RETENTION_SWEEP_MINUTES=0 with retention on killed startup.
         EngineConfiguration zeroSweep = new EngineConfiguration(0,
                 TestSupport.databaseUrl(temporaryDirectory, "sweep.db"), API_KEY, "text",
-                85.0, 80.0, 5, false, "", 1, 1, 1, 0, 0, "", "", 0, 7, 0, 0);
+                85.0, 80.0, 5, false, "", 1, 1, 1, 0, 0, "", "", 0, 7, 0, 0,
+                false, "", "", "PKCS12", List.of("http://localhost:3000"), false);
 
         assertEquals(60, zeroSweep.retentionSweepMinutes(), "a non-positive period falls back");
         assertEquals(10, zeroSweep.databasePoolSize(), "a non-positive pool size falls back");

@@ -53,7 +53,8 @@ class PostgresBackendTest {
                 4,
                 retentionDays,
                 60,
-                100);
+                100,
+                false, "", "", "PKCS12", List.of("http://localhost:3000"), false);
     }
 
     @BeforeEach

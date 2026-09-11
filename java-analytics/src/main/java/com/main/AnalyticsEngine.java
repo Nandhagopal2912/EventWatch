@@ -46,6 +46,8 @@ public class AnalyticsEngine {
     private static String apiKey;
     private static boolean textLogging;
     private static Database database;
+    private static List<String> allowedOrigins = List.of();
+    private static boolean metricsRequireKey;
     // A hardcoded ceiling would bind long before storage does, so it is configuration.
     private static int maxRequestsPerMinute = 100;
     private static int shutdownGraceSeconds = 5;
@@ -150,6 +152,8 @@ public class AnalyticsEngine {
             throw new IOException("EVENTWATCH_API_KEY is required");
         }
         maxRequestsPerMinute = configuration.rateLimitPerMinute();
+        allowedOrigins = configuration.corsAllowedOrigins();
+        metricsRequireKey = configuration.metricsRequireKey();
         shutdownGraceSeconds = configuration.shutdownGraceSeconds();
 
         recentEventsByHost.clear();
@@ -199,7 +203,7 @@ public class AnalyticsEngine {
                 StructuredLogger.fields("stored_events", storedEventCount.get()));
         HttpServer server;
         try {
-            server = HttpServer.create(new InetSocketAddress(configuration.port()), 0);
+            server = TlsSupport.createServer(configuration);
         } catch (IOException | RuntimeException exception) {
             releaseDatabase();
             throw exception;
@@ -344,6 +348,11 @@ public class AnalyticsEngine {
         server.createContext("/metrics", exchange -> {
             if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
                 sendResponse(exchange, 405, "Method not allowed");
+                return;
+            }
+            // Scrapers rarely send custom headers, so this is opt-in rather than the default.
+            if (metricsRequireKey && !isValidApiKey(exchange.getRequestHeaders().getFirst("X-EventWatch-Key"))) {
+                sendResponse(exchange, 401, "Unauthorized");
                 return;
             }
             long activeAlerts = 0;
@@ -583,6 +592,7 @@ public class AnalyticsEngine {
         server.start();
         StructuredLogger.info("analytics engine started", StructuredLogger.fields(
                 "port", server.getAddress().getPort(),
+                "tls", configuration.tlsEnabled(),
                 "database", database.dialect().name(),
                 "worker_threads", WORKER_THREADS,
                 "queue_capacity", WORK_QUEUE_CAPACITY));
@@ -826,7 +836,8 @@ public class AnalyticsEngine {
 
     private static void addCorsHeaders(HttpExchange exchange) {
         String origin = exchange.getRequestHeaders().getFirst("Origin");
-        if ("http://localhost:3000".equals(origin) || "http://127.0.0.1:3000".equals(origin)) {
+        // The allowlist is configuration; a hardcoded origin made the dashboard undeployable.
+        if (origin != null && allowedOrigins.contains(origin)) {
             exchange.getResponseHeaders().set("Access-Control-Allow-Origin", origin);
         }
         exchange.getResponseHeaders().set("Access-Control-Allow-Headers", "Content-Type, X-EventWatch-Key");

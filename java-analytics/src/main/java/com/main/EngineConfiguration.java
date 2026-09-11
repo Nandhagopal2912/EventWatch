@@ -1,6 +1,8 @@
 package com.main;
 
 import io.github.cdimascio.dotenv.Dotenv;
+import java.util.Arrays;
+import java.util.List;
 
 /**
  * Every runtime setting the analytics engine needs, so it can be started from
@@ -26,13 +28,21 @@ public record EngineConfiguration(
         int databasePoolSize,
         int retentionDays,
         int retentionSweepMinutes,
-        int rateLimitPerMinute) {
+        int rateLimitPerMinute,
+        boolean tlsEnabled,
+        String tlsKeystorePath,
+        String tlsKeystorePassword,
+        String tlsKeystoreType,
+        List<String> corsAllowedOrigins,
+        boolean metricsRequireKey) {
 
     /**
      * Settings where zero or negative is not a weaker setting but a crash: the pool rejects a
      * size below one, and the scheduler rejects a sweep period below one.
      */
     public EngineConfiguration {
+        corsAllowedOrigins = corsAllowedOrigins == null ? List.of() : List.copyOf(corsAllowedOrigins);
+        tlsKeystoreType = tlsKeystoreType == null || tlsKeystoreType.isBlank() ? "PKCS12" : tlsKeystoreType;
         databasePoolSize = databasePoolSize > 0 ? databasePoolSize : 10;
         retentionSweepMinutes = retentionSweepMinutes > 0 ? retentionSweepMinutes : 60;
         rateLimitPerMinute = rateLimitPerMinute > 0 ? rateLimitPerMinute : 100;
@@ -65,7 +75,14 @@ public record EngineConfiguration(
                 intValue(dotenv, "DATABASE_POOL_SIZE", 10),
                 intValue(dotenv, "RETENTION_DAYS", 0),
                 intValue(dotenv, "RETENTION_SWEEP_MINUTES", 60),
-                intValue(dotenv, "RATE_LIMIT_PER_MINUTE", 100));
+                intValue(dotenv, "RATE_LIMIT_PER_MINUTE", 100),
+                Boolean.parseBoolean(value(dotenv, "TLS_ENABLED", "false")),
+                value(dotenv, "TLS_KEYSTORE_PATH", ""),
+                value(dotenv, "TLS_KEYSTORE_PASSWORD", ""),
+                value(dotenv, "TLS_KEYSTORE_TYPE", "PKCS12"),
+                originList(value(dotenv, "CORS_ALLOWED_ORIGINS",
+                        "http://localhost:3000,http://127.0.0.1:3000")),
+                Boolean.parseBoolean(value(dotenv, "METRICS_REQUIRE_KEY", "false")));
     }
 
     /**
@@ -74,7 +91,16 @@ public record EngineConfiguration(
      */
     public static EngineConfiguration forTesting(String databaseUrl, String apiKey) {
         return new EngineConfiguration(0, databaseUrl, apiKey, "text",
-                85.0, 80.0, 5, false, "", 1, 1, 1, 0, 0, "", "", 2, 0, 60, 100);
+                85.0, 80.0, 5, false, "", 1, 1, 1, 0, 0, "", "", 2, 0, 60, 100,
+                false, "", "", "PKCS12", List.of("http://localhost:3000"), false);
+    }
+
+    /** A comma-separated origin list, so a deployment is not stuck on localhost:3000. */
+    private static List<String> originList(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return List.of();
+        }
+        return Arrays.stream(raw.split(",")).map(String::trim).filter(origin -> !origin.isEmpty()).toList();
     }
 
     private static String value(Dotenv dotenv, String name, String fallback) {

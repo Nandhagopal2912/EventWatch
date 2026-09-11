@@ -31,6 +31,11 @@ services:
       DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-10}
       RETENTION_DAYS: ${RETENTION_DAYS:-0}
       RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-100}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+      METRICS_REQUIRE_KEY: ${METRICS_REQUIRE_KEY:-false}
+      TLS_ENABLED: ${TLS_ENABLED:-false}
+      TLS_KEYSTORE_PATH: ${TLS_KEYSTORE_PATH:-}
+      TLS_KEYSTORE_PASSWORD: ${TLS_KEYSTORE_PASSWORD:-}
       LOG_FORMAT: ${LOG_FORMAT:-json}
       CPU_ALERT_THRESHOLD: ${CPU_ALERT_THRESHOLD:-85}
       RAM_ALERT_THRESHOLD: ${RAM_ALERT_THRESHOLD:-80}
@@ -54,6 +59,10 @@ services:
       context: ./go-collector
     environment:
       EVENTWATCH_API_KEY: ${EVENTWATCH_API_KEY:?set EVENTWATCH_API_KEY in .env}
+      # The agent's own ingress is published, so it authenticates callers too.
+      CAPTURE_API_KEY: ${CAPTURE_API_KEY:-${EVENTWATCH_API_KEY}}
+      BACKEND_CA_FILE: ${BACKEND_CA_FILE:-}
+      BACKEND_TLS_SKIP_VERIFY: ${BACKEND_TLS_SKIP_VERIFY:-false}
       COLLECTOR_PORT: 8082
       JAVA_BACKEND_URL: http://analytics:8080/receive
       PENDING_EVENTS_DIR: /queue

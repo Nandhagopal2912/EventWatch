@@ -14,6 +14,7 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.file.Path;
+import java.util.List;
 import java.time.Duration;
 import java.time.Instant;
 import org.junit.jupiter.api.AfterEach;
@@ -59,7 +60,8 @@ class AnalyticsEngineIntegrationTest {
 
     private EngineConfiguration configurationWithThresholds(double cpu, double ram, int repeatedErrors) {
         return new EngineConfiguration(0, databaseUrl, API_KEY, "text",
-                cpu, ram, repeatedErrors, false, "", 1, 1, 1, 0, 0, "", "", 2, 0, 60, 100);
+                cpu, ram, repeatedErrors, false, "", 1, 1, 1, 0, 0, "", "", 2, 0, 60, 100,
+                false, "", "", "PKCS12", List.of("http://localhost:3000"), false);
     }
 
     private String eventBody(String eventId, String level, double cpu, double ram) {

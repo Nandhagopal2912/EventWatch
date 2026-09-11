@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -71,6 +72,10 @@ func logHandler(w http.ResponseWriter, r *http.Request) {
 	// The public collector endpoint accepts query parameters and creates a telemetry event.
 	if r.Method != http.MethodGet {
 		writeMessage(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !authorizeCapture(r) {
+		writeMessage(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 
@@ -192,6 +197,10 @@ func stressHandler(w http.ResponseWriter, r *http.Request) {
 		writeMessage(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	if !authorizeCapture(r) {
+		writeMessage(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
 
 	correlationID := newEventID()
 	logInfo("starting stress test", logFields{
@@ -298,6 +307,27 @@ func main() {
 	configuredHostID = hostID
 	configuredHostname = hostname
 
+	bindAddress := getEnv("COLLECTOR_BIND", "127.0.0.1")
+	keyRequired, err := resolveIngressSecurity(
+		bindAddress,
+		getEnv("CAPTURE_API_KEY", ""),
+		strings.EqualFold(getEnv("CAPTURE_REQUIRE_KEY", "false"), "true"))
+	if err != nil {
+		fmt.Printf("Ingress security misconfigured: %v\n", err)
+		return
+	}
+
+	tlsConfig, err := backendTLSConfig(
+		getEnv("BACKEND_CA_FILE", ""),
+		strings.EqualFold(getEnv("BACKEND_TLS_SKIP_VERIFY", "false"), "true"))
+	if err != nil {
+		fmt.Printf("Backend TLS misconfigured: %v\n", err)
+		return
+	}
+	if tlsConfig != nil {
+		backendClient.Transport = &http.Transport{TLSClientConfig: tlsConfig}
+	}
+
 	go retryPendingEvents()
 
 	http.HandleFunc("/capture", logHandler)
@@ -306,16 +336,17 @@ func main() {
 
 	http.HandleFunc("/stress", stressHandler)
 
-	logInfo("collector started", logFields{
-		"host_id":        configuredHostID,
-		"hostname":       configuredHostname,
-		"address":        ":" + collectorPort,
-		"backend_url":    configuredBackendURL,
-		"queue_capacity": queueCapacity,
-		"queue_depth":    queueDepth(),
+	logInfo("agent started", logFields{
+		"host_id":              configuredHostID,
+		"hostname":             configuredHostname,
+		"address":              bindAddress + ":" + collectorPort,
+		"capture_key_required": keyRequired,
+		"backend_url":          configuredBackendURL,
+		"queue_capacity":       queueCapacity,
+		"queue_depth":          queueDepth(),
 	})
 
-	server := &http.Server{Addr: ":" + collectorPort}
+	server := &http.Server{Addr: bindAddress + ":" + collectorPort}
 	serverError := make(chan error, 1)
 	go func() {
 		serverError <- server.ListenAndServe()
@@ -325,11 +356,11 @@ func main() {
 	signal.Notify(shutdownSignal, os.Interrupt, syscall.SIGTERM)
 	select {
 	case signalReceived := <-shutdownSignal:
-		logInfo("shutting down collector", logFields{"signal": signalReceived.String()})
+		logInfo("shutting down agent", logFields{"signal": signalReceived.String()})
 		shutdownContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := server.Shutdown(shutdownContext); err != nil {
-			logError("collector shutdown error", logFields{"error": err.Error()})
+			logError("agent shutdown error", logFields{"error": err.Error()})
 		}
 		processPendingEvents()
 	case err := <-serverError:

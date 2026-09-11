@@ -79,6 +79,7 @@ curl.exe "http://localhost:8082/capture?level=ERROR&msg=Database%20transaction%2
 ```text
 go-collector/main.go            Handlers, forwardToJava retries, durable file queue
 go-collector/identity.go        Stable per-agent host_id, persisted beside the queue
+go-collector/security.go        Bind policy, capture auth, backend TLS trust
 go-collector/logging.go         Structured JSON log lines, LOG_FORMAT switch
 go-collector/metrics.go         Prometheus counters, queue-depth gauge, /metrics handler
 go-collector/main_test.go       Event-ID uniqueness + queue capacity
@@ -105,6 +106,7 @@ java-analytics/src/main/java/com/main/
   SqlDialect.java               The few places SQLite and PostgreSQL disagree
   SqliteDialect.java / PostgresDialect.java
   RetentionService.java         Prunes telemetry and delivery history past the window
+  TlsSupport.java               HTTPS listener from a keystore, TLS 1.2+
 
 java-analytics/src/test/java/com/main/
   AnalyticsEngineIntegrationTest.java   Real server on an ephemeral port, temp database
@@ -151,8 +153,8 @@ Changes to this schema must stay backward compatible — additive fields only, n
 | --- | --- | --- | --- |
 | POST | `/receive` (8080) | key | Ingest; rate limited 100/min/IP |
 | GET | `/health` (8080, 8082) | none | 8080 also probes SQLite |
-| GET | `/metrics` (8080, 8082) | none | Prometheus text format |
-| GET | `/capture?level=&msg=` (8082) | none | Public ingress |
+| GET | `/metrics` (8080, 8082) | none, or key when `METRICS_REQUIRE_KEY` | Prometheus text format |
+| GET | `/capture?level=&msg=` (8082) | none on loopback, key when exposed | Agent ingress |
 | GET | `/stress` (8082) | none | 500 events, 32 concurrent |
 | GET | `/events?level=&host_id=&from=&to=&limit=&offset=` | key | limit ≤ 200, default 50 |
 | GET | `/hosts?limit=` | key | Fleet listing with last-seen |
@@ -203,23 +205,23 @@ Changes to this schema must stay backward compatible — additive fields only, n
 
 ## 5. Current state — read before starting work
 
-**Phases 1–12 are complete.** Everything is green:
+**Phases 1–13 are complete.** Everything is green:
 
-- `cd java-analytics && mvn verify` → 126 tests, BUILD SUCCESS
-- `cd go-collector && go vet ./... && go test ./...` → 34 tests, pass
+- `cd java-analytics && mvn verify` → 134 tests, BUILD SUCCESS
+- `cd go-collector && go vet ./... && go test ./...` → 43 tests, pass
 - `cd loadtest && go vet ./... && go test ./...` → 4 tests, pass
 - `docker compose up --build` → all services healthy
 
-Phase 12 turned the pipeline into a fleet monitor. Every event names the machine that produced it;
-the moving window, the alert thresholds, and the alert keys are all scoped per host. Verified with
-two agents against one analytics service: distinct identities, `cpu-high@web-01` and
-`cpu-high@db-01` as separate rows, and acknowledging one leaving the other OPEN.
+Phase 13 made a deployment defensible. The agent binds to loopback by default and **refuses to
+start** on any other address without a capture key. The analytics API serves TLS from a keystore,
+and the agent verifies it against a configured CA. CORS origins and metrics auth are configuration.
+Verified end to end: a real agent delivered an event to a real TLS listener with certificate
+verification, and plain HTTP against that listener failed as it should.
 
-**The next blocker is security, not features.** `/capture` is unauthenticated and there is no TLS,
-so "localhost only" is still the honest description. That is Phase 13 and it gates any real
-deployment.
+**What is still open:** the dashboard holds the API key in page memory. Eliminating that needs
+same-origin serving plus an HttpOnly cookie — see section 13.
 
-B1–B15 in section 11 are all fixed.
+B1–B15 in section 12 are all fixed.
 
 ## 6. Phase 8 as built — notifications
 
@@ -363,7 +365,30 @@ bound — the same lesson as the rate-limit map in B4.
 **Alert keys use `rule@host`.** They appear in URLs (`/alerts/cpu-high@web-01/acknowledge`), and `@`
 survives a path segment without encoding while staying readable in a notification.
 
-## 11. Fixed defects and remaining quality work
+## 11. Phase 13 as built — agent security
+
+**The bind policy is the load-bearing decision.** `resolveIngressSecurity` couples exposure to
+authentication: loopback needs no key, anything else *requires* one, and the agent refuses to start
+otherwise. That ordering matters — a key that defaults to optional gets left optional. The container
+image sets `COLLECTOR_BIND=0.0.0.0` precisely because a published port is reachable, so Compose has
+to supply `CAPTURE_API_KEY`.
+
+**Capture auth uses constant-time comparison** and a length check, matching `isValidApiKey` on the
+Java side. `/stress` is behind the same check — it was the one route that could flood the backend.
+
+**TLS is opt-in, verification is not.** `TlsSupport` builds an `HttpsServer` from a PKCS12 keystore
+and pins TLS 1.2+. The agent trusts a private CA through `BACKEND_CA_FILE` rather than skipping
+verification; `BACKEND_TLS_SKIP_VERIFY` exists for a first run and logs a warning every time it is
+used, so it cannot quietly become the deployment setting.
+
+**Testing TLS needed a real certificate.** Java 17 has no public API for issuing one and
+BouncyCastle is not worth a test fixture, so `TestKeystore` shells out to the `keytool` beside the
+running JDK. The test performs a real handshake rather than asserting on configuration.
+
+**CORS was a hardcoded origin** (`localhost:3000`) that made the dashboard undeployable anywhere
+else. It is now a comma-separated allowlist; an empty list allows nothing.
+
+## 12. Fixed defects and remaining quality work
 
 ### Fixed (keep these fixed — each has a way to regress)
 
@@ -451,7 +476,7 @@ unaffected: at 3000 samples both percentile formulas select the same index.)
   in memory alongside the SQL `lastDeliveredAt` lookup; a restart falls back to the SQL value, which
   is correct but means an in-flight reservation is lost. Fine for one instance, wrong for two.
 
-## 12. Roadmap and deferred work
+## 13. Roadmap and deferred work
 
 **Phase 9 — Observability.** Done except tracing (see section 7).
 
@@ -487,9 +512,11 @@ The honest next step for scale is neither: it is the rate limit and the per-even
 ingestion path. Every event currently triggers alert evaluation plus a grouped error query. Batching
 that, or evaluating alerts on a timer instead of per event, is a larger win than changing databases.
 
-**Phase 13 — Make the agent safe to expose.** The blocker on any real deployment: `/capture` is
-unauthenticated, there is no TLS, the dashboard holds the API key in browser memory, and CORS
-origins are hardcoded. Until this lands, "localhost only" is the accurate description.
+**Phase 13 — Agent security.** Done (see section 11), except the dashboard session. The key is no
+longer in the DOM or in storage, but it is still in page memory for the session. A real fix means
+serving the dashboard from the analytics service itself so it is same-origin, then issuing an
+HttpOnly `SameSite=Strict` cookie from a `POST /session` endpoint. That also deletes the CORS
+configuration entirely, which is a good sign it is the right shape. Worth doing alongside Phase 15.
 
 **Phase 14 — Alert rules worth having.** Three global thresholds do not survive a mixed fleet: a
 build box at 90% CPU is healthy, a database at 90% is not. Per-host and per-rule configuration in a
@@ -504,7 +531,7 @@ self-reporting their version and queue depth.
 
 ---
 
-## 13. Definition of done for a release
+## 14. Definition of done for a release
 
 - Events are authenticated, validated, persisted transactionally, deduplicated, and queryable.
 - A temporary Java outage loses nothing and duplicates nothing.

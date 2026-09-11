@@ -21,8 +21,14 @@ function escapeHtml(value) {
   );
 }
 
+// The key lives in a closure for the page's lifetime rather than in the DOM or storage:
+// it is not readable from the input, not restored after a reload, and not in localStorage.
+// This reduces exposure; it is not a session system. A real one needs same-origin serving
+// and an HttpOnly cookie, which is a later phase.
+let apiKey = "";
+
 function headers() {
-  return { "X-EventWatch-Key": keyInput.value };
+  return { "X-EventWatch-Key": apiKey };
 }
 
 async function getJson(path) {
@@ -125,7 +131,7 @@ function renderHostOptions(hosts) {
 }
 
 async function refresh() {
-  if (!keyInput.value) return;
+  if (!apiKey) return;
   try {
     const host = hostFilter.value;
     const eventsPath = host
@@ -151,6 +157,12 @@ async function refresh() {
 
 form.addEventListener("submit", (event) => {
   event.preventDefault();
+  if (keyInput.value) {
+    apiKey = keyInput.value;
+    // Clear the field so the key is not sitting in the DOM for the rest of the session.
+    keyInput.value = "";
+    keyInput.placeholder = "Connected";
+  }
   refresh();
 });
 document.querySelector("#refresh").addEventListener("click", refresh);
