@@ -25,13 +25,13 @@ public class QueryService {
         this.movingWindowSize = movingWindowSize;
     }
 
-    public ObjectNode events(String level, Instant from, Instant to, int limit, int offset)
+    public ObjectNode events(String level, String hostId, Instant from, Instant to, int limit, int offset)
             throws SQLException {
-        List<AnalyticsEngine.LogEntry> events = eventRepository.find(level, from, to, limit, offset);
+        List<AnalyticsEngine.LogEntry> events = eventRepository.find(level, hostId, from, to, limit, offset);
         ObjectNode response = objectMapper.createObjectNode();
         response.put("limit", limit);
         response.put("offset", offset);
-        response.put("total", eventRepository.count(level, from, to));
+        response.put("total", eventRepository.count(level, hostId, from, to));
         ArrayNode items = response.putArray("items");
         for (AnalyticsEngine.LogEntry event : events) {
             items.add(eventJson(event));
@@ -44,6 +44,7 @@ public class QueryService {
         ObjectNode response = objectMapper.createObjectNode();
         response.put("total_events", eventRepository.count(null, null, null));
         response.put("active_alerts", alertRepository.findActive().size());
+        response.put("hosts", eventRepository.hosts(AnalyticsEngine.MAX_HOSTS_LISTED).size());
         if (recent.isEmpty()) {
             response.putNull("latest_event");
             response.put("average_cpu", 0.0);
@@ -60,6 +61,7 @@ public class QueryService {
         ObjectNode response = objectMapper.createObjectNode();
         response.put("alert_key", alert.getAlertKey());
         response.put("alert_type", alert.getAlertType());
+        response.put("host_id", alert.getHostId());
         response.put("message", alert.getMessage());
         response.put("status", alert.getStatus().name());
         response.put("first_seen", alert.getFirstSeen().toString());
@@ -92,9 +94,25 @@ public class QueryService {
         return items;
     }
 
+    /** One row per machine the analytics service has heard from. */
+    public ArrayNode hosts(int limit) throws SQLException {
+        ArrayNode items = objectMapper.createArrayNode();
+        for (EventRepository.HostSummary host : eventRepository.hosts(limit)) {
+            ObjectNode node = objectMapper.createObjectNode();
+            node.put("host_id", host.hostId());
+            node.put("hostname", host.hostname());
+            node.put("event_count", host.eventCount());
+            node.put("last_seen", host.lastSeen().toString());
+            items.add(node);
+        }
+        return items;
+    }
+
     private ObjectNode eventJson(AnalyticsEngine.LogEntry event) {
         ObjectNode response = objectMapper.createObjectNode();
         response.put("event_id", event.eventId);
+        response.put("host_id", event.hostId);
+        response.put("hostname", event.hostname);
         response.put("level", event.level);
         response.put("msg", event.message);
         response.put("timestamp", event.timestamp.toString());

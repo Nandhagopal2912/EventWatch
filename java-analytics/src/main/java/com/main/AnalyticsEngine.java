@@ -32,6 +32,11 @@ public class AnalyticsEngine {
     private static final int WORKER_THREADS = 8;
     private static final int WORK_QUEUE_CAPACITY = 500;
     private static final int TOP_ERROR_MESSAGES = 5;
+    static final String UNKNOWN_HOST = "unknown";
+    private static final int MAX_TRACKED_HOSTS = 1000;
+    private static final int MAX_RESTORED_HOSTS = 50;
+    private static final int MAX_IDENTITY_LENGTH = 128;
+    static final int MAX_HOSTS_LISTED = 200;
     private static final int NOTIFICATION_HISTORY_LIMIT = 50;
     private static final long RATE_WINDOW_SWEEP_SECONDS = 60;
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
@@ -54,8 +59,15 @@ public class AnalyticsEngine {
     private static NotificationRepository notificationRepository;
     private static NotificationService notificationService;
 
-    // Only the newest events are mirrored in memory; the full history stays in SQLite.
-    private static final Deque<LogEntry> recentEvents = new ArrayDeque<>();
+    // Only the newest events per machine are mirrored in memory; history stays in SQLite.
+    // A shared window would average unrelated hosts and make every alert meaningless.
+    private static final Map<String, Deque<LogEntry>> recentEventsByHost =
+            new LinkedHashMap<>(16, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, Deque<LogEntry>> eldest) {
+                    return size() > MAX_TRACKED_HOSTS;
+                }
+            };
     private static final AtomicLong storedEventCount = new AtomicLong();
     private static final Map<String, RateWindow> rateWindows = new ConcurrentHashMap<>();
 
@@ -85,15 +97,26 @@ public class AnalyticsEngine {
         String level;
         String message;
         String eventId;
+        String hostId;
+        String hostname;
         Instant timestamp;
         double cpuUsage;
         double ramUsage;
 
-        LogEntry(String eventId, String level, String message, Instant timestamp, double cpuUsage, double ramUsage) {
+        LogEntry(String eventId, String level, String message, Instant timestamp,
+                double cpuUsage, double ramUsage) {
+            this(eventId, level, message, timestamp, UNKNOWN_HOST, null, cpuUsage, ramUsage);
+        }
+
+        LogEntry(String eventId, String level, String message, Instant timestamp,
+                String hostId, String hostname, double cpuUsage, double ramUsage) {
             this.eventId = eventId;
             this.level = level;
             this.message = message;
             this.timestamp = timestamp;
+            // Events from an agent older than phase 12 carry no identity.
+            this.hostId = hostId == null || hostId.isBlank() ? UNKNOWN_HOST : hostId;
+            this.hostname = hostname;
             this.cpuUsage = cpuUsage;
             this.ramUsage = ramUsage;
         }
@@ -129,7 +152,7 @@ public class AnalyticsEngine {
         maxRequestsPerMinute = configuration.rateLimitPerMinute();
         shutdownGraceSeconds = configuration.shutdownGraceSeconds();
 
-        recentEvents.clear();
+        recentEventsByHost.clear();
         storedEventCount.set(0);
         rateWindows.clear();
 
@@ -261,11 +284,15 @@ public class AnalyticsEngine {
                     Instant timestamp = Instant.parse(json.path("timestamp").asText());
                     double cpuUsage = json.path("cpu_usage").asDouble();
                     double ramUsage = json.path("ram_usage").asDouble();
+                    String hostId = textOrNull(json, "host_id");
+                    String hostname = textOrNull(json, "hostname");
 
                     boolean stored;
+                    LogEntry event = new LogEntry(eventId, level, msg, timestamp,
+                            hostId, hostname, cpuUsage, ramUsage);
                     try {
-                        stored = storeEvent(new LogEntry(eventId, level, msg, timestamp, cpuUsage, ramUsage));
-                        alertEngine.evaluate(recentEventsSnapshot());
+                        stored = storeEvent(event);
+                        alertEngine.evaluate(recentEventsSnapshot(event.hostId));
                     } catch (SQLException exception) {
                         METRICS.recordDatabaseFailure();
                         StructuredLogger.error("database unavailable", StructuredLogger.fields(
@@ -283,6 +310,7 @@ public class AnalyticsEngine {
                     StructuredLogger.info(stored ? "event stored" : "duplicate event ignored",
                             StructuredLogger.fields(
                                     "correlation_id", correlationId, "event_id", eventId,
+                                    "host_id", event.hostId, "hostname", hostname,
                                     "event_level", level, "cpu_usage", cpuUsage, "ram_usage", ramUsage));
 
                     generateDashboardReport();
@@ -380,6 +408,10 @@ public class AnalyticsEngine {
                 Instant from = optionalInstant(parameters.get("from"));
                 Instant to = optionalInstant(parameters.get("to"));
                 String level = optionalUpper(parameters.get("level"));
+                String hostId = parameters.get("host_id");
+                if (hostId != null && hostId.isBlank()) {
+                    hostId = null;
+                }
                 if (level != null && !Set.of("INFO", "WARN", "ERROR", "CRITICAL").contains(level)) {
                     sendResponse(exchange, 400, "level must be INFO, WARN, ERROR, or CRITICAL");
                     return;
@@ -388,11 +420,35 @@ public class AnalyticsEngine {
                     sendResponse(exchange, 400, "from must be before to");
                     return;
                 }
-                sendJsonResponse(exchange, 200, queryService.events(level, from, to, limit, offset).toString());
+                sendJsonResponse(exchange, 200,
+                        queryService.events(level, hostId, from, to, limit, offset).toString());
             } catch (IllegalArgumentException exception) {
                 sendResponse(exchange, 400, exception.getMessage());
             } catch (SQLException exception) {
                 sendResponse(exchange, 503, "Event storage unavailable");
+            }
+        });
+
+        server.createContext("/hosts", exchange -> {
+            if (handleCorsPreflight(exchange)) {
+                return;
+            }
+            if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+                sendResponse(exchange, 405, "Method not allowed");
+                return;
+            }
+            if (!isValidApiKey(exchange.getRequestHeaders().getFirst("X-EventWatch-Key"))) {
+                sendResponse(exchange, 401, "Unauthorized");
+                return;
+            }
+            try {
+                Map<String, String> parameters = queryParameters(exchange.getRequestURI().getRawQuery());
+                int limit = boundedInteger(parameters.get("limit"), MAX_HOSTS_LISTED, QueryService.MAX_LIMIT);
+                sendJsonResponse(exchange, 200, queryService.hosts(limit).toString());
+            } catch (IllegalArgumentException exception) {
+                sendResponse(exchange, 400, exception.getMessage());
+            } catch (SQLException exception) {
+                sendResponse(exchange, 503, "Host storage unavailable");
             }
         });
 
@@ -610,7 +666,32 @@ public class AnalyticsEngine {
         if (!isValidPercentage(json, "cpu_usage") || !isValidPercentage(json, "ram_usage")) {
             return "cpu_usage and ram_usage must be numbers between 0 and 100";
         }
+        // Identity is optional so an agent older than phase 12 still reports, but bounded
+        // when present: these values become alert keys and label values.
+        String identityError = validateIdentity(json, "host_id");
+        if (identityError == null) {
+            identityError = validateIdentity(json, "hostname");
+        }
+        return identityError;
+    }
+
+    private static String validateIdentity(JsonNode json, String fieldName) {
+        if (!json.has(fieldName) || json.path(fieldName).isNull()) {
+            return null;
+        }
+        if (!json.path(fieldName).isTextual()) {
+            return fieldName + " must be a text value";
+        }
+        String value = json.path(fieldName).asText();
+        if (value.length() > MAX_IDENTITY_LENGTH) {
+            return fieldName + " must contain at most " + MAX_IDENTITY_LENGTH + " characters";
+        }
         return null;
+    }
+
+    static String textOrNull(JsonNode json, String fieldName) {
+        JsonNode value = json.path(fieldName);
+        return value.isTextual() && !value.asText().isBlank() ? value.asText() : null;
     }
 
     static boolean isValidPercentage(JsonNode json, String fieldName) {
@@ -662,16 +743,36 @@ public class AnalyticsEngine {
     }
 
     private static synchronized void loadRecentEvents() throws SQLException {
-        // Restore only the analytics window; SQLite remains the source of truth for history.
+        // Restore each machine's window; SQLite remains the source of truth for history.
         storedEventCount.set(eventRepository.count(null, null, null));
-        List<LogEntry> newestFirst = eventRepository.recent(MOVING_AVERAGE_WINDOW);
+        List<LogEntry> newestFirst = eventRepository.recent(MOVING_AVERAGE_WINDOW * MAX_RESTORED_HOSTS);
         for (int index = newestFirst.size() - 1; index >= 0; index--) {
-            recentEvents.addLast(newestFirst.get(index));
+            rememberEvent(newestFirst.get(index));
         }
     }
 
+    private static synchronized void rememberEvent(LogEntry event) {
+        Deque<LogEntry> window = recentEventsByHost.computeIfAbsent(event.hostId, key -> new ArrayDeque<>());
+        window.addLast(event);
+        while (window.size() > MOVING_AVERAGE_WINDOW) {
+            window.removeFirst();
+        }
+    }
+
+    private static synchronized List<LogEntry> recentEventsSnapshot(String hostId) {
+        Deque<LogEntry> window = recentEventsByHost.get(hostId);
+        return window == null ? List.of() : new ArrayList<>(window);
+    }
+
+    /** The newest events across every tracked machine, for the terminal report. */
     private static synchronized List<LogEntry> recentEventsSnapshot() {
-        return new ArrayList<>(recentEvents);
+        List<LogEntry> combined = new ArrayList<>();
+        for (Deque<LogEntry> window : recentEventsByHost.values()) {
+            combined.addAll(window);
+        }
+        combined.sort(Comparator.comparing(event -> event.timestamp));
+        int start = Math.max(0, combined.size() - MOVING_AVERAGE_WINDOW);
+        return new ArrayList<>(combined.subList(start, combined.size()));
     }
 
     private static synchronized boolean storeEvent(LogEntry event) throws SQLException {
@@ -680,10 +781,7 @@ public class AnalyticsEngine {
         boolean inserted = eventRepository.insertIfAbsent(event);
         if (inserted) {
             storedEventCount.incrementAndGet();
-            recentEvents.addLast(event);
-            while (recentEvents.size() > MOVING_AVERAGE_WINDOW) {
-                recentEvents.removeFirst();
-            }
+            rememberEvent(event);
         }
         return inserted;
     }

@@ -27,6 +27,10 @@ public class AlertEngine {
         this.repeatedErrorThreshold = repeatedErrorThreshold;
     }
 
+    /**
+     * Evaluates one machine's window. Alert keys are scoped to the host, so a fleet sharing
+     * one analytics service raises one alert per machine instead of fighting over a single row.
+     */
     public void evaluate(List<AnalyticsEngine.LogEntry> events) throws SQLException {
         if (events.isEmpty()) {
             return;
@@ -34,6 +38,7 @@ public class AlertEngine {
         int start = Math.max(0, events.size() - movingWindowSize);
         List<AnalyticsEngine.LogEntry> recentEvents = events.subList(start, events.size());
         Instant now = recentEvents.get(recentEvents.size() - 1).timestamp;
+        String hostId = recentEvents.get(recentEvents.size() - 1).hostId;
 
         double averageCpu = recentEvents.stream()
                 .mapToDouble(event -> event.cpuUsage)
@@ -44,9 +49,9 @@ public class AlertEngine {
                 .average()
                 .orElse(0.0);
 
-        evaluateThreshold("cpu-high", "HIGH_CPU", averageCpu, cpuThreshold,
+        evaluateThreshold(alertKey("cpu-high", hostId), "HIGH_CPU", hostId, averageCpu, cpuThreshold,
                 "CPU average is %.1f%% (threshold %.1f%%)".formatted(averageCpu, cpuThreshold), now);
-        evaluateThreshold("ram-high", "HIGH_RAM", averageRam, ramThreshold,
+        evaluateThreshold(alertKey("ram-high", hostId), "HIGH_RAM", hostId, averageRam, ramThreshold,
                 "RAM average is %.1f%% (threshold %.1f%%)".formatted(averageRam, ramThreshold), now);
 
         Map<String, Integer> errorCounts = new HashMap<>();
@@ -56,21 +61,26 @@ public class AlertEngine {
             }
         }
         for (Map.Entry<String, Integer> entry : errorCounts.entrySet()) {
-            String alertKey = "repeated-error-" + stableKey(entry.getKey());
+            String key = alertKey("repeated-error-" + stableKey(entry.getKey()), hostId);
             if (entry.getValue() >= repeatedErrorThreshold) {
-                notify(repository.saveOccurrence(new AlertRecord(alertKey, "REPEATED_ERROR",
+                notify(repository.saveOccurrence(new AlertRecord(key, "REPEATED_ERROR", hostId,
                         entry.getKey() + " occurred " + entry.getValue() + " times", now)));
             }
         }
     }
 
-    private void evaluateThreshold(String alertKey, String alertType, double value,
+    private void evaluateThreshold(String alertKey, String alertType, String hostId, double value,
             double threshold, String message, Instant timestamp) throws SQLException {
         if (value >= threshold) {
-            notify(repository.saveOccurrence(new AlertRecord(alertKey, alertType, message, timestamp)));
+            notify(repository.saveOccurrence(new AlertRecord(alertKey, alertType, hostId, message, timestamp)));
         } else {
             notify(repository.resolve(alertKey, timestamp));
         }
+    }
+
+    /** Alert keys appear in URLs, so the host is appended rather than embedded with a separator. */
+    static String alertKey(String rule, String hostId) {
+        return rule + "@" + (hostId == null || hostId.isBlank() ? AnalyticsEngine.UNKNOWN_HOST : hostId);
     }
 
     // Delivery is the notification service's concern; the rules only report what changed.

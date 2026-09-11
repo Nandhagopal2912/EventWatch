@@ -26,6 +26,8 @@ import (
 type LogPayload struct {
 	EventID       string  `json:"event_id"`
 	CorrelationID string  `json:"correlation_id,omitempty"`
+	HostID        string  `json:"host_id"`
+	Hostname      string  `json:"hostname"`
 	Level         string  `json:"level"`
 	Messages      string  `json:"msg"`
 	Time          string  `json:"timestamp"`
@@ -99,6 +101,8 @@ func logHandler(w http.ResponseWriter, r *http.Request) {
 	payload := LogPayload{
 		EventID:       newEventID(),
 		CorrelationID: correlationID,
+		HostID:        configuredHostID,
+		Hostname:      configuredHostname,
 		Level:         level,
 		Messages:      msg,
 		Time:          time.Now().UTC().Format(time.RFC3339),
@@ -107,6 +111,7 @@ func logHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	metrics.recordCapture(level)
 	logInfo("captured event", logFields{
+		"host_id":        configuredHostID,
 		"correlation_id": correlationID,
 		"event_id":       payload.EventID,
 		"event_level":    level,
@@ -215,6 +220,8 @@ func stressHandler(w http.ResponseWriter, r *http.Request) {
 		payload := LogPayload{
 			EventID:       newEventID(),
 			CorrelationID: correlationID,
+			HostID:        configuredHostID,
+			Hostname:      configuredHostname,
 			Level:         "ERROR",
 			Messages:      fmt.Sprintf("%s (Log #%d)", errorMsg, i),
 			Time:          time.Now().UTC().Format(time.RFC3339),
@@ -281,6 +288,16 @@ func main() {
 		return
 	}
 	collectorPort := getEnv("COLLECTOR_PORT", "8082")
+
+	identityFile := getEnv("HOST_ID_FILE", filepath.Join(queueDirectory, "host-id"))
+	hostID, hostname, err := resolveHostIdentity(identityFile)
+	if err != nil {
+		fmt.Printf("Unable to establish host identity: %v\n", err)
+		return
+	}
+	configuredHostID = hostID
+	configuredHostname = hostname
+
 	go retryPendingEvents()
 
 	http.HandleFunc("/capture", logHandler)
@@ -290,6 +307,8 @@ func main() {
 	http.HandleFunc("/stress", stressHandler)
 
 	logInfo("collector started", logFields{
+		"host_id":        configuredHostID,
+		"hostname":       configuredHostname,
 		"address":        ":" + collectorPort,
 		"backend_url":    configuredBackendURL,
 		"queue_capacity": queueCapacity,
@@ -380,9 +399,11 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{
-		"status":  "ok",
-		"service": "go-collector",
-		"message": "service is healthy",
+		"status":   "ok",
+		"service":  "go-collector",
+		"host_id":  configuredHostID,
+		"hostname": configuredHostname,
+		"message":  "service is healthy",
 	})
 }
 

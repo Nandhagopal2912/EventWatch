@@ -25,6 +25,7 @@ import org.junit.jupiter.api.io.TempDir;
 class AnalyticsEngineIntegrationTest {
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final String API_KEY = "integration-secret";
+    private static final String CPU_ALERT = "cpu-high@web-01";
 
     @TempDir
     Path temporaryDirectory;
@@ -62,10 +63,14 @@ class AnalyticsEngineIntegrationTest {
     }
 
     private String eventBody(String eventId, String level, double cpu, double ram) {
+        return eventBody(eventId, level, "web-01", cpu, ram);
+    }
+
+    private String eventBody(String eventId, String level, String hostId, double cpu, double ram) {
         return """
-                {"event_id":"%s","level":"%s","msg":"integration event",
+                {"event_id":"%s","level":"%s","host_id":"%s","hostname":"%s","msg":"integration event",
                  "timestamp":"%s","cpu_usage":%s,"ram_usage":%s}"""
-                .formatted(eventId, level, Instant.now().toString(), cpu, ram);
+                .formatted(eventId, level, hostId, hostId, Instant.now().toString(), cpu, ram);
     }
 
     private HttpRequest.Builder request(String path) {
@@ -268,26 +273,26 @@ class AnalyticsEngineIntegrationTest {
         JsonNode active = MAPPER.readTree(get("/alerts", true).body());
         assertEquals(2, active.size(), "a zero threshold opens both the CPU and RAM alerts");
 
-        JsonNode alert = MAPPER.readTree(get("/alerts/cpu-high", true).body());
+        JsonNode alert = MAPPER.readTree(get("/alerts/" + CPU_ALERT, true).body());
         assertEquals("HIGH_CPU", alert.path("alert_type").asText());
         assertEquals("OPEN", alert.path("status").asText());
 
-        assertEquals(200, post("/alerts/cpu-high/acknowledge", "", true).statusCode());
+        assertEquals(200, post("/alerts/" + CPU_ALERT + "/acknowledge", "", true).statusCode());
         assertEquals("ACKNOWLEDGED",
-                MAPPER.readTree(get("/alerts/cpu-high", true).body()).path("status").asText());
+                MAPPER.readTree(get("/alerts/" + CPU_ALERT, true).body()).path("status").asText());
 
         // Regression: a further occurrence must not undo the acknowledgement.
         ingest("alert-2", "INFO", 50, 50);
         assertEquals("ACKNOWLEDGED",
-                MAPPER.readTree(get("/alerts/cpu-high", true).body()).path("status").asText());
+                MAPPER.readTree(get("/alerts/" + CPU_ALERT, true).body()).path("status").asText());
 
-        assertEquals(200, post("/alerts/cpu-high/resolve", "", true).statusCode());
+        assertEquals(200, post("/alerts/" + CPU_ALERT + "/resolve", "", true).statusCode());
         assertEquals("RESOLVED",
-                MAPPER.readTree(get("/alerts/cpu-high", true).body()).path("status").asText());
-        assertEquals(404, post("/alerts/cpu-high/resolve", "", true).statusCode(), "already resolved");
+                MAPPER.readTree(get("/alerts/" + CPU_ALERT, true).body()).path("status").asText());
+        assertEquals(404, post("/alerts/" + CPU_ALERT + "/resolve", "", true).statusCode(), "already resolved");
         assertEquals(404, post("/alerts/does-not-exist/acknowledge", "", true).statusCode());
         assertEquals(404, get("/alerts/does-not-exist", true).statusCode());
-        assertEquals(404, get("/alerts/cpu-high/unknown-action", true).statusCode());
+        assertEquals(404, get("/alerts/" + CPU_ALERT + "/unknown-action", true).statusCode());
     }
 
     @Test
@@ -311,11 +316,84 @@ class AnalyticsEngineIntegrationTest {
         restart(configurationWithThresholds(0.0, 0.0, 5));
         ingest("notify-1", "INFO", 50, 50);
 
-        HttpResponse<String> response = get("/alerts/cpu-high/notifications?limit=10", true);
+        HttpResponse<String> response = get("/alerts/" + CPU_ALERT + "/notifications?limit=10", true);
         assertEquals(200, response.statusCode());
         assertEquals(0, MAPPER.readTree(response.body()).size(), "notifications are disabled in this config");
-        assertEquals(400, get("/alerts/cpu-high/notifications?limit=9999", true).statusCode());
-        assertEquals(401, get("/alerts/cpu-high/notifications", false).statusCode());
+        assertEquals(400, get("/alerts/" + CPU_ALERT + "/notifications?limit=9999", true).statusCode());
+        assertEquals(401, get("/alerts/" + CPU_ALERT + "/notifications", false).statusCode());
+    }
+
+    @Test
+    void eventsCarryAndFilterByTheReportingMachine() throws Exception {
+        assertEquals(200, post("/receive", eventBody("h1", "INFO", "web-01", 10, 10), true).statusCode());
+        assertEquals(200, post("/receive", eventBody("h2", "ERROR", "db-01", 20, 20), true).statusCode());
+        assertEquals(200, post("/receive", eventBody("h3", "INFO", "db-01", 30, 30), true).statusCode());
+
+        JsonNode all = MAPPER.readTree(get("/events", true).body());
+        assertEquals(3, all.path("total").asLong());
+        assertEquals("db-01", all.path("items").get(0).path("host_id").asText());
+        assertEquals("db-01", all.path("items").get(0).path("hostname").asText());
+
+        JsonNode database = MAPPER.readTree(get("/events?host_id=db-01", true).body());
+        assertEquals(2, database.path("total").asLong());
+        assertEquals(2, database.path("items").size());
+
+        JsonNode combined = MAPPER.readTree(get("/events?host_id=db-01&level=ERROR", true).body());
+        assertEquals(1, combined.path("total").asLong(), "host and level filters combine");
+
+        assertEquals(0, MAPPER.readTree(get("/events?host_id=nope", true).body()).path("total").asLong());
+    }
+
+    @Test
+    void theFleetIsListedWithLastSeenTimes() throws Exception {
+        post("/receive", eventBody("f1", "INFO", "web-01", 10, 10), true);
+        post("/receive", eventBody("f2", "INFO", "db-01", 10, 10), true);
+        post("/receive", eventBody("f3", "INFO", "db-01", 10, 10), true);
+
+        JsonNode hosts = MAPPER.readTree(get("/hosts", true).body());
+        assertEquals(2, hosts.size());
+        for (JsonNode host : hosts) {
+            assertFalse(host.path("host_id").asText().isBlank());
+            assertFalse(host.path("last_seen").asText().isBlank());
+            if ("db-01".equals(host.path("host_id").asText())) {
+                assertEquals(2, host.path("event_count").asLong());
+            }
+        }
+        assertEquals(2, MAPPER.readTree(get("/summary", true).body()).path("hosts").asInt());
+        assertEquals(401, get("/hosts", false).statusCode());
+    }
+
+    @Test
+    void twoMachinesRaiseSeparateAlerts() throws Exception {
+        restart(configurationWithThresholds(0.0, 200.0, 5));
+        assertEquals(200, post("/receive", eventBody("a1", "INFO", "web-01", 50, 5), true).statusCode());
+        assertEquals(200, post("/receive", eventBody("a2", "INFO", "db-01", 50, 5), true).statusCode());
+
+        JsonNode active = MAPPER.readTree(get("/alerts", true).body());
+        assertEquals(2, active.size(), "each machine gets its own alert");
+
+        JsonNode web = MAPPER.readTree(get("/alerts/cpu-high@web-01", true).body());
+        assertEquals("web-01", web.path("host_id").asText());
+        assertEquals(200, post("/alerts/cpu-high@web-01/acknowledge", "", true).statusCode());
+
+        assertEquals("ACKNOWLEDGED",
+                MAPPER.readTree(get("/alerts/cpu-high@web-01", true).body()).path("status").asText());
+        assertEquals("OPEN",
+                MAPPER.readTree(get("/alerts/cpu-high@db-01", true).body()).path("status").asText(),
+                "acknowledging one machine must not silence another");
+    }
+
+    @Test
+    void oneMachineDoesNotPolluteAnothersMovingAverage() throws Exception {
+        // A shared window would average these to 50 and fire on a host that is idle.
+        restart(configurationWithThresholds(80.0, 200.0, 5));
+        for (int index = 0; index < 5; index++) {
+            post("/receive", eventBody("hot-" + index, "INFO", "busy-01", 100, 5), true);
+            post("/receive", eventBody("cold-" + index, "INFO", "idle-01", 1, 5), true);
+        }
+
+        assertEquals(200, get("/alerts/cpu-high@busy-01", true).statusCode(), "the busy machine alerts");
+        assertEquals(404, get("/alerts/cpu-high@idle-01", true).statusCode(), "the idle machine does not");
     }
 
     @Test
@@ -349,10 +427,10 @@ class AnalyticsEngineIntegrationTest {
     void anAcknowledgedAlertSurvivesARestart() throws Exception {
         restart(configurationWithThresholds(0.0, 0.0, 5));
         ingest("alert-restart", "INFO", 50, 50);
-        assertEquals(200, post("/alerts/cpu-high/acknowledge", "", true).statusCode());
+        assertEquals(200, post("/alerts/" + CPU_ALERT + "/acknowledge", "", true).statusCode());
 
         restart(configurationWithThresholds(0.0, 0.0, 5));
-        JsonNode alert = MAPPER.readTree(get("/alerts/cpu-high", true).body());
+        JsonNode alert = MAPPER.readTree(get("/alerts/" + CPU_ALERT, true).body());
         assertEquals("ACKNOWLEDGED", alert.path("status").asText());
         assertNotNull(alert.path("first_seen").asText());
     }

@@ -47,7 +47,7 @@ class NotificationServiceTest {
     }
 
     private AlertTransition transition(AlertTransition.Type type) {
-        AlertRecord alert = new AlertRecord("cpu-high", "HIGH_CPU", "cpu is high",
+        AlertRecord alert = new AlertRecord("cpu-high@web-01", "HIGH_CPU", "web-01", "cpu is high",
                 Instant.parse("2026-09-11T10:00:00Z"));
         return new AlertTransition(alert, type);
     }
@@ -75,12 +75,12 @@ class NotificationServiceTest {
         JsonNode payload = MAPPER.readTree(sink.lastBody());
         assertEquals("eventwatch.notification.v1", payload.path("schema_version").asText());
         assertEquals("alert.opened", payload.path("event_type").asText());
-        assertEquals("cpu-high", payload.path("alert").path("alert_key").asText());
+        assertEquals("cpu-high@web-01", payload.path("alert").path("alert_key").asText());
         assertEquals("HIGH_CPU", payload.path("alert").path("alert_type").asText());
         assertEquals("OPEN", payload.path("alert").path("status").asText());
         assertEquals("application/json", sink.lastContentType());
 
-        List<NotificationRecord> history = repository.findByAlertKey("cpu-high", 10);
+        List<NotificationRecord> history = repository.findByAlertKey("cpu-high@web-01", 10);
         assertEquals(1, history.size());
         assertEquals("DELIVERED", history.get(0).deliveryStatus());
         assertEquals(200, history.get(0).httpStatus());
@@ -147,7 +147,7 @@ class NotificationServiceTest {
         service.shutdown();
 
         assertEquals(3, sink.requestCount(), "max attempts is three");
-        List<NotificationRecord> history = repository.findByAlertKey("cpu-high", 10);
+        List<NotificationRecord> history = repository.findByAlertKey("cpu-high@web-01", 10);
         assertEquals(3, history.size());
         assertEquals(3, history.get(0).attemptNumber());
         assertTrue(history.stream().allMatch(record -> "FAILED".equals(record.deliveryStatus())));
@@ -163,7 +163,7 @@ class NotificationServiceTest {
         service.shutdown();
 
         assertEquals(1, sink.requestCount(), "a permanent rejection must not be retried");
-        assertEquals(400, repository.findByAlertKey("cpu-high", 10).get(0).httpStatus());
+        assertEquals(400, repository.findByAlertKey("cpu-high@web-01", 10).get(0).httpStatus());
     }
 
     @Test
@@ -185,7 +185,7 @@ class NotificationServiceTest {
         Thread.sleep(500);
         service.shutdown();
 
-        List<NotificationRecord> history = repository.findByAlertKey("cpu-high", 10);
+        List<NotificationRecord> history = repository.findByAlertKey("cpu-high@web-01", 10);
         assertTrue(history.size() >= 1);
         assertNotNull(history.get(0).errorMessage());
         assertFalseContains(history.get(0).errorMessage(), "null");
@@ -199,7 +199,7 @@ class NotificationServiceTest {
         service.shutdown();
 
         assertEquals(0, sink.requestCount());
-        assertTrue(repository.findByAlertKey("cpu-high", 10).isEmpty());
+        assertTrue(repository.findByAlertKey("cpu-high@web-01", 10).isEmpty());
     }
 
     @Test
@@ -211,7 +211,7 @@ class NotificationServiceTest {
             service.shutdown();
         }
         assertEquals(0, sink.requestCount());
-        assertTrue(repository.findByAlertKey("cpu-high", 10).isEmpty());
+        assertTrue(repository.findByAlertKey("cpu-high@web-01", 10).isEmpty());
     }
 
     private void assertFalseContains(String value, String unwanted) {

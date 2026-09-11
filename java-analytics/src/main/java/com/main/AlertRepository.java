@@ -22,9 +22,9 @@ public class AlertRepository {
     public synchronized AlertTransition saveOccurrence(AlertRecord alert) throws SQLException {
         AlertRecord existing = findByKey(alert.getAlertKey());
         String query = """
-                INSERT INTO alerts (alert_key, alert_type, message, status, first_seen,
+                INSERT INTO alerts (alert_key, alert_type, host_id, message, status, first_seen,
                                     last_seen, occurrence_count)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(alert_key) DO UPDATE SET
                     message = excluded.message,
                     status = CASE WHEN alerts.status = 'RESOLVED' THEN 'OPEN' ELSE alerts.status END,
@@ -35,11 +35,12 @@ public class AlertRepository {
                 PreparedStatement statement = connection.prepareStatement(query)) {
             statement.setString(1, alert.getAlertKey());
             statement.setString(2, alert.getAlertType());
-            statement.setString(3, alert.getMessage());
-            statement.setString(4, alert.getStatus().name());
-            statement.setString(5, alert.getFirstSeen().toString());
-            statement.setString(6, alert.getLastSeen().toString());
-            statement.setInt(7, alert.getOccurrenceCount());
+            statement.setString(3, alert.getHostId());
+            statement.setString(4, alert.getMessage());
+            statement.setString(5, alert.getStatus().name());
+            statement.setString(6, alert.getFirstSeen().toString());
+            statement.setString(7, alert.getLastSeen().toString());
+            statement.setInt(8, alert.getOccurrenceCount());
             statement.executeUpdate();
         }
         AlertTransition.Type type;
@@ -96,8 +97,8 @@ public class AlertRepository {
 
     public List<AlertRecord> find(String alertKey, String status) throws SQLException {
         List<AlertRecord> alerts = new ArrayList<>();
-        StringBuilder query = new StringBuilder("SELECT alert_key, alert_type, message, status, first_seen, "
-                + "last_seen, occurrence_count FROM alerts WHERE 1 = 1");
+        StringBuilder query = new StringBuilder("SELECT alert_key, alert_type, host_id, message, status, "
+                + "first_seen, last_seen, occurrence_count FROM alerts WHERE 1 = 1");
         List<String> parameters = new ArrayList<>();
         if (alertKey != null) {
             query.append(" AND alert_key = ?");
@@ -120,6 +121,7 @@ public class AlertRepository {
                     AlertRecord alert = new AlertRecord(
                             results.getString("alert_key"),
                             results.getString("alert_type"),
+                            results.getString("host_id"),
                             results.getString("message"),
                             AlertStatus.valueOf(results.getString("status")),
                             Instant.parse(results.getString("first_seen")),

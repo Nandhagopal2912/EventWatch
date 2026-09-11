@@ -21,6 +21,8 @@ public class SqliteDialect implements SqlDialect {
                     level TEXT NOT NULL,
                     message TEXT NOT NULL,
                     event_timestamp TEXT NOT NULL,
+                    host_id TEXT,
+                    hostname TEXT,
                     cpu_usage REAL NOT NULL,
                     ram_usage REAL NOT NULL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -30,11 +32,14 @@ public class SqliteDialect implements SqlDialect {
                         + "ON telemetry_events(event_id) WHERE event_id IS NOT NULL",
                 "CREATE INDEX IF NOT EXISTS idx_telemetry_events_level "
                         + "ON telemetry_events(level, event_timestamp)",
+                "CREATE INDEX IF NOT EXISTS idx_telemetry_events_host "
+                        + "ON telemetry_events(host_id, event_timestamp)",
                 """
                 CREATE TABLE IF NOT EXISTS alerts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     alert_key TEXT NOT NULL UNIQUE,
                     alert_type TEXT NOT NULL,
+                    host_id TEXT,
                     message TEXT NOT NULL,
                     status TEXT NOT NULL,
                     first_seen TEXT NOT NULL,
@@ -61,15 +66,22 @@ public class SqliteDialect implements SqlDialect {
     @Override
     public String insertEventIgnoringDuplicates() {
         return "INSERT OR IGNORE INTO telemetry_events "
-                + "(event_id, level, message, event_timestamp, cpu_usage, ram_usage) "
-                + "VALUES (?, ?, ?, ?, ?, ?)";
+                + "(event_id, level, message, event_timestamp, host_id, hostname, cpu_usage, ram_usage) "
+                + "VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
     }
 
     @Override
     public void applyLegacyMigrations(Statement statement) throws SQLException {
-        // Databases written before phase 5 have no event_id column.
+        // Columns added after a database may already have been created.
+        addColumn(statement, "ALTER TABLE telemetry_events ADD COLUMN event_id TEXT");
+        addColumn(statement, "ALTER TABLE telemetry_events ADD COLUMN host_id TEXT");
+        addColumn(statement, "ALTER TABLE telemetry_events ADD COLUMN hostname TEXT");
+        addColumn(statement, "ALTER TABLE alerts ADD COLUMN host_id TEXT");
+    }
+
+    private void addColumn(Statement statement, String ddl) throws SQLException {
         try {
-            statement.executeUpdate("ALTER TABLE telemetry_events ADD COLUMN event_id TEXT");
+            statement.executeUpdate(ddl);
         } catch (SQLException exception) {
             if (!exception.getMessage().toLowerCase(Locale.ROOT).contains("duplicate column")) {
                 throw exception;

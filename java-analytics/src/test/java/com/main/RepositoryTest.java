@@ -41,6 +41,12 @@ class RepositoryTest {
         return new AnalyticsEngine.LogEntry(eventId, level, message, Instant.parse(timestamp), cpu, ram);
     }
 
+    private AnalyticsEngine.LogEntry entry(String eventId, String hostId, String level,
+            String message, String timestamp) {
+        return new AnalyticsEngine.LogEntry(eventId, level, message, Instant.parse(timestamp),
+                hostId, hostId + ".local", 10.0, 20.0);
+    }
+
     @Test
     void schemaCreationIsRepeatable() throws SQLException {
         database.initializeSchema();
@@ -112,6 +118,61 @@ class RepositoryTest {
     }
 
     @Test
+    void hostIdentityRoundTrips() throws SQLException {
+        events.insertIfAbsent(entry("h1", "web-01", "INFO", "m", "2026-09-11T10:00:00Z"));
+        AnalyticsEngine.LogEntry stored = events.recent(1).get(0);
+        assertEquals("web-01", stored.hostId);
+        assertEquals("web-01.local", stored.hostname);
+    }
+
+    @Test
+    void anEventStoredWithoutIdentityReadsBackAsUnknown() throws SQLException {
+        events.insertIfAbsent(entry("legacy", "INFO", "m", "2026-09-11T10:00:00Z", 5, 5));
+        assertEquals(AnalyticsEngine.UNKNOWN_HOST, events.recent(1).get(0).hostId);
+    }
+
+    @Test
+    void filtersByHost() throws SQLException {
+        events.insertIfAbsent(entry("a", "web-01", "INFO", "one", "2026-09-11T09:00:00Z"));
+        events.insertIfAbsent(entry("b", "db-01", "ERROR", "two", "2026-09-11T10:00:00Z"));
+        events.insertIfAbsent(entry("c", "db-01", "INFO", "three", "2026-09-11T11:00:00Z"));
+
+        assertEquals(2, events.count(null, "db-01", null, null));
+        assertEquals(1, events.count(null, "web-01", null, null));
+        assertEquals(1, events.count("ERROR", "db-01", null, null), "host and level combine");
+        assertEquals(0, events.count(null, "missing", null, null));
+        assertEquals(2, events.find(null, "db-01", null, null, 10, 0).size());
+        assertEquals(3, events.count(null, null, null, null), "a null host means every machine");
+    }
+
+    @Test
+    void hostsAreListedNewestActivityFirst() throws SQLException {
+        events.insertIfAbsent(entry("a", "web-01", "INFO", "one", "2026-09-11T09:00:00Z"));
+        events.insertIfAbsent(entry("b", "db-01", "INFO", "two", "2026-09-11T10:00:00Z"));
+        events.insertIfAbsent(entry("c", "db-01", "INFO", "three", "2026-09-11T11:00:00Z"));
+
+        List<EventRepository.HostSummary> hosts = events.hosts(10);
+        assertEquals(2, hosts.size());
+        assertEquals("db-01", hosts.get(0).hostId(), "the most recently active machine leads");
+        assertEquals("db-01.local", hosts.get(0).hostname());
+        assertEquals(2, hosts.get(0).eventCount());
+        assertEquals(Instant.parse("2026-09-11T11:00:00Z"), hosts.get(0).lastSeen());
+        assertEquals(1, events.hosts(1).size(), "the listing is bounded");
+    }
+
+    @Test
+    void anEmptyDatabaseListsNoHosts() throws SQLException {
+        assertTrue(events.hosts(10).isEmpty());
+    }
+
+    @Test
+    void alertsRememberWhichMachineTheyAreAbout() throws SQLException {
+        alerts.saveOccurrence(new AlertRecord("cpu-high@web-01", "HIGH_CPU", "web-01", "m",
+                Instant.parse("2026-09-11T10:00:00Z")));
+        assertEquals("web-01", alerts.findByKey("cpu-high@web-01").getHostId());
+    }
+
+    @Test
     void latestReturnsNullOnAnEmptyDatabase() throws SQLException {
         assertNull(events.latest());
         events.insertIfAbsent(entry("a", "INFO", "only", "2026-09-11T10:00:00Z", 1, 1));
@@ -121,7 +182,7 @@ class RepositoryTest {
     @Test
     void firstOccurrenceOpensAnAlert() throws SQLException {
         AlertTransition transition = alerts.saveOccurrence(
-                new AlertRecord("cpu-high", "HIGH_CPU", "cpu is high", Instant.parse("2026-09-11T10:00:00Z")));
+                new AlertRecord("cpu-high", "HIGH_CPU", "web-01", "cpu is high", Instant.parse("2026-09-11T10:00:00Z")));
         assertEquals(AlertTransition.Type.OPENED, transition.type());
         assertEquals(AlertStatus.OPEN, transition.alert().getStatus());
         assertEquals(1, transition.alert().getOccurrenceCount());
@@ -129,9 +190,9 @@ class RepositoryTest {
 
     @Test
     void repeatOccurrenceIncrementsWithoutReopening() throws SQLException {
-        alerts.saveOccurrence(new AlertRecord("cpu-high", "HIGH_CPU", "first", Instant.parse("2026-09-11T10:00:00Z")));
+        alerts.saveOccurrence(new AlertRecord("cpu-high", "HIGH_CPU", "web-01", "first", Instant.parse("2026-09-11T10:00:00Z")));
         AlertTransition transition = alerts.saveOccurrence(
-                new AlertRecord("cpu-high", "HIGH_CPU", "second", Instant.parse("2026-09-11T10:01:00Z")));
+                new AlertRecord("cpu-high", "HIGH_CPU", "web-01", "second", Instant.parse("2026-09-11T10:01:00Z")));
         assertEquals(AlertTransition.Type.OCCURRENCE, transition.type());
         assertEquals(2, transition.alert().getOccurrenceCount());
         assertEquals("second", transition.alert().getMessage(), "the message follows the latest value");
@@ -140,11 +201,11 @@ class RepositoryTest {
     @Test
     void acknowledgedAlertSurvivesFurtherOccurrences() throws SQLException {
         // Regression: the upsert used to reset status to OPEN, undoing an acknowledgement.
-        alerts.saveOccurrence(new AlertRecord("cpu-high", "HIGH_CPU", "m", Instant.parse("2026-09-11T10:00:00Z")));
+        alerts.saveOccurrence(new AlertRecord("cpu-high", "HIGH_CPU", "web-01", "m", Instant.parse("2026-09-11T10:00:00Z")));
         assertNotNull(alerts.acknowledge("cpu-high"));
 
         AlertTransition transition = alerts.saveOccurrence(
-                new AlertRecord("cpu-high", "HIGH_CPU", "m", Instant.parse("2026-09-11T10:01:00Z")));
+                new AlertRecord("cpu-high", "HIGH_CPU", "web-01", "m", Instant.parse("2026-09-11T10:01:00Z")));
         assertEquals(AlertTransition.Type.OCCURRENCE, transition.type());
         assertEquals(AlertStatus.ACKNOWLEDGED, transition.alert().getStatus());
         assertEquals(2, transition.alert().getOccurrenceCount());
@@ -152,11 +213,11 @@ class RepositoryTest {
 
     @Test
     void resolvedAlertReopensOnTheNextOccurrence() throws SQLException {
-        alerts.saveOccurrence(new AlertRecord("ram-high", "HIGH_RAM", "m", Instant.parse("2026-09-11T10:00:00Z")));
+        alerts.saveOccurrence(new AlertRecord("ram-high", "HIGH_RAM", "web-01", "m", Instant.parse("2026-09-11T10:00:00Z")));
         assertNotNull(alerts.resolve("ram-high", Instant.parse("2026-09-11T10:05:00Z")));
 
         AlertTransition transition = alerts.saveOccurrence(
-                new AlertRecord("ram-high", "HIGH_RAM", "m", Instant.parse("2026-09-11T10:10:00Z")));
+                new AlertRecord("ram-high", "HIGH_RAM", "web-01", "m", Instant.parse("2026-09-11T10:10:00Z")));
         assertEquals(AlertTransition.Type.REOPENED, transition.type());
         assertEquals(AlertStatus.OPEN, transition.alert().getStatus());
     }
@@ -166,7 +227,7 @@ class RepositoryTest {
         assertNull(alerts.acknowledge("missing"), "acknowledging an unknown alert changes nothing");
         assertNull(alerts.resolve("missing", Instant.now()), "resolving an unknown alert changes nothing");
 
-        alerts.saveOccurrence(new AlertRecord("cpu-high", "HIGH_CPU", "m", Instant.parse("2026-09-11T10:00:00Z")));
+        alerts.saveOccurrence(new AlertRecord("cpu-high", "HIGH_CPU", "web-01", "m", Instant.parse("2026-09-11T10:00:00Z")));
         assertNotNull(alerts.resolve("cpu-high", Instant.parse("2026-09-11T10:01:00Z")));
         assertNull(alerts.resolve("cpu-high", Instant.parse("2026-09-11T10:02:00Z")), "already resolved");
         assertNull(alerts.acknowledge("cpu-high"), "a resolved alert cannot be acknowledged");
@@ -174,8 +235,8 @@ class RepositoryTest {
 
     @Test
     void activeAlertsExcludeResolvedOnes() throws SQLException {
-        alerts.saveOccurrence(new AlertRecord("cpu-high", "HIGH_CPU", "m", Instant.parse("2026-09-11T10:00:00Z")));
-        alerts.saveOccurrence(new AlertRecord("ram-high", "HIGH_RAM", "m", Instant.parse("2026-09-11T10:00:00Z")));
+        alerts.saveOccurrence(new AlertRecord("cpu-high", "HIGH_CPU", "web-01", "m", Instant.parse("2026-09-11T10:00:00Z")));
+        alerts.saveOccurrence(new AlertRecord("ram-high", "HIGH_RAM", "web-01", "m", Instant.parse("2026-09-11T10:00:00Z")));
         assertEquals(2, alerts.findActive().size());
 
         alerts.resolve("ram-high", Instant.parse("2026-09-11T10:05:00Z"));

@@ -32,8 +32,10 @@ public class EventRepository {
             statement.setString(2, event.level);
             statement.setString(3, event.message);
             statement.setString(4, event.timestamp.toString());
-            statement.setDouble(5, event.cpuUsage);
-            statement.setDouble(6, event.ramUsage);
+            statement.setString(5, event.hostId);
+            statement.setString(6, event.hostname);
+            statement.setDouble(7, event.cpuUsage);
+            statement.setDouble(8, event.ramUsage);
             int inserted = statement.executeUpdate();
             connection.commit();
             return inserted > 0;
@@ -42,13 +44,22 @@ public class EventRepository {
 
     public List<AnalyticsEngine.LogEntry> find(String level, Instant from, Instant to,
             int limit, int offset) throws SQLException {
+        return find(level, null, from, to, limit, offset);
+    }
+
+    public List<AnalyticsEngine.LogEntry> find(String level, String hostId, Instant from, Instant to,
+            int limit, int offset) throws SQLException {
         StringBuilder query = new StringBuilder(
-                "SELECT event_id, level, message, event_timestamp, cpu_usage, ram_usage "
+                "SELECT event_id, level, message, event_timestamp, host_id, hostname, cpu_usage, ram_usage "
                         + "FROM telemetry_events WHERE 1 = 1");
         List<String> parameters = new ArrayList<>();
         if (level != null) {
             query.append(" AND level = ?");
             parameters.add(level);
+        }
+        if (hostId != null) {
+            query.append(" AND host_id = ?");
+            parameters.add(hostId);
         }
         if (from != null) {
             query.append(" AND event_timestamp >= ?");
@@ -79,11 +90,19 @@ public class EventRepository {
     }
 
     public long count(String level, Instant from, Instant to) throws SQLException {
+        return count(level, null, from, to);
+    }
+
+    public long count(String level, String hostId, Instant from, Instant to) throws SQLException {
         StringBuilder query = new StringBuilder("SELECT COUNT(*) FROM telemetry_events WHERE 1 = 1");
         List<String> parameters = new ArrayList<>();
         if (level != null) {
             query.append(" AND level = ?");
             parameters.add(level);
+        }
+        if (hostId != null) {
+            query.append(" AND host_id = ?");
+            parameters.add(hostId);
         }
         if (from != null) {
             query.append(" AND event_timestamp >= ?");
@@ -126,8 +145,34 @@ public class EventRepository {
         return counts;
     }
 
+    /** One row per machine that has ever reported, with its last-seen time. */
+    public List<HostSummary> hosts(int limit) throws SQLException {
+        String query = "SELECT host_id, MAX(hostname) AS hostname, COUNT(*) AS event_count, "
+                + "MAX(event_timestamp) AS last_seen FROM telemetry_events "
+                + "WHERE host_id IS NOT NULL GROUP BY host_id ORDER BY last_seen DESC LIMIT ?";
+        List<HostSummary> hosts = new ArrayList<>();
+        try (Connection connection = connections.getConnection();
+                PreparedStatement statement = connection.prepareStatement(query)) {
+            statement.setInt(1, limit);
+            try (ResultSet results = statement.executeQuery()) {
+                while (results.next()) {
+                    hosts.add(new HostSummary(
+                            results.getString("host_id"),
+                            results.getString("hostname"),
+                            results.getLong("event_count"),
+                            Instant.parse(results.getString("last_seen"))));
+                }
+            }
+        }
+        return hosts;
+    }
+
+    /** A machine as the analytics service knows it. */
+    public record HostSummary(String hostId, String hostname, long eventCount, Instant lastSeen) {
+    }
+
     public AnalyticsEngine.LogEntry latest() throws SQLException {
-        String query = "SELECT event_id, level, message, event_timestamp, cpu_usage, ram_usage "
+        String query = "SELECT event_id, level, message, event_timestamp, host_id, hostname, cpu_usage, ram_usage "
                 + "FROM telemetry_events ORDER BY event_timestamp DESC LIMIT 1";
         try (Connection connection = connections.getConnection();
                 PreparedStatement statement = connection.prepareStatement(query);
@@ -146,6 +191,8 @@ public class EventRepository {
                 results.getString("level"),
                 results.getString("message"),
                 Instant.parse(results.getString("event_timestamp")),
+                results.getString("host_id"),
+                results.getString("hostname"),
                 results.getDouble("cpu_usage"),
                 results.getDouble("ram_usage"));
     }

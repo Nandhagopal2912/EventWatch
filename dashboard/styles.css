@@ -54,3 +54,6 @@ td:nth-child(2) { max-width: 250px; overflow: hidden; text-overflow: ellipsis; }
 .empty { color: var(--muted); font: 13px "Trebuchet MS", sans-serif; }
 @media (max-width: 800px) { .header, .grid { display: block; } .config { margin-top: 24px; } .metrics { grid-template-columns: repeat(2, 1fr); margin-top: 20px; } .alerts-panel { margin-top: 20px; } }
 @media (max-width: 450px) { .shell { width: min(100% - 24px, 1180px); padding-top: 30px; } .metrics { gap: 8px; } .metric { padding: 14px; } .metric strong { font-size: 26px; } }
+.panel-controls { display: flex; gap: 8px; align-items: center; }
+.panel-controls select { background: transparent; color: var(--muted); border: 1px solid var(--muted); border-radius: 6px; padding: 6px 8px; font-size: 11px; font-family: inherit; }
+.host-tag { color: var(--muted); font-size: 11px; white-space: nowrap; }

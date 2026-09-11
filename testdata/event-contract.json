@@ -1,6 +1,8 @@
 {
   "event_id": "8f14e45f-ceea-167a-5a36-dedd4bea2543",
   "correlation_id": "2b1f7c90-4d5e-4a11-9d3c-71b0f0a9c8e2",
+  "host_id": "9c1f4b2e-7a35-4c88-b0d1-3e6a9f2c5d47",
+  "hostname": "web-01",
   "level": "ERROR",
   "msg": "High CPU Saturation Alert",
   "timestamp": "2026-09-04T18:46:00Z",

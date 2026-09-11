@@ -1,8 +1,8 @@
 # EventWatch
 
-EventWatch is a two-service host telemetry and event-monitoring pipeline. A Go collector captures application events together with CPU and RAM usage, then forwards them to a Java analytics engine for processing, persistence, and reporting.
+EventWatch is a self-hosted fleet monitor for a small number of machines. A lightweight Go agent runs on each host, captures application events together with that machine's CPU and RAM usage, and forwards them to a Java analytics service that keeps per-host history, evaluates per-host alert rules, and notifies an operator.
 
-The current implementation completes Phases 1–11. Future improvements are documented in `CLAUDE.md`.
+The current implementation completes Phases 1–12. Future improvements are documented in `CLAUDE.md`.
 
 ## Project Phase Status
 
@@ -19,6 +19,7 @@ The current implementation completes Phases 1–11. Future improvements are docu
 | **Phase 9**  | **✅ Completed** | Observability                    | Structured JSON logs in both services, correlation IDs carried end to end, and Prometheus metrics for both services.                                          |
 | **Phase 10** | **✅ Completed** | Testing and delivery             | Unit, integration, failure and contract tests on both services, plus Dockerfiles, Docker Compose, and a CI pipeline.                                |
 | **Phase 11** | **✅ Completed** | Scaling beyond SQLite            | Pluggable storage with a PostgreSQL backend, connection pooling, a retention policy, and a load harness. Messaging and service splits remain deliberately deferred. |
+| **Phase 12** | **✅ Completed** | Host identity                    | A stable per-agent identity on every event, per-host moving windows and alert keys, host filters, and a fleet listing.                     |
 
 **Current state:** EventWatch is a working local telemetry and event-monitoring system. Go collects and forwards events, Java analyzes and persists them, alert state changes are delivered to a configured webhook, and the browser dashboard reports events, alerts, and delivery history.
 
@@ -61,7 +62,8 @@ docker-compose.yml              Collector, analytics, and dashboard together
 
 ## Architecture
 
-- **Go ingress** (`go-collector/`): accepts `GET` requests at `http://localhost:8082/capture`, samples host CPU/RAM usage, and forwards each event to the Java service.
+- **Go agent** (`go-collector/`): one per machine. Accepts `GET` requests at `http://localhost:8082/capture`, samples that machine's CPU/RAM usage, stamps every event with its host identity, and forwards to the Java service.
+- **Host identity:** each agent establishes a stable `host_id` at startup and stores it beside its queue, so a restart is not mistaken for a new machine. Set `HOST_ID` to pin it explicitly; `HOSTNAME_OVERRIDE` renames the reported hostname.
 - **Java analytics engine** (`java-analytics/`): accepts `POST` requests at `http://localhost:8080/receive`, stores telemetry in SQLite, reloads events after restart, and prints error counts plus a five-event CPU/RAM moving average.
 - **Reliability queue** (`go-collector/pending-events/`): stores events when Java is temporarily unavailable and removes them only after a successful `2xx` response. Event IDs prevent duplicate database rows when retries occur. Permanent client failures move to `rejected-events/`.
 - **Health checks:** `GET http://localhost:8082/health` and `GET http://localhost:8080/health` report service availability without authentication.
@@ -69,6 +71,7 @@ docker-compose.yml              Collector, analytics, and dashboard together
 - **Alert acknowledgement:** `POST http://localhost:8080/alerts/{alert_key}/acknowledge` changes an `OPEN` alert to `ACKNOWLEDGED`.
 - **Alert resolution:** `POST http://localhost:8080/alerts/{alert_key}/resolve` changes an alert to `RESOLVED`, removing it from the active alerts response.
 - **Phase 7 query API:** `GET /events`, `GET /summary`, `GET /alerts`, and `GET /alerts/{alert_key}` provide bounded JSON data for the dashboard. All of them require the API key.
+- **Phase 12 fleet awareness:** every event carries `host_id` and `hostname`. Moving averages, alert thresholds, and alert keys are scoped per machine — `cpu-high@web-01` is a different alert from `cpu-high@db-01` — so one busy host cannot drag an idle one into an alert, and acknowledging one machine does not silence another. `GET /hosts` lists every machine with its event count and last-seen time; `GET /events?host_id=` filters to one.
 - **Phase 9 observability:** both services emit one JSON object per log line, expose `GET /metrics` in Prometheus text format, and carry an `X-Correlation-ID` from the collector through to the analytics response.
 - **Phase 8 notifications:** alert state changes (opened, reopened, acknowledged, resolved) are POSTed as versioned JSON to `NOTIFICATION_WEBHOOK_URL`. Repeat occurrences are suppressed until `NOTIFICATION_REMINDER_SECONDS` passes. Every attempt is recorded and readable at `GET /alerts/{alert_key}/notifications`.
 - **Dashboard:** `dashboard/index.html` displays summaries, recent events, active alerts, and per-alert delivery history. It reads the API key in the browser, escapes all event text before rendering it, and never accesses SQLite directly.
@@ -247,6 +250,29 @@ docker compose --profile postgres up --build
 with `DATABASE_URL=jdbc:postgresql://postgres:5432/eventwatch` in `.env`. Telemetry and the pending queue live on named volumes,
 so a container restart keeps both history and undelivered events. The collector waits for the
 analytics health check before starting.
+
+## Running a fleet
+
+Install the agent on each machine and point them all at one analytics service:
+
+```powershell
+$env:JAVA_BACKEND_URL="http://analytics-host:8080/receive"; go run .
+```
+
+Each agent generates and stores its own identity on first start. Nothing else needs configuring —
+the analytics service creates per-host windows and alert keys as machines appear.
+
+```powershell
+curl.exe "http://localhost:8080/hosts" -H "X-EventWatch-Key: local-secret"
+curl.exe "http://localhost:8080/events?host_id=web-01" -H "X-EventWatch-Key: local-secret"
+curl.exe -X POST "http://localhost:8080/alerts/cpu-high@web-01/acknowledge" -H "X-EventWatch-Key: local-secret"
+```
+
+An event from an agent older than Phase 12 carries no identity and is attributed to the host
+`unknown` rather than rejected.
+
+**Before deploying beyond localhost:** `/capture` is unauthenticated and there is no TLS, so an
+agent must not be exposed to an untrusted network yet. That is Phase 13.
 
 ## Requirements
 

@@ -36,20 +36,36 @@ class ContractTest {
     void theContractCarriesEveryDocumentedField() throws IOException {
         JsonNode contract = contract();
         for (String field : new String[] {
-                "event_id", "correlation_id", "level", "msg", "timestamp", "cpu_usage", "ram_usage"}) {
+                "event_id", "correlation_id", "host_id", "hostname",
+                "level", "msg", "timestamp", "cpu_usage", "ram_usage"}) {
             assertTrue(contract.hasNonNull(field), "the contract must document " + field);
         }
-        assertEquals(7, contract.size(), "an undocumented field was added to the contract fixture");
+        assertEquals(9, contract.size(), "an undocumented field was added to the contract fixture");
         assertTrue(contract.path("timestamp").asText().endsWith("Z"), "timestamps are UTC");
         assertEquals(Instant.parse("2026-09-04T18:46:00Z"), Instant.parse(contract.path("timestamp").asText()));
     }
 
     @Test
-    void theContractRemainsValidWithoutItsOptionalField() throws IOException {
-        // The collector omits correlation_id when it is empty; that must still validate.
-        ObjectNode withoutCorrelationId = ((ObjectNode) contract()).deepCopy();
-        withoutCorrelationId.remove("correlation_id");
-        assertNull(AnalyticsEngine.validateEvent(withoutCorrelationId));
+    void theContractRemainsValidWithoutItsOptionalFields() throws IOException {
+        // The collector omits correlation_id when it is empty, and an agent older than
+        // phase 12 sends no identity at all; both must still validate.
+        for (String optional : new String[] {"correlation_id", "host_id", "hostname"}) {
+            ObjectNode without = ((ObjectNode) contract()).deepCopy();
+            without.remove(optional);
+            assertNull(AnalyticsEngine.validateEvent(without), "removing " + optional + " must still validate");
+        }
+    }
+
+    @Test
+    void identityFieldsAreBoundedWhenPresent() throws IOException {
+        ObjectNode oversized = ((ObjectNode) contract()).deepCopy();
+        oversized.put("host_id", "x".repeat(129));
+        assertTrue(AnalyticsEngine.validateEvent(oversized) != null,
+                "an unbounded host id would become an unbounded alert key");
+
+        ObjectNode wrongType = ((ObjectNode) contract()).deepCopy();
+        wrongType.put("hostname", 42);
+        assertTrue(AnalyticsEngine.validateEvent(wrongType) != null);
     }
 
     @Test

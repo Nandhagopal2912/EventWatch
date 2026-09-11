@@ -5,15 +5,17 @@ import java.time.Instant;
 public class AlertRecord {
     private final String alertKey;
     private final String alertType;
+    private final String hostId;
     private final String message;
     private final AlertStatus status;
     private final Instant firstSeen;
     private final Instant lastSeen;
     private final int occurrenceCount;
 
-    public AlertRecord(String alertKey, String alertType, String message, Instant firstSeen) {
+    public AlertRecord(String alertKey, String alertType, String hostId, String message, Instant firstSeen) {
         this.alertKey = alertKey;
         this.alertType = alertType;
+        this.hostId = hostId;
         this.message = message;
         this.status = AlertStatus.OPEN;
         this.firstSeen = firstSeen;
@@ -21,10 +23,11 @@ public class AlertRecord {
         this.occurrenceCount = 1;
     }
 
-    public AlertRecord(String alertKey, String alertType, String message,
+    public AlertRecord(String alertKey, String alertType, String hostId, String message,
             AlertStatus status, Instant firstSeen, Instant lastSeen, int occurrenceCount) {
         this.alertKey = alertKey;
         this.alertType = alertType;
+        this.hostId = hostId;
         this.message = message;
         this.status = status;
         this.firstSeen = firstSeen;
@@ -38,6 +41,11 @@ public class AlertRecord {
 
     public String getAlertType() {
         return alertType;
+    }
+
+    /** The machine this alert is about. */
+    public String getHostId() {
+        return hostId;
     }
 
     public String getMessage() {

@@ -4,6 +4,7 @@ const keyInput = document.querySelector("#api-key");
 const notice = document.querySelector("#connection");
 const eventsBody = document.querySelector("#events-body");
 const alertsList = document.querySelector("#alerts-list");
+const hostFilter = document.querySelector("#host-filter");
 
 // Event and alert text is operator-supplied data: escape it before it reaches innerHTML.
 function escapeHtml(value) {
@@ -32,6 +33,7 @@ async function getJson(path) {
 }
 
 function renderSummary(summary) {
+  document.querySelector("#host-count").textContent = summary.hosts ?? "--";
   document.querySelector("#total-events").textContent = summary.total_events;
   document.querySelector("#active-alerts").textContent = summary.active_alerts;
   document.querySelector("#average-cpu").textContent =
@@ -46,12 +48,13 @@ function renderEvents(events) {
       .map(
         (event) => `
     <tr><td><span class="badge">${escapeHtml(event.level)}</span></td>
+    <td class="host-tag" title="${escapeHtml(event.host_id ?? "")}">${escapeHtml(event.hostname ?? event.host_id ?? "unknown")}</td>
     <td title="${escapeHtml(event.msg)}">${escapeHtml(event.msg)}</td>
     <td>${escapeHtml(new Date(event.timestamp).toLocaleString())}</td><td>${Number(event.cpu_usage).toFixed(1)}%</td>
     <td>${Number(event.ram_usage).toFixed(1)}%</td></tr>`,
       )
       .join("") ||
-    '<tr><td colspan="5" class="empty">No events found.</td></tr>';
+    '<tr><td colspan="6" class="empty">No events found.</td></tr>';
 }
 
 function renderAlerts(alerts) {
@@ -60,6 +63,7 @@ function renderAlerts(alerts) {
       .map(
         (alert) => `
     <div class="alert-card"><strong>${escapeHtml(alert.alert_type)} · ${escapeHtml(alert.status)}</strong>
+    <div class="host-tag">${escapeHtml(alert.host_id ?? "unknown")}</div>
     <div>${escapeHtml(alert.message)}</div><div class="alert-meta">${Number(alert.occurrence_count)} occurrence(s) · last seen ${escapeHtml(new Date(alert.last_seen).toLocaleString())}</div>
     <div class="alert-actions"><button data-action="acknowledge" data-key="${escapeHtml(alert.alert_key)}" type="button">Acknowledge</button><button data-action="resolve" data-key="${escapeHtml(alert.alert_key)}" type="button">Resolve</button><button data-action="notifications" data-key="${escapeHtml(alert.alert_key)}" type="button">History</button></div>
     <div class="notification-history" data-history-for="${escapeHtml(alert.alert_key)}"></div></div>`,
@@ -105,14 +109,35 @@ async function updateAlert(alertKey, action) {
   await refresh();
 }
 
+function renderHostOptions(hosts) {
+  const selected = hostFilter.value;
+  const options = hosts
+    .map(
+      (host) =>
+        `<option value="${escapeHtml(host.host_id)}">${escapeHtml(host.hostname ?? host.host_id)}</option>`,
+    )
+    .join("");
+  hostFilter.innerHTML = `<option value="">All machines</option>${options}`;
+  // Preserve the selection across refreshes, unless that machine is gone.
+  if (selected && hosts.some((host) => host.host_id === selected)) {
+    hostFilter.value = selected;
+  }
+}
+
 async function refresh() {
   if (!keyInput.value) return;
   try {
-    const [summary, events, alerts] = await Promise.all([
+    const host = hostFilter.value;
+    const eventsPath = host
+      ? `/events?limit=50&host_id=${encodeURIComponent(host)}`
+      : "/events?limit=50";
+    const [summary, events, alerts, hosts] = await Promise.all([
       getJson("/summary"),
-      getJson("/events?limit=50"),
+      getJson(eventsPath),
       getJson("/alerts"),
+      getJson("/hosts"),
     ]);
+    renderHostOptions(hosts);
     renderSummary(summary);
     renderEvents(events);
     renderAlerts(alerts);
@@ -129,6 +154,7 @@ form.addEventListener("submit", (event) => {
   refresh();
 });
 document.querySelector("#refresh").addEventListener("click", refresh);
+hostFilter.addEventListener("change", refresh);
 alertsList.addEventListener("click", (event) => {
   const button = event.target.closest("button[data-action]");
   if (!button) return;

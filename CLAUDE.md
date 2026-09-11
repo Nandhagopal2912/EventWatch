@@ -8,12 +8,16 @@ next.** Update it whenever a phase closes or an item in the backlog is fixed.
 
 ## 1. What this project is
 
-EventWatch is a two-service, local-first host telemetry and alert pipeline — a small SIEM /
-infrastructure-health collector built to learn distributed-systems mechanics without frameworks.
+EventWatch is a self-hosted fleet monitor for 5–50 machines: one Go agent per host, one Java
+analytics service, one dashboard. Built without frameworks so every mechanism stays visible.
+
+**Purpose, settled in Phase 12:** a per-host agent, not a central ingress. The agent samples the
+machine it runs on, so host metrics only mean anything when one agent runs per machine. Everything
+downstream — per-host windows, per-host alert keys, the fleet listing — follows from that.
 
 | Service | Language | Port | Role |
 | --- | --- | --- | --- |
-| `go-collector/` | Go 1.27, stdlib + gopsutil + godotenv | 8082 | Captures events + host CPU/RAM, forwards to Java, durable retry queue |
+| `go-collector/` | Go 1.27, stdlib + gopsutil + godotenv | 8082 | One per machine: stable identity, host CPU/RAM, durable retry queue |
 | `java-analytics/` | Java 17, Maven, `com.sun.net.httpserver` + Jackson + sqlite-jdbc | 8080 | Validates, persists to SQLite, evaluates alerts, serves query API |
 | `dashboard/` | Static HTML/CSS/JS, no build step | 3000 (any static server) | Reads the Java query API only; never touches SQLite |
 
@@ -74,6 +78,7 @@ curl.exe "http://localhost:8082/capture?level=ERROR&msg=Database%20transaction%2
 
 ```text
 go-collector/main.go            Handlers, forwardToJava retries, durable file queue
+go-collector/identity.go        Stable per-agent host_id, persisted beside the queue
 go-collector/logging.go         Structured JSON log lines, LOG_FORMAT switch
 go-collector/metrics.go         Prometheus counters, queue-depth gauge, /metrics handler
 go-collector/main_test.go       Event-ID uniqueness + queue capacity
@@ -126,12 +131,16 @@ dashboard/{index.html,app.js,styles.css}
 Go → Java `POST /receive`, header `X-EventWatch-Key`, `Content-Type: application/json`:
 
 ```json
-{ "event_id": "...", "correlation_id": "...", "level": "ERROR", "msg": "...",
-  "timestamp": "2026-09-04T18:46:00Z", "cpu_usage": 88.4, "ram_usage": 12.1 }
+{ "event_id": "...", "correlation_id": "...", "host_id": "...", "hostname": "web-01",
+  "level": "ERROR", "msg": "...", "timestamp": "2026-09-04T18:46:00Z",
+  "cpu_usage": 88.4, "ram_usage": 12.1 }
 ```
 
 `correlation_id` is optional and carried in the payload so a queued event keeps it across a retry;
-the live request also sends it as the `X-Correlation-ID` header.
+the live request also sends it as the `X-Correlation-ID` header. `host_id` and `hostname` are
+optional too — an agent older than Phase 12 sends neither and its events are attributed to the host
+`unknown` — but bounded to 128 characters when present, because `host_id` becomes part of an alert
+key and a metric label.
 Rules: `level` ∈ INFO|WARN|ERROR|CRITICAL; `msg` 1–1000 chars; `event_id` 1–128 chars and unique
 (partial unique index makes retries idempotent); usages are finite numbers 0–100; body ≤ 64 KiB.
 Changes to this schema must stay backward compatible — additive fields only, never renames.
@@ -145,7 +154,8 @@ Changes to this schema must stay backward compatible — additive fields only, n
 | GET | `/metrics` (8080, 8082) | none | Prometheus text format |
 | GET | `/capture?level=&msg=` (8082) | none | Public ingress |
 | GET | `/stress` (8082) | none | 500 events, 32 concurrent |
-| GET | `/events?level=&from=&to=&limit=&offset=` | key | limit ≤ 200, default 50 |
+| GET | `/events?level=&host_id=&from=&to=&limit=&offset=` | key | limit ≤ 200, default 50 |
+| GET | `/hosts?limit=` | key | Fleet listing with last-seen |
 | GET | `/summary` | key | Totals, active alerts, 5-event averages |
 | GET | `/alerts?status=&type=` | key | Active alerts |
 | GET | `/alerts/{key}` | key | Single alert |
@@ -193,26 +203,23 @@ Changes to this schema must stay backward compatible — additive fields only, n
 
 ## 5. Current state — read before starting work
 
-**Phases 1–11 are complete**, with two Phase 11 items deliberately deferred (section 11).
+**Phases 1–12 are complete.** Everything is green:
 
-- `cd java-analytics && mvn verify` → 112 tests, BUILD SUCCESS
-- `cd go-collector && go vet ./... && go test ./...` → 27 tests, pass
+- `cd java-analytics && mvn verify` → 126 tests, BUILD SUCCESS
+- `cd go-collector && go vet ./... && go test ./...` → 34 tests, pass
 - `cd loadtest && go vet ./... && go test ./...` → 4 tests, pass
 - `docker compose up --build` → all services healthy
 
-Storage is now pluggable: `Database.open` picks SQLite or PostgreSQL from the JDBC URL, both behind
-`ConnectionProvider` and `SqlDialect`, both pooled, and the same repository code runs on either.
-SQLite stays the default. `RetentionService` prunes history past `RETENTION_DAYS`. The rate limit
-and pool size became configuration.
+Phase 12 turned the pipeline into a fleet monitor. Every event names the machine that produced it;
+the moving window, the alert thresholds, and the alert keys are all scoped per host. Verified with
+two agents against one analytics service: distinct identities, `cpu-high@web-01` and
+`cpu-high@db-01` as separate rows, and acknowledging one leaving the other OPEN.
 
-**The measurement that matters** (`loadtest/`, 3000 events, concurrency 16, limit raised): SQLite
-with a connection per query managed 60 events/s at a 260 ms p50. PostgreSQL pooled managed 164.
-SQLite pooled and in WAL mode managed **522 at a 28 ms p50** — three times PostgreSQL over a local
-socket. SQLite was never the constraint; connection-per-query and an fsync per commit were. Do not
-migrate for throughput; migrate for several collectors sharing one store, or for retention beyond
-one disk.
+**The next blocker is security, not features.** `/capture` is unauthenticated and there is no TLS,
+so "localhost only" is still the honest description. That is Phase 13 and it gates any real
+deployment.
 
-B1–B15 in section 10 are all fixed.
+B1–B15 in section 11 are all fixed.
 
 ## 6. Phase 8 as built — notifications
 
@@ -330,7 +337,33 @@ produced it, and a failed sweep is logged rather than thrown so the timer thread
 **What is deliberately NOT done, and when to revisit** — see section 11. Short version: the file
 queue and the two-service shape are both still comfortably inside what the measurements justify.
 
-## 10. Fixed defects and remaining quality work
+## 10. Phase 12 as built — host identity
+
+**Why it had to be more than a column.** Phase 11 made several agents writing to one store
+possible; Phase 12 made them distinguishable. Adding `host_id` to the table alone would not have
+been enough — the moving window and the alert keys were both global, so two machines would have
+averaged together and fought over one `cpu-high` row. The fix is three-part: identity on the event,
+`recentEventsByHost` instead of one deque, and `rule@host` alert keys.
+
+**Agent identity** is generated once and persisted beside the durable queue, so a restart is not a
+new machine. `HOST_ID` pins it explicitly (containers, config management); `HOSTNAME_OVERRIDE`
+renames the reported hostname without changing the id. The id is written through a temp file and
+renamed, like the queue, so a crash cannot leave half an identity.
+
+**Backward compatibility.** Identity is optional in the contract. An agent older than Phase 12 sends
+neither field and its events land under the host `unknown` rather than being rejected — the same
+choice the durable queue forces, since queued files written by an old agent will arrive after an
+upgrade. Both dialects migrate existing databases with guarded `ALTER TABLE`.
+
+**Bounded on purpose.** `host_id` is capped at 128 characters because it becomes part of an alert
+key (which appears in URLs) and could become a metric label. `recentEventsByHost` is an LRU capped
+at `MAX_TRACKED_HOSTS`, so a misconfigured fleet sending random ids cannot grow memory without
+bound — the same lesson as the rate-limit map in B4.
+
+**Alert keys use `rule@host`.** They appear in URLs (`/alerts/cpu-high@web-01/acknowledge`), and `@`
+survives a path segment without encoding while staying readable in a notification.
+
+## 11. Fixed defects and remaining quality work
 
 ### Fixed (keep these fixed — each has a way to regress)
 
@@ -418,7 +451,7 @@ unaffected: at 3000 samples both percentile formulas select the same index.)
   in memory alongside the SQL `lastDeliveredAt` lookup; a restart falls back to the SQL value, which
   is correct but means an in-flight reservation is lost. Fine for one instance, wrong for two.
 
-## 11. Roadmap and deferred work
+## 12. Roadmap and deferred work
 
 **Phase 9 — Observability.** Done except tracing (see section 7).
 
@@ -454,13 +487,24 @@ The honest next step for scale is neither: it is the rate limit and the per-even
 ingestion path. Every event currently triggers alert evaluation plus a grouped error query. Batching
 that, or evaluating alerts on a timer instead of per event, is a larger win than changing databases.
 
-**Cross-cutting, currently unowned:** TLS between the services (the API key travels in plaintext over
-localhost today), authentication for the public `/capture` endpoint, per-alert-rule configuration
-instead of three global thresholds, and CORS origins moved to `.env`.
+**Phase 13 — Make the agent safe to expose.** The blocker on any real deployment: `/capture` is
+unauthenticated, there is no TLS, the dashboard holds the API key in browser memory, and CORS
+origins are hardcoded. Until this lands, "localhost only" is the accurate description.
+
+**Phase 14 — Alert rules worth having.** Three global thresholds do not survive a mixed fleet: a
+build box at 90% CPU is healthy, a database at 90% is not. Per-host and per-rule configuration in a
+table rather than `.env`, with a rules API and a dashboard editor. Phase 12's per-host alert keys
+are the foundation this sits on.
+
+**Phase 15 — Fleet operations.** A host list with staleness — "agent silent for 10 minutes" is
+often the most important alert and nothing currently detects it — per-host drill-down, and agents
+self-reporting their version and queue depth.
+
+**Still unowned:** OpenTelemetry (see above), and a scripted two-process outage test.
 
 ---
 
-## 12. Definition of done for a release
+## 13. Definition of done for a release
 
 - Events are authenticated, validated, persisted transactionally, deduplicated, and queryable.
 - A temporary Java outage loses nothing and duplicates nothing.

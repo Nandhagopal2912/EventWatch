@@ -141,20 +141,20 @@ class PostgresBackendTest {
         Instant timestamp = Instant.parse("2026-09-11T10:00:00Z");
 
         assertEquals(AlertTransition.Type.OPENED,
-                alerts.saveOccurrence(new AlertRecord("cpu-high", "HIGH_CPU", "m", timestamp)).type());
+                alerts.saveOccurrence(new AlertRecord("cpu-high", "HIGH_CPU", "web-01", "m", timestamp)).type());
         assertEquals(AlertTransition.Type.OCCURRENCE,
-                alerts.saveOccurrence(new AlertRecord("cpu-high", "HIGH_CPU", "m", timestamp)).type());
+                alerts.saveOccurrence(new AlertRecord("cpu-high", "HIGH_CPU", "web-01", "m", timestamp)).type());
 
         assertNotNull(alerts.acknowledge("cpu-high"));
         AlertTransition afterAcknowledgement =
-                alerts.saveOccurrence(new AlertRecord("cpu-high", "HIGH_CPU", "m", timestamp));
+                alerts.saveOccurrence(new AlertRecord("cpu-high", "HIGH_CPU", "web-01", "m", timestamp));
         assertEquals(AlertStatus.ACKNOWLEDGED, afterAcknowledgement.alert().getStatus(),
                 "the upsert must preserve an acknowledgement on PostgreSQL too");
 
         assertNotNull(alerts.resolve("cpu-high", timestamp));
         assertNull(alerts.resolve("cpu-high", timestamp));
         assertEquals(AlertTransition.Type.REOPENED,
-                alerts.saveOccurrence(new AlertRecord("cpu-high", "HIGH_CPU", "m", timestamp)).type());
+                alerts.saveOccurrence(new AlertRecord("cpu-high", "HIGH_CPU", "web-01", "m", timestamp)).type());
     }
 
     @Test

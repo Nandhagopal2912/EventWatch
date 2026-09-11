@@ -24,6 +24,7 @@
     <section id="connection" class="notice" aria-live="polite">Enter the API key to load telemetry.</section>
 
     <section class="metrics" aria-label="Telemetry summary">
+      <article class="metric"><span>Machines</span><strong id="host-count">--</strong></article>
       <article class="metric"><span>Total events</span><strong id="total-events">--</strong></article>
       <article class="metric"><span>Active alerts</span><strong id="active-alerts">--</strong></article>
       <article class="metric"><span>Average CPU</span><strong id="average-cpu">--</strong></article>
@@ -32,8 +33,8 @@
 
     <section class="grid">
       <article class="panel events-panel">
-        <div class="panel-heading"><div><p class="eyebrow">RECENT TELEMETRY</p><h2>Events</h2></div><button id="refresh" class="quiet" type="button">Refresh</button></div>
-        <div class="table-wrap"><table><thead><tr><th>Level</th><th>Message</th><th>Timestamp</th><th>CPU</th><th>RAM</th></tr></thead><tbody id="events-body"></tbody></table></div>
+        <div class="panel-heading"><div><p class="eyebrow">RECENT TELEMETRY</p><h2>Events</h2></div><div class="panel-controls"><select id="host-filter" aria-label="Filter by machine"><option value="">All machines</option></select><button id="refresh" class="quiet" type="button">Refresh</button></div></div>
+        <div class="table-wrap"><table><thead><tr><th>Level</th><th>Machine</th><th>Message</th><th>Timestamp</th><th>CPU</th><th>RAM</th></tr></thead><tbody id="events-body"></tbody></table></div>
       </article>
       <article class="panel alerts-panel">
         <div class="panel-heading"><div><p class="eyebrow">RESPONSE QUEUE</p><h2>Active alerts</h2></div></div>
