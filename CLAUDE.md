@@ -195,9 +195,9 @@ Changes to this schema must stay backward compatible — additive fields only, n
 
 **Phases 1–11 are complete**, with two Phase 11 items deliberately deferred (section 11).
 
-- `cd java-analytics && mvn verify` → 106 tests, BUILD SUCCESS
+- `cd java-analytics && mvn verify` → 112 tests, BUILD SUCCESS
 - `cd go-collector && go vet ./... && go test ./...` → 27 tests, pass
-- `cd loadtest && go vet ./... && go build ./...` → clean
+- `cd loadtest && go vet ./... && go test ./...` → 4 tests, pass
 - `docker compose up --build` → all services healthy
 
 Storage is now pluggable: `Database.open` picks SQLite or PostgreSQL from the JDBC URL, both behind
@@ -212,7 +212,7 @@ socket. SQLite was never the constraint; connection-per-query and an fsync per c
 migrate for throughput; migrate for several collectors sharing one store, or for retention beyond
 one disk.
 
-B1–B10 in section 10 are all fixed.
+B1–B15 in section 10 are all fixed.
 
 ## 6. Phase 8 as built — notifications
 
@@ -288,6 +288,10 @@ file passes `validateEvent`, that removing any required field fails, and that th
 declare a health check. The analytics image is a shaded jar on a JRE; the collector is a static
 `CGO_ENABLED=0` binary on alpine. Each keeps its durable state on a volume — the database and the
 pending queue — because losing either on a restart defeats the reliability work of Phase 5.
+
+**The compose gotcha:** `analytics` needs `depends_on: postgres` for the profile, but a plain
+`depends_on` would fail the default SQLite run where that container does not exist. `required: false`
+is the resolution — the dependency applies when the profile is active and is ignored otherwise.
 
 **A build gotcha worth remembering:** buildx caches tag resolution independently of `docker pull`,
 so `golang:1.27-alpine` kept resolving to a stale 1.25 image and failed the `go >= 1.27` check in
@@ -373,6 +377,31 @@ use a partial unique index as its arbiter without repeating the predicate. Caugh
 `TestMetricsEscapeLabelValues`: a heredoc had collapsed the replacement pair so
 `strings.NewReplacer` mapped a backslash to itself. A label value containing one would have emitted
 malformed Prometheus output. The Java side was already correct.
+
+**B11 — stop() closed the connection pool before draining the request executor.** Work still
+running lost its database mid-flight. The pool is now released after `awaitTermination`. Note the
+window is narrower than it first looks: `server.stop(grace)` blocks for the full grace and drains
+its own exchanges, so an HTTP request only observes this if its handler outlives the grace. The
+regression test asserts the ordering on the executor directly for that reason — and was checked to
+fail against the old ordering before being kept.
+
+**B12 — a failed start() leaked the connection pool.** `Database.open` allocated a live pool (and
+its housekeeper thread) before the API-key check, and nothing closed it when start() threw. The key
+is now validated first, every failure path calls `releaseDatabase()`, and an unreachable backend is
+wrapped into a readable `IOException` instead of an unchecked pool error.
+
+**B13 — a non-positive RETENTION_SWEEP_MINUTES crashed startup.** `scheduleWithFixedDelay` rejects a
+delay below one. `EngineConfiguration` now clamps `retentionSweepMinutes`, `databasePoolSize`, and
+`rateLimitPerMinute` in its compact constructor, so the rule holds however the record is built —
+not just through `fromDotenv`.
+
+**B14 — RetentionService.sweep caught only SQLException.** Anything else escaped into the scheduled
+task, which cancels it silently for the life of the process. It now catches `Exception`.
+
+**B15 — the load harness did not drain response bodies.** A single 512-byte `Read` leaves the
+connection unreusable, so the harness timed TCP handshakes; and `percentile` truncated instead of
+using nearest rank, biasing p95/p99 downward. Both fixed. (The published Phase 11 numbers are
+unaffected: at 3000 samples both percentile formulas select the same index.)
 
 ### Remaining quality work
 

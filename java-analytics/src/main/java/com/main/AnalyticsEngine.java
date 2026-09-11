@@ -122,16 +122,23 @@ public class AnalyticsEngine {
         textLogging = "text".equalsIgnoreCase(configuration.logFormat());
         StructuredLogger.configure(OBJECT_MAPPER, configuration.logFormat());
         apiKey = configuration.apiKey();
-        database = Database.open(configuration);
-        maxRequestsPerMinute = configuration.rateLimitPerMinute();
-        shutdownGraceSeconds = configuration.shutdownGraceSeconds();
+        // Validate before opening the pool; a throw after this point has to release it.
         if (apiKey == null || apiKey.isBlank()) {
             throw new IOException("EVENTWATCH_API_KEY is required");
         }
+        maxRequestsPerMinute = configuration.rateLimitPerMinute();
+        shutdownGraceSeconds = configuration.shutdownGraceSeconds();
 
         recentEvents.clear();
         storedEventCount.set(0);
         rateWindows.clear();
+
+        try {
+            database = Database.open(configuration);
+        } catch (RuntimeException exception) {
+            // An unreachable backend surfaces as an unchecked pool error; make it readable.
+            throw new IOException("Unable to open the database at " + configuration.databaseUrl(), exception);
+        }
 
         try {
             database.initializeSchema();
@@ -160,13 +167,20 @@ public class AnalyticsEngine {
                     eventRepository, alertRepository, OBJECT_MAPPER, MOVING_AVERAGE_WINDOW);
             retentionService = new RetentionService(
                     database.connections(), METRICS, configuration.retentionDays());
-        } catch (SQLException exception) {
-            throw new IOException("Unable to initialize the "
-                    + database.dialect().name() + " database", exception);
+        } catch (SQLException | RuntimeException exception) {
+            String backend = database.dialect().name();
+            releaseDatabase();
+            throw new IOException("Unable to initialize the " + backend + " database", exception);
         }
         StructuredLogger.info("loaded stored events",
                 StructuredLogger.fields("stored_events", storedEventCount.get()));
-        HttpServer server = HttpServer.create(new InetSocketAddress(configuration.port()), 0);
+        HttpServer server;
+        try {
+            server = HttpServer.create(new InetSocketAddress(configuration.port()), 0);
+        } catch (IOException | RuntimeException exception) {
+            releaseDatabase();
+            throw exception;
+        }
 
         server.createContext("/receive", new HttpHandler() {
             @Override
@@ -528,21 +542,36 @@ public class AnalyticsEngine {
         if (notificationService != null) {
             notificationService.shutdown();
         }
-        if (runningExecutor == null) {
-            return;
+        if (runningExecutor != null) {
+            runningExecutor.shutdown();
+            try {
+                if (!runningExecutor.awaitTermination(shutdownGraceSeconds, TimeUnit.SECONDS)) {
+                    runningExecutor.shutdownNow();
+                }
+            } catch (InterruptedException exception) {
+                runningExecutor.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
         }
+        // Closing the pool first would fail the requests the drain above exists to finish.
+        releaseDatabase();
+    }
+
+    private static void releaseDatabase() {
         if (database != null) {
             database.close();
+            database = null;
         }
-        runningExecutor.shutdown();
-        try {
-            if (!runningExecutor.awaitTermination(shutdownGraceSeconds, TimeUnit.SECONDS)) {
-                runningExecutor.shutdownNow();
-            }
-        } catch (InterruptedException exception) {
-            runningExecutor.shutdownNow();
-            Thread.currentThread().interrupt();
-        }
+    }
+
+    /** Visible for tests that assert the pool is released rather than leaked. */
+    static Database database() {
+        return database;
+    }
+
+    /** Visible for tests that assert work in flight keeps its database until it finishes. */
+    static ThreadPoolExecutor requestExecutor() {
+        return runningExecutor;
     }
 
     static Instant parseTimestamp(String value) {

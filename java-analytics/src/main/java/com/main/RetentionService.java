@@ -55,10 +55,12 @@ public class RetentionService {
                 StructuredLogger.info("retention sweep removed expired rows", StructuredLogger.fields(
                         "removed_rows", removed, "retention_days", retentionDays));
             }
-        } catch (SQLException exception) {
+        } catch (Exception exception) {
+            // Anything escaping here cancels the scheduled task for the life of the process,
+            // so nothing may escape - not only SQLException.
             metrics.recordDatabaseFailure();
             StructuredLogger.error("retention sweep failed",
-                    StructuredLogger.fields("error", exception.getMessage()));
+                    StructuredLogger.fields("error", String.valueOf(exception)));
         }
     }
 

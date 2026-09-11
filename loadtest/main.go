@@ -17,6 +17,8 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"math"
 	"net/http"
 	"os"
 	"sort"
@@ -146,8 +148,9 @@ func send(client *http.Client, mode, url, apiKey string, index, distinct int) re
 		return result{latency: time.Since(started), err: err}
 	}
 	defer response.Body.Close()
-	// Drain so the connection can be reused.
-	_, _ = response.Body.Read(make([]byte, 512))
+	// Drain to EOF: a short read leaves the connection unreusable, so the harness would
+	// measure TCP handshakes instead of server time.
+	_, _ = io.Copy(io.Discard, response.Body)
 	return result{latency: time.Since(started), status: response.StatusCode}
 }
 
@@ -201,8 +204,18 @@ func report(results []result, elapsed time.Duration) {
 	}
 }
 
+// Nearest-rank, so a percentile is never reported lower than the sample it names.
 func percentile(sorted []time.Duration, fraction float64) time.Duration {
-	index := int(float64(len(sorted)-1) * fraction)
+	if len(sorted) == 0 {
+		return 0
+	}
+	index := int(math.Ceil(fraction*float64(len(sorted)))) - 1
+	if index < 0 {
+		index = 0
+	}
+	if index >= len(sorted) {
+		index = len(sorted) - 1
+	}
 	return sorted[index]
 }
 

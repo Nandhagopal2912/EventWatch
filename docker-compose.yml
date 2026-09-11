@@ -42,6 +42,11 @@ services:
       - analytics-data:/data
     ports:
       - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+        # Without the postgres profile there is no database container to wait for.
+        required: false
     restart: unless-stopped
 
   collector:

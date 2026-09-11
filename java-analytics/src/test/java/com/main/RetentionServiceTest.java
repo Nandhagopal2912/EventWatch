@@ -1,10 +1,12 @@
 package com.main;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.file.Path;
+import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
@@ -100,5 +102,22 @@ class RetentionServiceTest {
         database.close();
         // The connection provider is closed, so the sweep must report rather than throw.
         service(7).sweep();
+    }
+
+    @Test
+    void sweepSwallowsUncheckedFailuresToo() {
+        // Regression: sweep() caught only SQLException. Anything else escaped into the
+        // scheduled task, which silently cancels it for the life of the process.
+        ConnectionProvider exploding = new ConnectionProvider() {
+            @Override
+            public Connection getConnection() {
+                throw new IllegalStateException("pool is gone");
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        assertDoesNotThrow(() -> new RetentionService(exploding, new Metrics(), 7).sweep());
     }
 }

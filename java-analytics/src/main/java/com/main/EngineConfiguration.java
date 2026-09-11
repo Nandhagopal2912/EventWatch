@@ -28,6 +28,16 @@ public record EngineConfiguration(
         int retentionSweepMinutes,
         int rateLimitPerMinute) {
 
+    /**
+     * Settings where zero or negative is not a weaker setting but a crash: the pool rejects a
+     * size below one, and the scheduler rejects a sweep period below one.
+     */
+    public EngineConfiguration {
+        databasePoolSize = databasePoolSize > 0 ? databasePoolSize : 10;
+        retentionSweepMinutes = retentionSweepMinutes > 0 ? retentionSweepMinutes : 60;
+        rateLimitPerMinute = rateLimitPerMinute > 0 ? rateLimitPerMinute : 100;
+    }
+
     public static EngineConfiguration fromDotenv(Dotenv dotenv) {
         // An explicit DATABASE_URL selects the backend; otherwise SQLite keeps the local default.
         String databasePath = value(dotenv, "DATABASE_PATH", "events.db");
