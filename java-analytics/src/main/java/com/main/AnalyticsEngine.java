@@ -29,7 +29,6 @@ public class AnalyticsEngine {
     private static final int MOVING_AVERAGE_WINDOW = 5;
     private static final int MAX_REQUEST_BYTES = 64 * 1024;
     private static final int MAX_MESSAGE_LENGTH = 1000;
-    private static final int MAX_REQUESTS_PER_MINUTE = 100;
     private static final int WORKER_THREADS = 8;
     private static final int WORK_QUEUE_CAPACITY = 500;
     private static final int TOP_ERROR_MESSAGES = 5;
@@ -41,8 +40,11 @@ public class AnalyticsEngine {
     private static final ThreadLocal<String> CORRELATION_ID = new ThreadLocal<>();
     private static String apiKey;
     private static boolean textLogging;
-    private static String databaseUrl;
+    private static Database database;
+    // A hardcoded ceiling would bind long before storage does, so it is configuration.
+    private static int maxRequestsPerMinute = 100;
     private static int shutdownGraceSeconds = 5;
+    private static RetentionService retentionService;
     private static ThreadPoolExecutor runningExecutor;
     private static ScheduledExecutorService runningMaintenance;
     private static AlertRepository alertRepository;
@@ -67,7 +69,7 @@ public class AnalyticsEngine {
                 startedAt = now;
                 requestCount = 0;
             }
-            if (requestCount >= MAX_REQUESTS_PER_MINUTE) {
+            if (requestCount >= maxRequestsPerMinute) {
                 return false;
             }
             requestCount++;
@@ -120,7 +122,8 @@ public class AnalyticsEngine {
         textLogging = "text".equalsIgnoreCase(configuration.logFormat());
         StructuredLogger.configure(OBJECT_MAPPER, configuration.logFormat());
         apiKey = configuration.apiKey();
-        databaseUrl = configuration.databaseUrl();
+        database = Database.open(configuration);
+        maxRequestsPerMinute = configuration.rateLimitPerMinute();
         shutdownGraceSeconds = configuration.shutdownGraceSeconds();
         if (apiKey == null || apiKey.isBlank()) {
             throw new IOException("EVENTWATCH_API_KEY is required");
@@ -131,11 +134,11 @@ public class AnalyticsEngine {
         rateWindows.clear();
 
         try {
-            eventRepository = new EventRepository(configuration.databaseUrl());
-            eventRepository.initializeSchema();
+            database.initializeSchema();
+            eventRepository = new EventRepository(database.connections(), database.dialect());
             loadRecentEvents();
-            alertRepository = new AlertRepository(configuration.databaseUrl());
-            notificationRepository = new NotificationRepository(configuration.databaseUrl());
+            alertRepository = new AlertRepository(database.connections());
+            notificationRepository = new NotificationRepository(database.connections());
             notificationService = new NotificationService(
                     notificationRepository,
                     OBJECT_MAPPER,
@@ -155,8 +158,11 @@ public class AnalyticsEngine {
                     configuration.repeatedErrorThreshold());
             queryService = new QueryService(
                     eventRepository, alertRepository, OBJECT_MAPPER, MOVING_AVERAGE_WINDOW);
+            retentionService = new RetentionService(
+                    database.connections(), METRICS, configuration.retentionDays());
         } catch (SQLException exception) {
-            throw new IOException("Unable to initialize SQLite database", exception);
+            throw new IOException("Unable to initialize the "
+                    + database.dialect().name() + " database", exception);
         }
         StructuredLogger.info("loaded stored events",
                 StructuredLogger.fields("stored_events", storedEventCount.get()));
@@ -280,11 +286,13 @@ public class AnalyticsEngine {
                 sendResponse(exchange, 405, "Method not allowed");
                 return;
             }
-            try (Connection ignored = DriverManager.getConnection(databaseUrl)) {
+            try {
+                database.checkReachable();
                 sendJsonResponse(exchange, 200,
                         "{\"status\":\"ok\",\"service\":\"java-analytics\","
                                 + "\"message\":\"service is healthy\"}");
             } catch (SQLException exception) {
+                METRICS.recordDatabaseFailure();
                 sendJsonResponse(exchange, 503,
                         "{\"status\":\"error\",\"service\":\"java-analytics\","
                                 + "\"message\":\"database unavailable\"}");
@@ -491,6 +499,13 @@ public class AnalyticsEngine {
         maintenance.scheduleWithFixedDelay(
                 () -> rateWindows.values().removeIf(window -> window.isExpired(System.currentTimeMillis())),
                 RATE_WINDOW_SWEEP_SECONDS, RATE_WINDOW_SWEEP_SECONDS, TimeUnit.SECONDS);
+        if (retentionService.enabled()) {
+            long sweepMinutes = configuration.retentionSweepMinutes();
+            maintenance.scheduleWithFixedDelay(retentionService::sweep, 1, sweepMinutes, TimeUnit.MINUTES);
+            StructuredLogger.info("retention enabled", StructuredLogger.fields(
+                    "retention_days", configuration.retentionDays(),
+                    "sweep_minutes", sweepMinutes));
+        }
 
         runningExecutor = requestExecutor;
         runningMaintenance = maintenance;
@@ -498,6 +513,7 @@ public class AnalyticsEngine {
         server.start();
         StructuredLogger.info("analytics engine started", StructuredLogger.fields(
                 "port", server.getAddress().getPort(),
+                "database", database.dialect().name(),
                 "worker_threads", WORKER_THREADS,
                 "queue_capacity", WORK_QUEUE_CAPACITY));
         return server;
@@ -514,6 +530,9 @@ public class AnalyticsEngine {
         }
         if (runningExecutor == null) {
             return;
+        }
+        if (database != null) {
+            database.close();
         }
         runningExecutor.shutdown();
         try {

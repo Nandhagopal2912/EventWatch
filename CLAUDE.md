@@ -95,6 +95,11 @@ java-analytics/src/main/java/com/main/
   StructuredLogger.java         One JSON object per log line; LOG_FORMAT=text for humans
   Metrics.java                  Prometheus counters, gauges, and text rendering
   EngineConfiguration.java      Every runtime setting; fromDotenv() and forTesting()
+  Database.java                 Picks the backend from the JDBC url, pools, creates the schema
+  ConnectionProvider.java       Where repositories get connections from
+  SqlDialect.java               The few places SQLite and PostgreSQL disagree
+  SqliteDialect.java / PostgresDialect.java
+  RetentionService.java         Prunes telemetry and delivery history past the window
 
 java-analytics/src/test/java/com/main/
   AnalyticsEngineIntegrationTest.java   Real server on an ephemeral port, temp database
@@ -104,8 +109,11 @@ java-analytics/src/test/java/com/main/
   EventValidationTest.java      Validation and query-parameter parsing
   ObservabilityTest.java        Log shape and metric rendering
   ContractTest.java             Shared JSON contract, against testdata/
+  PostgresBackendTest.java      The storage layer against a real PostgreSQL; skipped without one
+  RetentionServiceTest.java     Prune boundaries and failure handling
 java-analytics/Dockerfile       Shaded jar on a JRE, database on a volume
 
+loadtest/main.go                Throughput and latency harness (its own module, stdlib only)
 testdata/event-contract.json    One canonical event, read by both test suites
 docker-compose.yml              Collector, analytics, dashboard
 .github/workflows/ci.yml        Go job, Java job, image build job
@@ -185,30 +193,26 @@ Changes to this schema must stay backward compatible — additive fields only, n
 
 ## 5. Current state — read before starting work
 
-**Phases 1–10 are complete.** Everything is green:
+**Phases 1–11 are complete**, with two Phase 11 items deliberately deferred (section 11).
 
-- `cd java-analytics && mvn verify` → 90 tests, BUILD SUCCESS
-- `cd go-collector && go vet ./... && go test ./...` → pass
-- `docker compose up --build` → all three services healthy
+- `cd java-analytics && mvn verify` → 106 tests, BUILD SUCCESS
+- `cd go-collector && go vet ./... && go test ./...` → 27 tests, pass
+- `cd loadtest && go vet ./... && go build ./...` → clean
+- `docker compose up --build` → all services healthy
 
-Phase 10 added the test suites that did not exist before (the project had no Java tests at all), plus
-Dockerfiles, Compose, and a CI pipeline. Verified in containers, not just asserted: the stack starts,
-an event flows collector → analytics → SQLite on a volume, and with the analytics container stopped
-three captures returned `503` and queued, then drained to zero and stored all of them once the
-container came back.
+Storage is now pluggable: `Database.open` picks SQLite or PostgreSQL from the JDBC URL, both behind
+`ConnectionProvider` and `SqlDialect`, both pooled, and the same repository code runs on either.
+SQLite stays the default. `RetentionService` prunes history past `RETENTION_DAYS`. The rate limit
+and pool size became configuration.
 
-To make that possible the engine gained a real seam: `EngineConfiguration` holds every runtime
-setting, `AnalyticsEngine.start(configuration)` returns the running server, and
-`AnalyticsEngine.stop(server)` shuts it down — `main()` is now wiring only. Schema creation and the
-idempotent insert moved from `AnalyticsEngine` into `EventRepository`, where they can be tested
-directly.
+**The measurement that matters** (`loadtest/`, 3000 events, concurrency 16, limit raised): SQLite
+with a connection per query managed 60 events/s at a 260 ms p50. PostgreSQL pooled managed 164.
+SQLite pooled and in WAL mode managed **522 at a 28 ms p50** — three times PostgreSQL over a local
+socket. SQLite was never the constraint; connection-per-query and an fsync per commit were. Do not
+migrate for throughput; migrate for several collectors sharing one store, or for retention beyond
+one disk.
 
-**Known wart:** `AnalyticsEngine` still keeps its collaborators in static fields, so only one engine
-can run per JVM and tests must run sequentially. `start()` resets the window, counter, and rate-limit
-map to compensate. Worth fixing when the routing extraction in section 9 happens.
-
-B1–B9 in section 9 are all fixed. What remains unowned is Phase 11 and the cross-cutting items in
-section 10.
+B1–B10 in section 10 are all fixed.
 
 ## 6. Phase 8 as built — notifications
 
@@ -294,7 +298,35 @@ surefire reports uploaded on failure), and images (build both, validate the comp
 are built but never pushed — publishing is a deployment decision. Dependabot covers Go modules,
 Maven, both Dockerfiles, and the actions themselves.
 
-## 9. Fixed defects and remaining quality work
+## 9. Phase 11 as built — beyond SQLite
+
+**Shape of the abstraction.** Not one interface per store with two implementations — that would
+duplicate almost-identical JDBC three times. Instead `ConnectionProvider` supplies connections and
+`SqlDialect` supplies the handful of fragments the two engines disagree on (DDL, and the
+insert-ignoring-duplicates). The repositories are unchanged single implementations running portable
+SQL, so there is one query path to maintain and the PostgreSQL suite asserts identical behaviour.
+
+**Timestamps stay ISO-8601 text on both backends.** Native timestamp types would drag in timezone
+semantics that differ between the engines; text keeps stored data, lexical ordering, and range
+filters meaning exactly the same thing everywhere.
+
+**Two things the PostgreSQL work taught, both caught by tests:**
+
+- `ON CONFLICT (event_id) DO NOTHING` fails against a *partial* unique index — PostgreSQL needs the
+  index predicate repeated: `ON CONFLICT (event_id) WHERE event_id IS NOT NULL DO NOTHING`.
+  SQLite's `INSERT OR IGNORE` has no such requirement.
+- A hardcoded `MAX_REQUESTS_PER_MINUTE = 100` made the first benchmark meaningless: only 100 of 2000
+  events were admitted. It is now `RATE_LIMIT_PER_MINUTE`. A scaling phase cannot proceed past a
+  fixed admission ceiling.
+
+**Retention** is off by default (`RETENTION_DAYS=0`) and runs on the maintenance timer that already
+sweeps rate windows. The cutoff is exclusive, delivery history is pruned alongside the events that
+produced it, and a failed sweep is logged rather than thrown so the timer thread survives.
+
+**What is deliberately NOT done, and when to revisit** — see section 11. Short version: the file
+queue and the two-service shape are both still comfortably inside what the measurements justify.
+
+## 10. Fixed defects and remaining quality work
 
 ### Fixed (keep these fixed — each has a way to regress)
 
@@ -333,6 +365,10 @@ Verified: the same burst leaves exactly 400 files in `pending-events/` and the w
 Note what this means for `/stress`: a 500-event burst legitimately exceeds the rate limit and most of
 it arrives over the following minutes through the queue. That is the system working, not a failure.
 
+**B10 — PostgreSQL rejected the deduplicating insert.** `ON CONFLICT (event_id) DO NOTHING` cannot
+use a partial unique index as its arbiter without repeating the predicate. Caught by
+`PostgresBackendTest`, which is why that suite exists rather than trusting the SQL to be portable.
+
 **B9 — Go metric labels did not escape backslashes.** Found by the new
 `TestMetricsEscapeLabelValues`: a heredoc had collapsed the replacement pair so
 `strings.NewReplacer` mapped a backslash to itself. A label value containing one would have emitted
@@ -340,15 +376,10 @@ malformed Prometheus output. The Java side was already correct.
 
 ### Remaining quality work
 
-- **Connection handling.** Every repository call opens a fresh `DriverManager.getConnection`. A
-  shared connection or small pool with `PRAGMA journal_mode=WAL` and `busy_timeout` would cut
-  per-query overhead and lock contention under load.
 - **Routing and static state.** `start()` is still a long run of inline lambdas, and the engine's
   collaborators live in static fields, so only one instance can run per JVM. Extracting handlers
   into their own classes with an injected context would fix both and let the integration tests run
   in parallel.
-- **Retention.** Nothing deletes from `telemetry_events` or `notification_deliveries`. Add a
-  configurable retention window and a periodic prune.
 - **Timestamps.** Go now sends UTC `Z` values so lexical order matches chronological order, but rows
   written by older builds may carry a local offset. A one-off normalization pass would make range
   filters exact for that history.
@@ -358,7 +389,7 @@ malformed Prometheus output. The Java side was already correct.
   in memory alongside the SQL `lastDeliveredAt` lookup; a restart falls back to the SQL value, which
   is correct but means an in-flight reservation is lost. Fine for one instance, wrong for two.
 
-## 10. Roadmap — Phase 11 onward
+## 11. Roadmap and deferred work
 
 **Phase 9 — Observability.** Done except tracing (see section 7).
 
@@ -376,11 +407,23 @@ plan: there is no test that runs *both* services as processes and kills one mid-
 covered against a stand-in for the other, and the compose stack was exercised by hand — a scripted
 version of that outage run would close it.
 
-**Phase 11 — Scale beyond SQLite.** Only when measurements justify it. Order: extract a storage
-interface behind the repositories → PostgreSQL or a time-series store for multi-collector or
-long-retention deployments → a broker (Kafka/NATS) in place of the file queue when volume demands
-durable distributed streaming → split ingestion, analytics, and notification into separately
-scalable services. Keep SQLite as the single-host and development path.
+**Phase 11 — Scale beyond SQLite.** The storage half is done (section 9). Two items remain, both
+deferred on purpose rather than forgotten:
+
+- **A message broker in place of the file queue.** The durable file queue has no measured problem:
+  it loses nothing across an outage (verified in containers in Phase 10), and ingestion sustains
+  522 events/s before it is even involved. Kafka or NATS would add an operational dependency heavier
+  than both services combined. Revisit when a single collector host cannot hold the backlog of a
+  realistic outage, or when more than one analytics instance must consume the same stream — that is
+  the real trigger, because the file queue is point-to-point.
+- **Splitting ingestion, analytics, storage, and notification into separate services.** There is no
+  component whose scaling needs differ enough to justify it yet; notification already runs on its
+  own dispatcher thread and never blocks ingestion. Revisit when one part genuinely needs to scale
+  independently, and expect to need the broker first.
+
+The honest next step for scale is neither: it is the rate limit and the per-event work in the
+ingestion path. Every event currently triggers alert evaluation plus a grouped error query. Batching
+that, or evaluating alerts on a timer instead of per event, is a larger win than changing databases.
 
 **Cross-cutting, currently unowned:** TLS between the services (the API key travels in plaintext over
 localhost today), authentication for the public `/capture` endpoint, per-alert-rule configuration
@@ -388,7 +431,7 @@ instead of three global thresholds, and CORS origins moved to `.env`.
 
 ---
 
-## 11. Definition of done for a release
+## 12. Definition of done for a release
 
 - Events are authenticated, validated, persisted transactionally, deduplicated, and queryable.
 - A temporary Java outage loses nothing and duplicates nothing.

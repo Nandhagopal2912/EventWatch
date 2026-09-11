@@ -20,13 +20,24 @@ public record EngineConfiguration(
         int notificationMaxAttempts,
         long notificationRetryDelayMillis,
         long notificationReminderSeconds,
-        int shutdownGraceSeconds) {
+        int shutdownGraceSeconds,
+        String databaseUser,
+        String databasePassword,
+        int databasePoolSize,
+        int retentionDays,
+        int retentionSweepMinutes,
+        int rateLimitPerMinute) {
 
     public static EngineConfiguration fromDotenv(Dotenv dotenv) {
+        // An explicit DATABASE_URL selects the backend; otherwise SQLite keeps the local default.
         String databasePath = value(dotenv, "DATABASE_PATH", "events.db");
+        String databaseUrl = value(dotenv, "DATABASE_URL", null);
+        if (databaseUrl == null || databaseUrl.isBlank()) {
+            databaseUrl = "jdbc:sqlite:" + databasePath;
+        }
         return new EngineConfiguration(
                 intValue(dotenv, "HTTP_PORT", 8080),
-                "jdbc:sqlite:" + databasePath,
+                databaseUrl,
                 value(dotenv, "EVENTWATCH_API_KEY", null),
                 value(dotenv, "LOG_FORMAT", "json"),
                 doubleValue(dotenv, "CPU_ALERT_THRESHOLD", 85.0),
@@ -38,7 +49,13 @@ public record EngineConfiguration(
                 intValue(dotenv, "NOTIFICATION_MAX_ATTEMPTS", 3),
                 intValue(dotenv, "NOTIFICATION_RETRY_DELAY_MILLIS", 1000),
                 intValue(dotenv, "NOTIFICATION_REMINDER_SECONDS", 900),
-                intValue(dotenv, "SHUTDOWN_GRACE_SECONDS", 5));
+                intValue(dotenv, "SHUTDOWN_GRACE_SECONDS", 5),
+                value(dotenv, "DATABASE_USER", ""),
+                value(dotenv, "DATABASE_PASSWORD", ""),
+                intValue(dotenv, "DATABASE_POOL_SIZE", 10),
+                intValue(dotenv, "RETENTION_DAYS", 0),
+                intValue(dotenv, "RETENTION_SWEEP_MINUTES", 60),
+                intValue(dotenv, "RATE_LIMIT_PER_MINUTE", 100));
     }
 
     /**
@@ -47,7 +64,7 @@ public record EngineConfiguration(
      */
     public static EngineConfiguration forTesting(String databaseUrl, String apiKey) {
         return new EngineConfiguration(0, databaseUrl, apiKey, "text",
-                85.0, 80.0, 5, false, "", 1, 1, 1, 0, 0);
+                85.0, 80.0, 5, false, "", 1, 1, 1, 0, 0, "", "", 2, 0, 60, 100);
     }
 
     private static String value(Dotenv dotenv, String name, String fallback) {

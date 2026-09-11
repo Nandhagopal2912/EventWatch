@@ -10,6 +10,7 @@ import java.sql.SQLException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -20,15 +21,21 @@ class AlertEngineTest {
     @TempDir
     Path temporaryDirectory;
 
+    private Database database;
     private AlertRepository alerts;
     private AlertEngine engine;
 
     @BeforeEach
     void setUp() throws SQLException {
-        String databaseUrl = TestSupport.databaseUrl(temporaryDirectory, "alerts.db");
-        alerts = new AlertRepository(databaseUrl);
+        database = TestSupport.openDatabase(temporaryDirectory, "alerts.db");
+        alerts = new AlertRepository(database.connections());
         // A null notification service keeps these tests focused on the rules themselves.
         engine = new AlertEngine(alerts, null, WINDOW, 85.0, 80.0, 3);
+    }
+
+    @AfterEach
+    void tearDown() {
+        database.close();
     }
 
     private List<AnalyticsEngine.LogEntry> window(double cpu, double ram, int count) {

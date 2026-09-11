@@ -1,21 +1,18 @@
 package com.main;
 
 import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.sql.Statement;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 
 public class AlertRepository {
-    private final String databaseUrl;
+    private final ConnectionProvider connections;
 
-    public AlertRepository(String databaseUrl) throws SQLException {
-        this.databaseUrl = databaseUrl;
-        initializeTable();
+    public AlertRepository(ConnectionProvider connections) {
+        this.connections = connections;
     }
 
     /**
@@ -34,7 +31,7 @@ public class AlertRepository {
                     last_seen = excluded.last_seen,
                     occurrence_count = alerts.occurrence_count + 1
                 """;
-        try (Connection connection = DriverManager.getConnection(databaseUrl);
+        try (Connection connection = connections.getConnection();
                 PreparedStatement statement = connection.prepareStatement(query)) {
             statement.setString(1, alert.getAlertKey());
             statement.setString(2, alert.getAlertType());
@@ -61,7 +58,7 @@ public class AlertRepository {
     public synchronized AlertTransition resolve(String alertKey, Instant resolvedAt) throws SQLException {
         String query = "UPDATE alerts SET status = 'RESOLVED', last_seen = ? "
                 + "WHERE alert_key = ? AND status <> 'RESOLVED'";
-        try (Connection connection = DriverManager.getConnection(databaseUrl);
+        try (Connection connection = connections.getConnection();
                 PreparedStatement statement = connection.prepareStatement(query)) {
             statement.setString(1, resolvedAt.toString());
             statement.setString(2, alertKey);
@@ -77,7 +74,7 @@ public class AlertRepository {
     public synchronized AlertTransition acknowledge(String alertKey) throws SQLException {
         String query = "UPDATE alerts SET status = 'ACKNOWLEDGED' "
                 + "WHERE alert_key = ? AND status = 'OPEN'";
-        try (Connection connection = DriverManager.getConnection(databaseUrl);
+        try (Connection connection = connections.getConnection();
                 PreparedStatement statement = connection.prepareStatement(query)) {
             statement.setString(1, alertKey);
             if (statement.executeUpdate() == 0) {
@@ -113,7 +110,7 @@ public class AlertRepository {
             query.append(" AND status <> 'RESOLVED'");
         }
         query.append(" ORDER BY last_seen DESC");
-        try (Connection connection = DriverManager.getConnection(databaseUrl);
+        try (Connection connection = connections.getConnection();
                 PreparedStatement statement = connection.prepareStatement(query.toString())) {
             for (int index = 0; index < parameters.size(); index++) {
                 statement.setString(index + 1, parameters.get(index));
@@ -133,23 +130,5 @@ public class AlertRepository {
             }
         }
         return alerts;
-    }
-
-    private void initializeTable() throws SQLException {
-        try (Connection connection = DriverManager.getConnection(databaseUrl);
-                Statement statement = connection.createStatement()) {
-            statement.executeUpdate("""
-                    CREATE TABLE IF NOT EXISTS alerts (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        alert_key TEXT NOT NULL UNIQUE,
-                        alert_type TEXT NOT NULL,
-                        message TEXT NOT NULL,
-                        status TEXT NOT NULL,
-                        first_seen TEXT NOT NULL,
-                        last_seen TEXT NOT NULL,
-                        occurrence_count INTEGER NOT NULL DEFAULT 1
-                    )
-                    """);
-        }
     }
 }

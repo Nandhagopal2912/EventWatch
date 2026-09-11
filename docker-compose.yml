@@ -1,4 +1,22 @@
 services:
+  # PostgreSQL is opt-in: `docker compose --profile postgres up`. Without the profile the
+  # stack runs on SQLite exactly as before and needs no extra container.
+  postgres:
+    profiles: [postgres]
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${DATABASE_USER:-eventwatch}
+      POSTGRES_PASSWORD: ${DATABASE_PASSWORD:-eventwatch}
+      POSTGRES_DB: ${POSTGRES_DB:-eventwatch}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DATABASE_USER:-eventwatch}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
   analytics:
     build:
       context: ./java-analytics
@@ -6,6 +24,13 @@ services:
       EVENTWATCH_API_KEY: ${EVENTWATCH_API_KEY:?set EVENTWATCH_API_KEY in .env}
       HTTP_PORT: 8080
       DATABASE_PATH: /data/events.db
+      # Empty means SQLite; set it to jdbc:postgresql://postgres:5432/eventwatch with the profile.
+      DATABASE_URL: ${DATABASE_URL:-}
+      DATABASE_USER: ${DATABASE_USER:-}
+      DATABASE_PASSWORD: ${DATABASE_PASSWORD:-}
+      DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-10}
+      RETENTION_DAYS: ${RETENTION_DAYS:-0}
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-100}
       LOG_FORMAT: ${LOG_FORMAT:-json}
       CPU_ALERT_THRESHOLD: ${CPU_ALERT_THRESHOLD:-85}
       RAM_ALERT_THRESHOLD: ${RAM_ALERT_THRESHOLD:-80}
@@ -53,3 +78,4 @@ services:
 volumes:
   analytics-data:
   collector-queue:
+  postgres-data:

@@ -2,7 +2,7 @@
 
 EventWatch is a two-service host telemetry and event-monitoring pipeline. A Go collector captures application events together with CPU and RAM usage, then forwards them to a Java analytics engine for processing, persistence, and reporting.
 
-The current implementation completes Phases 1–10. Future improvements are documented in `CLAUDE.md`.
+The current implementation completes Phases 1–11. Future improvements are documented in `CLAUDE.md`.
 
 ## Project Phase Status
 
@@ -18,7 +18,7 @@ The current implementation completes Phases 1–10. Future improvements are docu
 | **Phase 8**  | **✅ Completed** | Notifications                    | Webhook delivery on alert state changes, cooldown reminders, bounded retries, and a durable delivery-attempt audit trail.                                                  |
 | **Phase 9**  | **✅ Completed** | Observability                    | Structured JSON logs in both services, correlation IDs carried end to end, and Prometheus metrics for both services.                                          |
 | **Phase 10** | **✅ Completed** | Testing and delivery             | Unit, integration, failure and contract tests on both services, plus Dockerfiles, Docker Compose, and a CI pipeline.                                |
-| **Phase 11** | 🗓️ Planned       | Scaling beyond SQLite            | PostgreSQL or time-series storage, durable messaging, and independently scalable services when required.                                                                                                   |
+| **Phase 11** | **✅ Completed** | Scaling beyond SQLite            | Pluggable storage with a PostgreSQL backend, connection pooling, a retention policy, and a load harness. Messaging and service splits remain deliberately deferred. |
 
 **Current state:** EventWatch is a working local telemetry and event-monitoring system. Go collects and forwards events, Java analyzes and persists them, alert state changes are delivered to a configured webhook, and the browser dashboard reports events, alerts, and delivery history.
 
@@ -53,6 +53,7 @@ dashboard/                      Local browser dashboard
 	index.html
 	app.js
 	styles.css
+loadtest/                       Throughput and latency harness
 testdata/                       Cross-language JSON contract fixture
 .github/workflows/ci.yml        Build, test, scan, and image pipeline
 docker-compose.yml              Collector, analytics, and dashboard together
@@ -166,6 +167,9 @@ cd java-analytics; mvn verify
 cd go-collector; go vet ./...; go test ./...
 ```
 
+The PostgreSQL suite is skipped unless `EVENTWATCH_TEST_POSTGRES_URL` points at a reachable
+server, so a checkout without PostgreSQL still builds; CI supplies one as a service container.
+
 The Java suite covers event validation, query-parameter parsing, SQLite persistence and
 deduplication, the alert rules and lifecycle, webhook delivery against a local sink, the metric and
 log formats, and an end-to-end pass that drives the real HTTP server on an ephemeral port with a
@@ -176,6 +180,56 @@ using an `httptest` stand-in for the analytics service.
 `testdata/event-contract.json` is read by both suites, so a change to the shared JSON contract fails
 on whichever side was not updated.
 
+## Storage backends
+
+SQLite stays the default and needs no external services. Setting `DATABASE_URL` to a PostgreSQL
+JDBC URL switches the backend; everything else — the API, the alert rules, the JSON contract —
+behaves identically, and the same test suite runs against both.
+
+```powershell
+# SQLite (default): DATABASE_URL empty, DATABASE_PATH names the file
+DATABASE_URL=
+DATABASE_PATH=events.db
+
+# PostgreSQL
+DATABASE_URL=jdbc:postgresql://localhost:5432/eventwatch
+DATABASE_USER=eventwatch
+DATABASE_PASSWORD=eventwatch
+```
+
+Both backends use a connection pool sized by `DATABASE_POOL_SIZE`. SQLite additionally runs in
+write-ahead-logging mode, which is what makes the default backend fast enough to not be the
+constraint — see the measurements below.
+
+Set `RETENTION_DAYS` to a positive number to delete telemetry and delivery history older than that
+window; a sweep runs every `RETENTION_SWEEP_MINUTES`. The default of `0` keeps everything, which is
+right for a local install and wrong for a long-running one.
+
+`RATE_LIMIT_PER_MINUTE` sets the per-client ingestion limit, default `100`. It is the first ceiling
+a high-volume collector meets, well before storage is.
+
+## Measured throughput
+
+`loadtest/` measures ingestion so scaling decisions rest on numbers rather than guesses.
+
+```powershell
+cd loadtest
+go run . -mode analytics -events 3000 -concurrency 16
+```
+
+Measured on one developer machine, 3000 events at concurrency 16, rate limit raised:
+
+| Backend                              | Throughput    | p50     | p99     |
+| ------------------------------------ | ------------- | ------- | ------- |
+| SQLite, connection per query          | 60 events/s   | 260 ms  | 461 ms  |
+| PostgreSQL in Docker, pooled          | 164 events/s  | 90 ms   | 150 ms  |
+| SQLite, pooled with write-ahead log   | 522 events/s  | 28 ms   | 84 ms   |
+
+The headline is that SQLite was never the bottleneck: opening a connection per query and syncing
+every commit was. Pooled and in WAL mode it outruns PostgreSQL over a local network socket by three
+times. Move to PostgreSQL when you need several collectors writing to one store, or retention longer
+than a single disk holds — not for throughput.
+
 ## Docker
 
 ```powershell
@@ -183,7 +237,14 @@ docker compose up --build
 ```
 
 Compose starts the analytics service on `8080`, the collector on `8082`, and the dashboard on
-`3000`, and reads the same root `.env` file. Telemetry and the pending queue live on named volumes,
+`3000`, and reads the same root `.env` file. To run against PostgreSQL instead, enable its profile
+and point the analytics service at it:
+
+```powershell
+docker compose --profile postgres up --build
+```
+
+with `DATABASE_URL=jdbc:postgresql://postgres:5432/eventwatch` in `.env`. Telemetry and the pending queue live on named volumes,
 so a container restart keeps both history and undelivered events. The collector waits for the
 analytics health check before starting.
 

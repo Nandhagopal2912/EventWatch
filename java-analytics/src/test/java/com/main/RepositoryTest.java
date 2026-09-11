@@ -11,6 +11,7 @@ import java.sql.SQLException;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -19,16 +20,20 @@ class RepositoryTest {
     @TempDir
     Path temporaryDirectory;
 
-    private String databaseUrl;
+    private Database database;
     private EventRepository events;
     private AlertRepository alerts;
 
     @BeforeEach
     void setUp() throws SQLException {
-        databaseUrl = TestSupport.databaseUrl(temporaryDirectory, "repository.db");
-        events = new EventRepository(databaseUrl);
-        events.initializeSchema();
-        alerts = new AlertRepository(databaseUrl);
+        database = TestSupport.openDatabase(temporaryDirectory, "repository.db");
+        events = new EventRepository(database.connections(), database.dialect());
+        alerts = new AlertRepository(database.connections());
+    }
+
+    @AfterEach
+    void tearDown() {
+        database.close();
     }
 
     private AnalyticsEngine.LogEntry entry(String eventId, String level, String message,
@@ -38,8 +43,8 @@ class RepositoryTest {
 
     @Test
     void schemaCreationIsRepeatable() throws SQLException {
-        events.initializeSchema();
-        events.initializeSchema();
+        database.initializeSchema();
+        database.initializeSchema();
         assertEquals(0, events.count(null, null, null));
     }
 
@@ -181,7 +186,7 @@ class RepositoryTest {
 
     @Test
     void notificationHistoryIsRecordedNewestFirst() throws SQLException {
-        NotificationRepository notifications = new NotificationRepository(databaseUrl);
+        NotificationRepository notifications = new NotificationRepository(database.connections());
         notifications.record(new NotificationRecord("cpu-high", "alert.opened", "FAILED", 500,
                 "boom", 1, Instant.parse("2026-09-11T10:00:00Z")));
         notifications.record(new NotificationRecord("cpu-high", "alert.opened", "DELIVERED", 200,

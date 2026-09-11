@@ -50,6 +50,21 @@ jobs:
     defaults:
       run:
         working-directory: java-analytics
+    # The PostgreSQL backend tests are skipped unless a server is reachable, so CI supplies one.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: eventwatch
+          POSTGRES_PASSWORD: eventwatch
+          POSTGRES_DB: eventwatch
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U eventwatch"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
@@ -61,6 +76,10 @@ jobs:
 
       - name: Build and test
         run: mvn -B verify
+        env:
+          EVENTWATCH_TEST_POSTGRES_URL: jdbc:postgresql://localhost:5432/eventwatch
+          EVENTWATCH_TEST_POSTGRES_USER: eventwatch
+          EVENTWATCH_TEST_POSTGRES_PASSWORD: eventwatch
 
       - name: Upload test reports on failure
         if: failure()
@@ -69,10 +88,36 @@ jobs:
           name: surefire-reports
           path: java-analytics/target/surefire-reports/
 
+  loadtest:
+    name: Load harness
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: loadtest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: loadtest/go.mod
+
+      # The harness is a tool, not a test: CI only proves it still compiles.
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet and build
+        run: go vet ./... && go build ./...
+
   images:
     name: Container images
     runs-on: ubuntu-latest
-    needs: [go-collector, java-analytics]
+    needs: [go-collector, java-analytics, loadtest]
     steps:
       - uses: actions/checkout@v4
 

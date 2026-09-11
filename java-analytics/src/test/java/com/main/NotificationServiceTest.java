@@ -24,19 +24,22 @@ class NotificationServiceTest {
     Path temporaryDirectory;
 
     private WebhookSink sink;
+    private Database database;
     private NotificationRepository repository;
     private Metrics metrics;
 
     @BeforeEach
     void setUp() throws IOException, SQLException {
         sink = new WebhookSink();
-        repository = new NotificationRepository(TestSupport.databaseUrl(temporaryDirectory, "notifications.db"));
+        database = TestSupport.openDatabase(temporaryDirectory, "notifications.db");
+        repository = new NotificationRepository(database.connections());
         metrics = new Metrics();
     }
 
     @AfterEach
     void tearDown() {
         sink.close();
+        database.close();
     }
 
     private NotificationService service(boolean enabled, String url, long reminderSeconds) {
