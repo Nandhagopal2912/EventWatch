@@ -17,12 +17,13 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import io.github.cdimascio.dotenv.Dotenv;
 
 import java.util.*;
-import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
-import java.util.stream.Collectors;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class AnalyticsEngine {
     private static final int MOVING_AVERAGE_WINDOW = 5;
@@ -33,13 +34,21 @@ public class AnalyticsEngine {
     private static final int WORK_QUEUE_CAPACITY = 500;
     private static final String DATABASE_URL = "jdbc:sqlite:events.db";
     private static final String DATABASE_UNIQUE_INDEX = "idx_telemetry_events_event_id";
+    private static final int TOP_ERROR_MESSAGES = 5;
+    private static final int NOTIFICATION_HISTORY_LIMIT = 50;
+    private static final long RATE_WINDOW_SWEEP_SECONDS = 60;
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
     private static String apiKey;
     private static AlertRepository alertRepository;
     private static AlertEngine alertEngine;
     private static QueryService queryService;
+    private static EventRepository eventRepository;
+    private static NotificationRepository notificationRepository;
+    private static NotificationService notificationService;
 
-    private static final List<LogEntry> logStorage = new CopyOnWriteArrayList<>();
+    // Only the newest events are mirrored in memory; the full history stays in SQLite.
+    private static final Deque<LogEntry> recentEvents = new ArrayDeque<>();
+    private static final AtomicLong storedEventCount = new AtomicLong();
     private static final Map<String, RateWindow> rateWindows = new ConcurrentHashMap<>();
 
     private static class RateWindow {
@@ -57,6 +66,10 @@ public class AnalyticsEngine {
             }
             requestCount++;
             return true;
+        }
+
+        synchronized boolean isExpired(long now) {
+            return now - startedAt >= 60_000;
         }
     }
 
@@ -91,20 +104,32 @@ public class AnalyticsEngine {
 
         try {
             initializeDatabase();
-            loadStoredEvents();
+            eventRepository = new EventRepository(DATABASE_URL);
+            loadRecentEvents();
             alertRepository = new AlertRepository(DATABASE_URL);
+            notificationRepository = new NotificationRepository(DATABASE_URL);
+            notificationService = new NotificationService(
+                    notificationRepository,
+                    OBJECT_MAPPER,
+                    Boolean.parseBoolean(getConfig(dotenv, "NOTIFICATIONS_ENABLED", "false")),
+                    getConfig(dotenv, "NOTIFICATION_WEBHOOK_URL", ""),
+                    getIntConfig(dotenv, "NOTIFICATION_TIMEOUT_SECONDS", 5),
+                    getIntConfig(dotenv, "NOTIFICATION_MAX_ATTEMPTS", 3),
+                    getIntConfig(dotenv, "NOTIFICATION_RETRY_DELAY_MILLIS", 1000),
+                    getIntConfig(dotenv, "NOTIFICATION_REMINDER_SECONDS", 900));
             alertEngine = new AlertEngine(
                     alertRepository,
+                    notificationService,
                     MOVING_AVERAGE_WINDOW,
                     getDoubleConfig(dotenv, "CPU_ALERT_THRESHOLD", 85.0),
                     getDoubleConfig(dotenv, "RAM_ALERT_THRESHOLD", 80.0),
                     getIntConfig(dotenv, "REPEATED_ERROR_THRESHOLD", 5));
             queryService = new QueryService(
-                    new EventRepository(DATABASE_URL), alertRepository, OBJECT_MAPPER, MOVING_AVERAGE_WINDOW);
+                    eventRepository, alertRepository, OBJECT_MAPPER, MOVING_AVERAGE_WINDOW);
         } catch (SQLException exception) {
             throw new IOException("Unable to initialize SQLite database", exception);
         }
-        System.out.println("Loaded " + logStorage.size() + " stored events.");
+        System.out.println("Loaded " + storedEventCount.get() + " stored events.");
         HttpServer server = HttpServer.create(new InetSocketAddress(8080), 0);
 
         server.createContext("/receive", new HttpHandler() {
@@ -163,7 +188,7 @@ public class AnalyticsEngine {
 
                     try {
                         storeEvent(new LogEntry(eventId, level, msg, timestamp, cpuUsage, ramUsage));
-                        alertEngine.evaluate(new ArrayList<>(logStorage));
+                        alertEngine.evaluate(recentEventsSnapshot());
                     } catch (SQLException exception) {
                         sendResponse(exchange, 503, "Database unavailable");
                         return;
@@ -204,6 +229,10 @@ public class AnalyticsEngine {
             }
             if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
                 sendResponse(exchange, 405, "Method not allowed");
+                return;
+            }
+            if (!isValidApiKey(exchange.getRequestHeaders().getFirst("X-EventWatch-Key"))) {
+                sendResponse(exchange, 401, "Unauthorized");
                 return;
             }
             try {
@@ -283,8 +312,8 @@ public class AnalyticsEngine {
                 exchange.sendResponseHeaders(204, -1);
                 return;
             }
-            if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())
-                    && !"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+            boolean readRequest = "GET".equalsIgnoreCase(exchange.getRequestMethod());
+            if (!readRequest && !"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
                 sendResponse(exchange, 405, "Method not allowed");
                 return;
             }
@@ -292,27 +321,35 @@ public class AnalyticsEngine {
                 sendResponse(exchange, 401, "Unauthorized");
                 return;
             }
-            String path = exchange.getRequestURI().getPath();
             String prefix = "/alerts/";
-            String acknowledgeSuffix = "/acknowledge";
-            String resolveSuffix = "/resolve";
+            String path = exchange.getRequestURI().getPath();
             if (!path.startsWith(prefix)) {
                 sendResponse(exchange, 404, "Alert route not found");
                 return;
             }
-            boolean acknowledgeRoute = path.endsWith(acknowledgeSuffix);
-            boolean resolveRoute = path.endsWith(resolveSuffix);
-            String suffix = acknowledgeRoute ? acknowledgeSuffix : resolveSuffix;
-            String alertKey = "GET".equalsIgnoreCase(exchange.getRequestMethod())
-                    ? path.substring(prefix.length())
-                    : path.substring(prefix.length(), path.length() - suffix.length());
-            if (alertKey.isBlank() || ("POST".equalsIgnoreCase(exchange.getRequestMethod())
-                    && !acknowledgeRoute && !resolveRoute)) {
+            // Alert keys never contain a separator, so the last segment is the action.
+            String remainder = path.substring(prefix.length());
+            int separator = remainder.lastIndexOf('/');
+            String alertKey = separator < 0 ? remainder : remainder.substring(0, separator);
+            String action = separator < 0 ? "" : remainder.substring(separator + 1);
+            if (alertKey.isBlank()) {
                 sendResponse(exchange, 404, "Alert route not found");
                 return;
             }
             try {
-                if ("GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+                if (readRequest) {
+                    if ("notifications".equals(action)) {
+                        Map<String, String> parameters = queryParameters(exchange.getRequestURI().getRawQuery());
+                        int limit = boundedInteger(parameters.get("limit"),
+                                NOTIFICATION_HISTORY_LIMIT, QueryService.MAX_LIMIT);
+                        sendJsonResponse(exchange, 200, queryService
+                                .notifications(notificationRepository.findByAlertKey(alertKey, limit)).toString());
+                        return;
+                    }
+                    if (!action.isEmpty()) {
+                        sendResponse(exchange, 404, "Alert route not found");
+                        return;
+                    }
                     AlertRecord alert = alertRepository.findByKey(alertKey);
                     if (alert == null) {
                         sendResponse(exchange, 404, "Alert not found");
@@ -321,20 +358,27 @@ public class AnalyticsEngine {
                     }
                     return;
                 }
-                boolean changed;
-                String action;
-                if (acknowledgeRoute) {
-                    changed = alertRepository.acknowledge(alertKey);
-                    action = "acknowledged";
+                AlertTransition transition;
+                String outcome;
+                if ("acknowledge".equals(action)) {
+                    transition = alertRepository.acknowledge(alertKey);
+                    outcome = "acknowledged";
+                } else if ("resolve".equals(action)) {
+                    transition = alertRepository.resolve(alertKey, Instant.now());
+                    outcome = "resolved";
                 } else {
-                    changed = alertRepository.resolve(alertKey, Instant.now());
-                    action = "resolved";
+                    sendResponse(exchange, 404, "Alert route not found");
+                    return;
                 }
-                if (changed) {
-                    sendResponse(exchange, 200, "Alert " + action);
-                } else {
-                    sendResponse(exchange, 404, "Alert not found or already " + action);
+                if (transition == null) {
+                    sendResponse(exchange, 404, "Alert not found or already " + outcome);
+                    return;
                 }
+                // Operator actions are lifecycle changes and notify like engine transitions.
+                notificationService.handle(transition);
+                sendResponse(exchange, 200, "Alert " + outcome);
+            } catch (IllegalArgumentException exception) {
+                sendResponse(exchange, 400, exception.getMessage());
             } catch (SQLException exception) {
                 sendResponse(exchange, 503, "Alert storage unavailable");
             }
@@ -350,9 +394,21 @@ public class AnalyticsEngine {
                 new ThreadPoolExecutor.CallerRunsPolicy());
         server.setExecutor(requestExecutor);
 
+        // Without eviction the rate-limit map grows with every distinct client address.
+        ScheduledExecutorService maintenance = Executors.newSingleThreadScheduledExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "eventwatch-maintenance");
+            thread.setDaemon(true);
+            return thread;
+        });
+        maintenance.scheduleWithFixedDelay(
+                () -> rateWindows.values().removeIf(window -> window.isExpired(System.currentTimeMillis())),
+                RATE_WINDOW_SWEEP_SECONDS, RATE_WINDOW_SWEEP_SECONDS, TimeUnit.SECONDS);
+
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             System.out.println("Shutting down Java analytics engine...");
             server.stop(5);
+            maintenance.shutdownNow();
+            notificationService.shutdown();
             requestExecutor.shutdown();
             try {
                 if (!requestExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
@@ -417,26 +473,26 @@ public class AnalyticsEngine {
     }
 
     private static void generateDashboardReport() {
-        Map<String, Long> errorCounts = logStorage.stream()
-                .filter(log -> "ERROR".equalsIgnoreCase(log.level))
-                .collect(Collectors.groupingBy(log -> log.message, Collectors.counting()));
-
-        long totalProcessed = logStorage.size();
-        List<LogEntry> logSnapshot = new ArrayList<>(logStorage);
-        // Limit the trend calculation to the most recent events.
-        int windowStart = Math.max(0, logSnapshot.size() - MOVING_AVERAGE_WINDOW);
-        List<LogEntry> recentLogs = logSnapshot.subList(windowStart, logSnapshot.size());
-        double averageCpu = recentLogs.stream().mapToDouble(log -> log.cpuUsage).average().orElse(0.0);
-        double averageRam = recentLogs.stream().mapToDouble(log -> log.ramUsage).average().orElse(0.0);
+        List<LogEntry> window = recentEventsSnapshot();
+        double averageCpu = window.stream().mapToDouble(log -> log.cpuUsage).average().orElse(0.0);
+        double averageRam = window.stream().mapToDouble(log -> log.ramUsage).average().orElse(0.0);
+        // Counting in SQLite keeps the report independent of how much history exists.
+        Map<String, Long> errorCounts;
+        try {
+            errorCounts = eventRepository.topErrorMessages(TOP_ERROR_MESSAGES);
+        } catch (SQLException exception) {
+            errorCounts = Map.of();
+        }
 
         System.out.println("\n================ LIVE CLOUD ALERT DASHBOARD ================");
-        System.out.println("Total Logs Processed (All Types): " + totalProcessed);
+        System.out.println("Total Logs Processed (All Types): " + storedEventCount.get());
         System.out.printf("Last %d-event average: CPU %.1f%% | RAM %.1f%%%n",
-                recentLogs.size(), averageCpu, averageRam);
+                window.size(), averageCpu, averageRam);
         System.out.println("------------------------------------------------------------");
         if (errorCounts.isEmpty()) {
             System.out.println(" No critical errors detected yet.");
         } else {
+            System.out.printf(" Top %d repeated error message(s):%n", errorCounts.size());
             errorCounts.forEach((errorMessage, count) -> System.out
                     .printf(" 🚨 [ERROR] \"%s\" -> occurred %d time(s)\n", errorMessage, count));
         }
@@ -469,26 +525,22 @@ public class AnalyticsEngine {
             }
             statement.executeUpdate("CREATE UNIQUE INDEX IF NOT EXISTS " + DATABASE_UNIQUE_INDEX
                     + " ON telemetry_events(event_id) WHERE event_id IS NOT NULL");
+            statement.executeUpdate("CREATE INDEX IF NOT EXISTS idx_telemetry_events_level "
+                    + "ON telemetry_events(level, event_timestamp)");
         }
     }
 
-    private static void loadStoredEvents() throws SQLException {
-        // Rebuild the in-memory analytics window from durable SQLite records.
-        String query = "SELECT event_id, level, message, event_timestamp, cpu_usage, ram_usage "
-                + "FROM telemetry_events ORDER BY id";
-        try (Connection connection = DriverManager.getConnection(DATABASE_URL);
-                PreparedStatement statement = connection.prepareStatement(query);
-                ResultSet results = statement.executeQuery()) {
-            while (results.next()) {
-                logStorage.add(new LogEntry(
-                        results.getString("event_id"),
-                        results.getString("level"),
-                        results.getString("message"),
-                        parseTimestamp(results.getString("event_timestamp")),
-                        results.getDouble("cpu_usage"),
-                        results.getDouble("ram_usage")));
-            }
+    private static synchronized void loadRecentEvents() throws SQLException {
+        // Restore only the analytics window; SQLite remains the source of truth for history.
+        storedEventCount.set(eventRepository.count(null, null, null));
+        List<LogEntry> newestFirst = eventRepository.recent(MOVING_AVERAGE_WINDOW);
+        for (int index = newestFirst.size() - 1; index >= 0; index--) {
+            recentEvents.addLast(newestFirst.get(index));
         }
+    }
+
+    private static synchronized List<LogEntry> recentEventsSnapshot() {
+        return new ArrayList<>(recentEvents);
     }
 
     private static synchronized void storeEvent(LogEntry event) throws SQLException {
@@ -508,7 +560,11 @@ public class AnalyticsEngine {
             int inserted = statement.executeUpdate();
             connection.commit();
             if (inserted > 0) {
-                logStorage.add(event);
+                storedEventCount.incrementAndGet();
+                recentEvents.addLast(event);
+                while (recentEvents.size() > MOVING_AVERAGE_WINDOW) {
+                    recentEvents.removeFirst();
+                }
             }
         }
     }

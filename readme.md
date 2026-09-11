@@ -2,7 +2,7 @@
 
 EventWatch is a two-service host telemetry and event-monitoring pipeline. A Go collector captures application events together with CPU and RAM usage, then forwards them to a Java analytics engine for processing, persistence, and reporting.
 
-The current implementation completes Phases 1–6. Future improvements are documented in `agent.md`.
+The current implementation completes Phases 1–8. Future improvements are documented in `CLAUDE.md`.
 
 ## Project Phase Status
 
@@ -15,12 +15,12 @@ The current implementation completes Phases 1–6. Future improvements are docum
 | **Phase 5**  | **✅ Completed** | Reliability and failure handling | Go health endpoint, atomic durable JSON queue, recovery worker, queue limits, retry configuration, event-ID deduplication, Java health endpoint, bounded request execution, and consistent JSON responses. |
 | **Phase 6**  | **✅ Completed** | Analytics and alert rules        | Configurable CPU/RAM thresholds, moving-window detection, repeated-error alerts, SQLite alert state, deduplication, and the active-alerts endpoint.                                                        |
 | **Phase 7**  | **✅ Completed** | Query API and dashboard          | Bounded event queries, summaries, alert lookup/filtering, a separate local dashboard, and operator alert workflows.                                                                                        |
-| **Phase 8**  | 🗓️ Planned       | Notifications                    | Email and webhook integrations with delivery tracking and duplicate-alert prevention.                                                                                                                      |
+| **Phase 8**  | **✅ Completed** | Notifications                    | Webhook delivery on alert state changes, cooldown reminders, bounded retries, and a durable delivery-attempt audit trail.                                                  |
 | **Phase 9**  | 🗓️ Planned       | Observability                    | Structured logs, Prometheus metrics, OpenTelemetry tracing, and correlation IDs.                                                                                                                           |
 | **Phase 10** | 🗓️ Planned       | Testing and delivery             | Unit, integration, load, and failure tests plus Docker and CI/CD automation.                                                                                                                               |
 | **Phase 11** | 🗓️ Planned       | Scaling beyond SQLite            | PostgreSQL or time-series storage, durable messaging, and independently scalable services when required.                                                                                                   |
 
-**Current state:** EventWatch is a working local telemetry and event-monitoring system. Go collects and forwards events, Java analyzes and persists them, and the terminal dashboard reports errors and recent resource averages.
+**Current state:** EventWatch is a working local telemetry and event-monitoring system. Go collects and forwards events, Java analyzes and persists them, alert state changes are delivered to a configured webhook, and the browser dashboard reports events, alerts, and delivery history.
 
 ## Project Structure
 
@@ -37,6 +37,12 @@ java-analytics/                 Maven Java analytics service
 		AlertRecord.java
 		AlertRepository.java
 		AlertStatus.java
+		AlertTransition.java
+		EventRepository.java
+		QueryService.java
+		NotificationRecord.java
+		NotificationRepository.java
+		NotificationService.java
 dashboard/                      Local browser dashboard
 	index.html
 	app.js
@@ -52,8 +58,9 @@ dashboard/                      Local browser dashboard
 - **Alert API:** `GET http://localhost:8080/alerts` returns active `OPEN` and `ACKNOWLEDGED` alerts as JSON.
 - **Alert acknowledgement:** `POST http://localhost:8080/alerts/{alert_key}/acknowledge` changes an `OPEN` alert to `ACKNOWLEDGED`.
 - **Alert resolution:** `POST http://localhost:8080/alerts/{alert_key}/resolve` changes an alert to `RESOLVED`, removing it from the active alerts response.
-- **Phase 7 query API:** `GET /events`, `GET /summary`, `GET /alerts`, and `GET /alerts/{alert_key}` provide bounded JSON data for the dashboard.
-- **Dashboard:** `dashboard/index.html` displays summaries, recent events, and active alerts. It reads the API key in the browser and never accesses SQLite directly.
+- **Phase 7 query API:** `GET /events`, `GET /summary`, `GET /alerts`, and `GET /alerts/{alert_key}` provide bounded JSON data for the dashboard. All of them require the API key.
+- **Phase 8 notifications:** alert state changes (opened, reopened, acknowledged, resolved) are POSTed as versioned JSON to `NOTIFICATION_WEBHOOK_URL`. Repeat occurrences are suppressed until `NOTIFICATION_REMINDER_SECONDS` passes. Every attempt is recorded and readable at `GET /alerts/{alert_key}/notifications`.
+- **Dashboard:** `dashboard/index.html` displays summaries, recent events, active alerts, and per-alert delivery history. It reads the API key in the browser, escapes all event text before rendering it, and never accesses SQLite directly.
 - **SQLite database** (`java-analytics/events.db`): stores telemetry in the `telemetry_events` table. The database is created automatically when the Java service starts.
 
 ## End-to-End Flow
@@ -75,6 +82,10 @@ Alert engine evaluates the latest five-event window
 	↓
 SQLite stores or updates alert state
 	↓
+Lifecycle changes are handed to the notification dispatcher
+	↓
+Webhook delivery attempt recorded in SQLite
+	↓
 JSON response and terminal dashboard output
 ```
 
@@ -95,6 +106,8 @@ If Java is temporarily unavailable, Go retries the request and writes the same e
 | **Moving-window analytics** | Evaluates the latest five events for CPU and RAM trends.                                          | Detects sustained pressure instead of reacting to one momentary spike.        |
 | **Alert engine**            | Creates and updates `HIGH_CPU`, `HIGH_RAM`, and `REPEATED_ERROR` alerts.                          | Turns raw telemetry into actionable incidents.                                |
 | **Alert lifecycle**         | Supports `OPEN`, `ACKNOWLEDGED`, and `RESOLVED` states.                                           | Shows whether an issue is new, being handled, or no longer active.            |
+| **Webhook notifications**   | Delivers alert state changes to an external endpoint and retries transient failures.              | Reaches an operator who is not watching the dashboard.                        |
+| **Delivery audit trail**    | Records every attempt with status, HTTP code, and attempt number.                                 | Makes a missed notification diagnosable instead of invisible.                 |
 | **Health endpoints**        | Reports Go availability and Java availability plus SQLite reachability.                           | Gives operators and future deployment tools a simple readiness check.         |
 | **Graceful shutdown**       | Stops new work, drains Java workers, and flushes the Go queue once.                               | Leaves the system in a recoverable state during restarts or deployments.      |
 
@@ -130,6 +143,8 @@ go run .
 Both services load the root `.env` file automatically and must remain running. The Go service listens on port `8082`; the Java service listens on port `8080`. The Go collector sends `X-EventWatch-Key`, and Java rejects requests with a missing or incorrect key.
 
 Queue settings are controlled by `PENDING_EVENTS_DIR`, `QUEUE_CAPACITY`, and `QUEUE_RETRY_SECONDS` in `.env`. Alert settings are controlled by `CPU_ALERT_THRESHOLD`, `RAM_ALERT_THRESHOLD`, and `REPEATED_ERROR_THRESHOLD`.
+
+Notifications are disabled by default. Set `NOTIFICATIONS_ENABLED=true` and a `NOTIFICATION_WEBHOOK_URL` to turn them on; `NOTIFICATION_TIMEOUT_SECONDS`, `NOTIFICATION_MAX_ATTEMPTS`, `NOTIFICATION_RETRY_DELAY_MILLIS`, and `NOTIFICATION_REMINDER_SECONDS` control delivery behaviour. Delivery never blocks ingestion: it runs on a background dispatcher, and a failed webhook still leaves the alert state correct.
 
 When Java is unavailable, the Go collector retries the request and writes the event atomically as a JSON file. A single background worker retries pending files. Successfully delivered files disappear; temporary failures remain pending; permanent `4xx` failures move to `pending-events/rejected-events/` for inspection. On shutdown, Go stops accepting requests and performs a final pending-queue delivery pass; Java drains its request executor before stopping.
 
@@ -185,10 +200,16 @@ Use the API key to acknowledge an alert:
 curl.exe -i -X POST "http://localhost:8080/alerts/cpu-high/acknowledge" -H "X-EventWatch-Key: local-secret"
 ```
 
-Acknowledged alerts remain visible because they are still active. Resolve them after the underlying issue is fixed:
+Acknowledging an alert does not reset it: further occurrences keep incrementing the count while the status stays `ACKNOWLEDGED`. Resolve them after the underlying issue is fixed:
 
 ```powershell
 curl.exe -i -X POST "http://localhost:8080/alerts/cpu-high/resolve" -H "X-EventWatch-Key: local-secret"
+```
+
+Review webhook delivery attempts for one alert:
+
+```powershell
+curl.exe "http://localhost:8080/alerts/cpu-high/notifications?limit=10" -H "X-EventWatch-Key: local-secret"
 ```
 
 ## Run the stress test
@@ -199,11 +220,11 @@ After both services are running, send 500 test requests through the Go service:
 curl.exe http://localhost:8082/stress
 ```
 
-The stress handler adds a unique `(Log #N)` suffix to each message. Because the Java dashboard groups by the complete message, each generated message currently appears with a count of `1`.
+The stress handler adds a unique `(Log #N)` suffix to each message and bounds its fan-out to 32 concurrent deliveries. Java rate-limits a single client to 100 requests per minute, so most of the burst is answered with `429` and written to the pending queue; the recovery worker then drains it over the following minutes. No event is dropped.
 
 ## Notes
 
-- Telemetry is stored in `java-analytics/events.db` and loaded when the Java service restarts.
+- Telemetry is stored in `java-analytics/events.db`. Only the newest five events are mirrored in memory at startup; the full history stays in SQLite and is reached through the query API.
 - `alerts_history.json` is a legacy Phase 2 archive and is no longer written by the service.
 - Maven build output and the runtime SQLite database are generated files and should not be committed.
 - The services currently communicate over `localhost`; HTTPS/TLS remains a future deployment task.

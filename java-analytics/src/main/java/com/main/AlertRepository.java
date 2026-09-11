@@ -18,13 +18,19 @@ public class AlertRepository {
         initializeTable();
     }
 
-    public synchronized void saveOccurrence(AlertRecord alert) throws SQLException {
+    /**
+     * Records one occurrence of an alert and reports how the lifecycle changed so the
+     * notification policy can decide whether the change is worth delivering.
+     */
+    public synchronized AlertTransition saveOccurrence(AlertRecord alert) throws SQLException {
+        AlertRecord existing = findByKey(alert.getAlertKey());
         String query = """
                 INSERT INTO alerts (alert_key, alert_type, message, status, first_seen,
                                     last_seen, occurrence_count)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(alert_key) DO UPDATE SET
-                    status = excluded.status,
+                    message = excluded.message,
+                    status = CASE WHEN alerts.status = 'RESOLVED' THEN 'OPEN' ELSE alerts.status END,
                     last_seen = excluded.last_seen,
                     occurrence_count = alerts.occurrence_count + 1
                 """;
@@ -39,27 +45,47 @@ public class AlertRepository {
             statement.setInt(7, alert.getOccurrenceCount());
             statement.executeUpdate();
         }
+        AlertTransition.Type type;
+        if (existing == null) {
+            type = AlertTransition.Type.OPENED;
+        } else if (existing.getStatus() == AlertStatus.RESOLVED) {
+            type = AlertTransition.Type.REOPENED;
+        } else {
+            type = AlertTransition.Type.OCCURRENCE;
+        }
+        AlertRecord stored = findByKey(alert.getAlertKey());
+        return new AlertTransition(stored == null ? alert : stored, type);
     }
 
-    public synchronized boolean resolve(String alertKey, Instant resolvedAt) throws SQLException {
+    /** Returns the resolving transition, or null when the alert was already resolved or unknown. */
+    public synchronized AlertTransition resolve(String alertKey, Instant resolvedAt) throws SQLException {
         String query = "UPDATE alerts SET status = 'RESOLVED', last_seen = ? "
                 + "WHERE alert_key = ? AND status <> 'RESOLVED'";
         try (Connection connection = DriverManager.getConnection(databaseUrl);
                 PreparedStatement statement = connection.prepareStatement(query)) {
             statement.setString(1, resolvedAt.toString());
             statement.setString(2, alertKey);
-            return statement.executeUpdate() > 0;
+            if (statement.executeUpdate() == 0) {
+                return null;
+            }
         }
+        AlertRecord stored = findByKey(alertKey);
+        return stored == null ? null : new AlertTransition(stored, AlertTransition.Type.RESOLVED);
     }
 
-    public synchronized boolean acknowledge(String alertKey) throws SQLException {
+    /** Returns the acknowledging transition, or null when the alert was not open. */
+    public synchronized AlertTransition acknowledge(String alertKey) throws SQLException {
         String query = "UPDATE alerts SET status = 'ACKNOWLEDGED' "
                 + "WHERE alert_key = ? AND status = 'OPEN'";
         try (Connection connection = DriverManager.getConnection(databaseUrl);
                 PreparedStatement statement = connection.prepareStatement(query)) {
             statement.setString(1, alertKey);
-            return statement.executeUpdate() > 0;
+            if (statement.executeUpdate() == 0) {
+                return null;
+            }
         }
+        AlertRecord stored = findByKey(alertKey);
+        return stored == null ? null : new AlertTransition(stored, AlertTransition.Type.ACKNOWLEDGED);
     }
 
     public List<AlertRecord> findActive() throws SQLException {

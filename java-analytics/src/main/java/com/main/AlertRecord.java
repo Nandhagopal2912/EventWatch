@@ -6,10 +6,10 @@ public class AlertRecord {
     private final String alertKey;
     private final String alertType;
     private final String message;
-    private AlertStatus status;
+    private final AlertStatus status;
     private final Instant firstSeen;
-    private Instant lastSeen;
-    private int occurrenceCount;
+    private final Instant lastSeen;
+    private final int occurrenceCount;
 
     public AlertRecord(String alertKey, String alertType, String message, Instant firstSeen) {
         this.alertKey = alertKey;
@@ -58,15 +58,5 @@ public class AlertRecord {
 
     public int getOccurrenceCount() {
         return occurrenceCount;
-    }
-
-    public void recordOccurrence(Instant occurrenceTime) {
-        status = AlertStatus.OPEN;
-        lastSeen = occurrenceTime;
-        occurrenceCount++;
-    }
-
-    public void resolve() {
-        status = AlertStatus.RESOLVED;
     }
 }

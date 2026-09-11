@@ -47,7 +47,10 @@ td:nth-child(2) { max-width: 250px; overflow: hidden; text-overflow: ellipsis; }
 .alert-meta { color: var(--muted); font-size: 11px; }
 .alert-actions { display: flex; gap: 8px; margin-top: 10px; }
 .alert-actions button { padding: 7px 9px; font-size: 11px; }
-.alert-actions button:last-child { background: transparent; color: var(--coral); border-color: var(--coral); }
+.alert-actions button[data-action="resolve"] { background: transparent; color: var(--coral); border-color: var(--coral); }
+.alert-actions button[data-action="notifications"] { background: transparent; color: var(--muted); border-color: var(--muted); }
+.notification-history:not(:empty) { margin-top: 10px; border-top: 1px solid var(--muted); padding-top: 8px; }
+.notification-history ul { margin: 0; padding-left: 16px; color: var(--muted); font-size: 11px; line-height: 1.6; }
 .empty { color: var(--muted); font: 13px "Trebuchet MS", sans-serif; }
 @media (max-width: 800px) { .header, .grid { display: block; } .config { margin-top: 24px; } .metrics { grid-template-columns: repeat(2, 1fr); margin-top: 20px; } .alerts-panel { margin-top: 20px; } }
 @media (max-width: 450px) { .shell { width: min(100% - 24px, 1180px); padding-top: 30px; } .metrics { gap: 8px; } .metric { padding: 14px; } .metric strong { font-size: 26px; } }

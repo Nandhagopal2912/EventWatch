@@ -6,3 +6,4 @@ java-analytics/events.db-wal
 .env
 go-collector/pending-events/
 java-analytics/hs_err_pid*.log
+go-collector/gocode.exe

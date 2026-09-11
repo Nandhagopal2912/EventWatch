@@ -68,6 +68,30 @@ public class QueryService {
         return response;
     }
 
+    public ArrayNode notifications(List<NotificationRecord> deliveries) {
+        ArrayNode items = objectMapper.createArrayNode();
+        for (NotificationRecord delivery : deliveries) {
+            ObjectNode node = objectMapper.createObjectNode();
+            node.put("alert_key", delivery.alertKey());
+            node.put("event_type", delivery.eventType());
+            node.put("delivery_status", delivery.deliveryStatus());
+            if (delivery.httpStatus() == null) {
+                node.putNull("http_status");
+            } else {
+                node.put("http_status", delivery.httpStatus());
+            }
+            if (delivery.errorMessage() == null) {
+                node.putNull("error_message");
+            } else {
+                node.put("error_message", delivery.errorMessage());
+            }
+            node.put("attempt_number", delivery.attemptNumber());
+            node.put("attempted_at", delivery.attemptedAt().toString());
+            items.add(node);
+        }
+        return items;
+    }
+
     private ObjectNode eventJson(AnalyticsEngine.LogEntry event) {
         ObjectNode response = objectMapper.createObjectNode();
         response.put("event_id", event.eventId);

@@ -11,14 +11,16 @@ import java.util.Map;
 
 public class AlertEngine {
     private final AlertRepository repository;
+    private final NotificationService notificationService;
     private final int movingWindowSize;
     private final double cpuThreshold;
     private final double ramThreshold;
     private final int repeatedErrorThreshold;
 
-    public AlertEngine(AlertRepository repository, int movingWindowSize,
-            double cpuThreshold, double ramThreshold, int repeatedErrorThreshold) {
+    public AlertEngine(AlertRepository repository, NotificationService notificationService,
+            int movingWindowSize, double cpuThreshold, double ramThreshold, int repeatedErrorThreshold) {
         this.repository = repository;
+        this.notificationService = notificationService;
         this.movingWindowSize = movingWindowSize;
         this.cpuThreshold = cpuThreshold;
         this.ramThreshold = ramThreshold;
@@ -56,8 +58,8 @@ public class AlertEngine {
         for (Map.Entry<String, Integer> entry : errorCounts.entrySet()) {
             String alertKey = "repeated-error-" + stableKey(entry.getKey());
             if (entry.getValue() >= repeatedErrorThreshold) {
-                repository.saveOccurrence(new AlertRecord(alertKey, "REPEATED_ERROR",
-                        entry.getKey() + " occurred " + entry.getValue() + " times", now));
+                notify(repository.saveOccurrence(new AlertRecord(alertKey, "REPEATED_ERROR",
+                        entry.getKey() + " occurred " + entry.getValue() + " times", now)));
             }
         }
     }
@@ -65,9 +67,16 @@ public class AlertEngine {
     private void evaluateThreshold(String alertKey, String alertType, double value,
             double threshold, String message, Instant timestamp) throws SQLException {
         if (value >= threshold) {
-            repository.saveOccurrence(new AlertRecord(alertKey, alertType, message, timestamp));
+            notify(repository.saveOccurrence(new AlertRecord(alertKey, alertType, message, timestamp)));
         } else {
-            repository.resolve(alertKey, timestamp);
+            notify(repository.resolve(alertKey, timestamp));
+        }
+    }
+
+    // Delivery is the notification service's concern; the rules only report what changed.
+    private void notify(AlertTransition transition) {
+        if (transition != null && notificationService != null) {
+            notificationService.handle(transition);
         }
     }
 

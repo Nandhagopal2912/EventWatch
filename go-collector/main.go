@@ -32,7 +32,11 @@ type LogPayload struct {
 	RAMUsage float64 `json:"ram_usage"`
 }
 
-const maxBackendAttempts = 3
+const (
+	maxBackendAttempts = 3
+	stressEventCount   = 500
+	stressConcurrency  = 32
+)
 
 var (
 	backendClient        *http.Client
@@ -88,7 +92,7 @@ func logHandler(w http.ResponseWriter, r *http.Request) {
 		EventID:  newEventID(),
 		Level:    level,
 		Messages: msg,
-		Time:     time.Now().Format(time.RFC3339),
+		Time:     time.Now().UTC().Format(time.RFC3339),
 		CPUUsage: cpuUsage,
 		RAMUsage: ramUsage,
 	}
@@ -116,7 +120,8 @@ func logHandler(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		if resp.StatusCode >= 500 {
+		// Rate limiting is temporary, so queue it for retry exactly like a server failure.
+		if isRetryableStatus(resp.StatusCode) {
 			if queueErr := enqueueEvent(jsonBytes); queueErr != nil {
 				writeMessage(w, http.StatusServiceUnavailable, "backend unavailable and local queue is full")
 				return
@@ -136,7 +141,7 @@ func stressHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fmt.Printf("⚡ STARTING MASS STRESS TEST: Firing 500 logs...")
+	fmt.Printf("⚡ STARTING MASS STRESS TEST: Firing %d logs...", stressEventCount)
 
 	fakeErrors := []string{
 		"Database transaction deadlock",
@@ -149,36 +154,44 @@ func stressHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	for i := 0; i < 500; i++ {
-		errorMsg := fakeErrors[i%3]
+	// Bound the fan-out so the test measures pipeline throughput rather than goroutine spawning.
+	slots := make(chan struct{}, stressConcurrency)
+	for i := 0; i < stressEventCount; i++ {
+		errorMsg := fakeErrors[i%len(fakeErrors)]
 
 		payload := LogPayload{
 			EventID:  newEventID(),
 			Level:    "ERROR",
 			Messages: fmt.Sprintf("%s (Log #%d)", errorMsg, i),
-			Time:     time.Now().Format(time.RFC3339),
+			Time:     time.Now().UTC().Format(time.RFC3339),
 			CPUUsage: cpuUsage,
 			RAMUsage: ramUsage,
 		}
-		jsonBytes, _ := json.Marshal(payload)
+		jsonBytes, marshalErr := json.Marshal(payload)
+		if marshalErr != nil {
+			fmt.Printf("❌ Stress event dropped: %v\n", marshalErr)
+			continue
+		}
+		slots <- struct{}{}
 		go func(data []byte) {
+			defer func() { <-slots }()
 			resp, err := forwardToJava(data)
 
 			if err != nil {
 				if queueErr := enqueueEvent(data); queueErr != nil {
 					fmt.Printf("❌ Stress event dropped: %v\n", queueErr)
 				}
-			} else if resp.StatusCode >= 500 {
+				return
+			}
+			defer resp.Body.Close()
+			if isRetryableStatus(resp.StatusCode) {
 				if queueErr := enqueueEvent(data); queueErr != nil {
 					fmt.Printf("❌ Stress event dropped: %v\n", queueErr)
 				}
-				resp.Body.Close()
-			} else {
-				resp.Body.Close()
 			}
 		}(jsonBytes)
 	}
-	writeMessage(w, http.StatusOK, "500 logs queued for the analytics engine")
+	writeMessage(w, http.StatusOK, fmt.Sprintf("%d logs queued for the analytics engine", stressEventCount))
 }
 
 func main() {
@@ -269,6 +282,11 @@ func forwardToJava(jsonBytes []byte) (*http.Response, error) {
 		}
 	}
 	return nil, lastError
+}
+
+// A queued event is only abandoned on a permanent client error.
+func isRetryableStatus(status int) bool {
+	return status >= 500 || status == http.StatusTooManyRequests
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
@@ -362,7 +380,7 @@ func processPendingEvents() {
 			} else {
 				fmt.Printf("✅ Queued event delivered successfully: %s (removed from pending queue)\n", name)
 			}
-		} else if status >= 400 && status < 500 && status != http.StatusTooManyRequests {
+		} else if !isRetryableStatus(status) {
 			moveToRejected(path, name)
 		}
 	}

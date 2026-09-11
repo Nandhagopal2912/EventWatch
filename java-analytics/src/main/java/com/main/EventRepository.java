@@ -7,7 +7,9 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 public class EventRepository {
     private final String databaseUrl;
@@ -79,6 +81,27 @@ public class EventRepository {
                 return results.getLong(1);
             }
         }
+    }
+
+    /**
+     * Most frequent error messages, newest counts first. Bounded so the terminal report
+     * cannot grow with the number of distinct messages in the database.
+     */
+    public Map<String, Long> topErrorMessages(int limit) throws SQLException {
+        String query = "SELECT message, COUNT(*) AS occurrences FROM telemetry_events "
+                + "WHERE level IN ('ERROR', 'CRITICAL') GROUP BY message "
+                + "ORDER BY occurrences DESC, message LIMIT ?";
+        Map<String, Long> counts = new LinkedHashMap<>();
+        try (Connection connection = DriverManager.getConnection(databaseUrl);
+                PreparedStatement statement = connection.prepareStatement(query)) {
+            statement.setInt(1, limit);
+            try (ResultSet results = statement.executeQuery()) {
+                while (results.next()) {
+                    counts.put(results.getString("message"), results.getLong("occurrences"));
+                }
+            }
+        }
+        return counts;
     }
 
     public AnalyticsEngine.LogEntry latest() throws SQLException {

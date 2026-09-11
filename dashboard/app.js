@@ -5,6 +5,21 @@ const notice = document.querySelector("#connection");
 const eventsBody = document.querySelector("#events-body");
 const alertsList = document.querySelector("#alerts-list");
 
+// Event and alert text is operator-supplied data: escape it before it reaches innerHTML.
+function escapeHtml(value) {
+  return String(value ?? "").replace(
+    /[&<>"']/g,
+    (character) =>
+      ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;",
+      })[character],
+  );
+}
+
 function headers() {
   return { "X-EventWatch-Key": keyInput.value };
 }
@@ -30,8 +45,9 @@ function renderEvents(events) {
     events.items
       .map(
         (event) => `
-    <tr><td><span class="badge">${event.level}</span></td><td title="${event.msg}">${event.msg}</td>
-    <td>${new Date(event.timestamp).toLocaleString()}</td><td>${Number(event.cpu_usage).toFixed(1)}%</td>
+    <tr><td><span class="badge">${escapeHtml(event.level)}</span></td>
+    <td title="${escapeHtml(event.msg)}">${escapeHtml(event.msg)}</td>
+    <td>${escapeHtml(new Date(event.timestamp).toLocaleString())}</td><td>${Number(event.cpu_usage).toFixed(1)}%</td>
     <td>${Number(event.ram_usage).toFixed(1)}%</td></tr>`,
       )
       .join("") ||
@@ -43,11 +59,37 @@ function renderAlerts(alerts) {
     alerts
       .map(
         (alert) => `
-    <div class="alert-card"><strong>${alert.alert_type} · ${alert.status}</strong>
-    <div>${alert.message}</div><div class="alert-meta">${alert.occurrence_count} occurrence(s) · last seen ${new Date(alert.last_seen).toLocaleString()}</div>
-    <div class="alert-actions"><button data-action="acknowledge" data-key="${alert.alert_key}" type="button">Acknowledge</button><button data-action="resolve" data-key="${alert.alert_key}" type="button">Resolve</button></div></div>`,
+    <div class="alert-card"><strong>${escapeHtml(alert.alert_type)} · ${escapeHtml(alert.status)}</strong>
+    <div>${escapeHtml(alert.message)}</div><div class="alert-meta">${Number(alert.occurrence_count)} occurrence(s) · last seen ${escapeHtml(new Date(alert.last_seen).toLocaleString())}</div>
+    <div class="alert-actions"><button data-action="acknowledge" data-key="${escapeHtml(alert.alert_key)}" type="button">Acknowledge</button><button data-action="resolve" data-key="${escapeHtml(alert.alert_key)}" type="button">Resolve</button><button data-action="notifications" data-key="${escapeHtml(alert.alert_key)}" type="button">History</button></div>
+    <div class="notification-history" data-history-for="${escapeHtml(alert.alert_key)}"></div></div>`,
       )
       .join("") || '<p class="empty">No active alerts.</p>';
+}
+
+async function showNotifications(alertKey) {
+  const panel = alertsList.querySelector(
+    `[data-history-for="${CSS.escape(alertKey)}"]`,
+  );
+  if (!panel) return;
+  if (panel.innerHTML) {
+    panel.innerHTML = "";
+    return;
+  }
+  const deliveries = await getJson(
+    `/alerts/${encodeURIComponent(alertKey)}/notifications?limit=10`,
+  );
+  panel.innerHTML = deliveries.length
+    ? `<ul>${deliveries
+        .map(
+          (delivery) =>
+            `<li>${escapeHtml(delivery.event_type)} · ${escapeHtml(delivery.delivery_status)}` +
+            `${delivery.http_status ? ` (HTTP ${Number(delivery.http_status)})` : ""}` +
+            ` · attempt ${Number(delivery.attempt_number)} · ${escapeHtml(new Date(delivery.attempted_at).toLocaleString())}` +
+            `${delivery.error_message ? `<br><span class="empty">${escapeHtml(delivery.error_message)}</span>` : ""}</li>`,
+        )
+        .join("")}</ul>`
+    : '<p class="empty">No delivery attempts recorded.</p>';
 }
 
 async function updateAlert(alertKey, action) {
@@ -90,7 +132,11 @@ document.querySelector("#refresh").addEventListener("click", refresh);
 alertsList.addEventListener("click", (event) => {
   const button = event.target.closest("button[data-action]");
   if (!button) return;
-  updateAlert(button.dataset.key, button.dataset.action).catch((error) => {
+  const handled =
+    button.dataset.action === "notifications"
+      ? showNotifications(button.dataset.key)
+      : updateAlert(button.dataset.key, button.dataset.action);
+  handled.catch((error) => {
     notice.textContent = error.message;
     notice.style.borderColor = "var(--coral)";
   });
