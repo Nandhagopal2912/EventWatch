@@ -1,0 +1,55 @@
+services:
+  analytics:
+    build:
+      context: ./java-analytics
+    environment:
+      EVENTWATCH_API_KEY: ${EVENTWATCH_API_KEY:?set EVENTWATCH_API_KEY in .env}
+      HTTP_PORT: 8080
+      DATABASE_PATH: /data/events.db
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      CPU_ALERT_THRESHOLD: ${CPU_ALERT_THRESHOLD:-85}
+      RAM_ALERT_THRESHOLD: ${RAM_ALERT_THRESHOLD:-80}
+      REPEATED_ERROR_THRESHOLD: ${REPEATED_ERROR_THRESHOLD:-5}
+      NOTIFICATIONS_ENABLED: ${NOTIFICATIONS_ENABLED:-false}
+      NOTIFICATION_WEBHOOK_URL: ${NOTIFICATION_WEBHOOK_URL:-}
+      NOTIFICATION_REMINDER_SECONDS: ${NOTIFICATION_REMINDER_SECONDS:-900}
+    volumes:
+      - analytics-data:/data
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+  collector:
+    build:
+      context: ./go-collector
+    environment:
+      EVENTWATCH_API_KEY: ${EVENTWATCH_API_KEY:?set EVENTWATCH_API_KEY in .env}
+      COLLECTOR_PORT: 8082
+      JAVA_BACKEND_URL: http://analytics:8080/receive
+      PENDING_EVENTS_DIR: /queue
+      QUEUE_CAPACITY: ${QUEUE_CAPACITY:-1000}
+      QUEUE_RETRY_SECONDS: ${QUEUE_RETRY_SECONDS:-5}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+    volumes:
+      - collector-queue:/queue
+    ports:
+      - "8082:8082"
+    depends_on:
+      analytics:
+        condition: service_healthy
+    restart: unless-stopped
+
+  dashboard:
+    # Port 3000 is not arbitrary: the analytics CORS policy only allows that origin.
+    image: nginx:1.27-alpine
+    volumes:
+      - ./dashboard:/usr/share/nginx/html:ro
+    ports:
+      - "3000:80"
+    depends_on:
+      - analytics
+    restart: unless-stopped
+
+volumes:
+  analytics-data:
+  collector-queue:

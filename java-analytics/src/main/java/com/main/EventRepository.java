@@ -5,6 +5,8 @@ import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Statement;
+import java.util.Locale;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -14,8 +16,62 @@ import java.util.Map;
 public class EventRepository {
     private final String databaseUrl;
 
+    private static final String UNIQUE_INDEX = "idx_telemetry_events_event_id";
+
     public EventRepository(String databaseUrl) {
         this.databaseUrl = databaseUrl;
+    }
+
+    /** Creates the schema on first startup so no manual database setup is required. */
+    public void initializeSchema() throws SQLException {
+        try (Connection connection = DriverManager.getConnection(databaseUrl);
+                Statement statement = connection.createStatement()) {
+            statement.executeUpdate("""
+                    CREATE TABLE IF NOT EXISTS telemetry_events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        event_id TEXT,
+                        level TEXT NOT NULL,
+                        message TEXT NOT NULL,
+                        event_timestamp TEXT NOT NULL,
+                        cpu_usage REAL NOT NULL,
+                        ram_usage REAL NOT NULL,
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """);
+            try {
+                statement.executeUpdate("ALTER TABLE telemetry_events ADD COLUMN event_id TEXT");
+            } catch (SQLException exception) {
+                if (!exception.getMessage().toLowerCase(Locale.ROOT).contains("duplicate column")) {
+                    throw exception;
+                }
+            }
+            statement.executeUpdate("CREATE UNIQUE INDEX IF NOT EXISTS " + UNIQUE_INDEX
+                    + " ON telemetry_events(event_id) WHERE event_id IS NOT NULL");
+            statement.executeUpdate("CREATE INDEX IF NOT EXISTS idx_telemetry_events_level "
+                    + "ON telemetry_events(level, event_timestamp)");
+        }
+    }
+
+    /**
+     * Commits one event and reports whether it was new. The unique event_id index makes a
+     * repeated delivery a no-op instead of a duplicate row.
+     */
+    public synchronized boolean insertIfAbsent(AnalyticsEngine.LogEntry event) throws SQLException {
+        String query = "INSERT OR IGNORE INTO telemetry_events "
+                + "(event_id, level, message, event_timestamp, cpu_usage, ram_usage) VALUES (?, ?, ?, ?, ?, ?)";
+        try (Connection connection = DriverManager.getConnection(databaseUrl);
+                PreparedStatement statement = connection.prepareStatement(query)) {
+            connection.setAutoCommit(false);
+            statement.setString(1, event.eventId);
+            statement.setString(2, event.level);
+            statement.setString(3, event.message);
+            statement.setString(4, event.timestamp.toString());
+            statement.setDouble(5, event.cpuUsage);
+            statement.setDouble(6, event.ramUsage);
+            int inserted = statement.executeUpdate();
+            connection.commit();
+            return inserted > 0;
+        }
     }
 
     public List<AnalyticsEngine.LogEntry> find(String level, Instant from, Instant to,

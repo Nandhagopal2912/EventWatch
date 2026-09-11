@@ -128,7 +128,7 @@ func singleCounter(builder *strings.Builder, name, help string, value uint64) {
 }
 
 func escapeLabelValue(value string) string {
-	replacer := strings.NewReplacer(`\`, `\`, `"`, `\"`, "\n", `\n`)
+	replacer := strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`)
 	return replacer.Replace(value)
 }
 

@@ -46,7 +46,11 @@ cd go-collector && go vet ./... && go test ./...
 ```
 
 ```bash
-cd java-analytics && mvn -q compile
+cd java-analytics && mvn verify
+```
+
+```bash
+docker compose up --build
 ```
 
 Notes:
@@ -73,6 +77,9 @@ go-collector/main.go            Handlers, forwardToJava retries, durable file qu
 go-collector/logging.go         Structured JSON log lines, LOG_FORMAT switch
 go-collector/metrics.go         Prometheus counters, queue-depth gauge, /metrics handler
 go-collector/main_test.go       Event-ID uniqueness + queue capacity
+go-collector/collector_test.go  Retries, capture handler, queue outcomes, metrics
+go-collector/contract_test.go   Shared JSON contract, against testdata/
+go-collector/Dockerfile         Static binary on alpine, queue on a volume
 
 java-analytics/src/main/java/com/main/
   AnalyticsEngine.java          main(), HTTP routing, auth, validation, rate limit, SQLite bootstrap
@@ -87,6 +94,21 @@ java-analytics/src/main/java/com/main/
   AlertTransition.java          OPENED/REOPENED/ACKNOWLEDGED/RESOLVED/OCCURRENCE
   StructuredLogger.java         One JSON object per log line; LOG_FORMAT=text for humans
   Metrics.java                  Prometheus counters, gauges, and text rendering
+  EngineConfiguration.java      Every runtime setting; fromDotenv() and forTesting()
+
+java-analytics/src/test/java/com/main/
+  AnalyticsEngineIntegrationTest.java   Real server on an ephemeral port, temp database
+  RepositoryTest.java           Persistence, dedup, alert lifecycle
+  AlertEngineTest.java          Threshold, window, and repeated-error rules
+  NotificationServiceTest.java  Delivery, cooldown, and retry against a local sink
+  EventValidationTest.java      Validation and query-parameter parsing
+  ObservabilityTest.java        Log shape and metric rendering
+  ContractTest.java             Shared JSON contract, against testdata/
+java-analytics/Dockerfile       Shaded jar on a JRE, database on a volume
+
+testdata/event-contract.json    One canonical event, read by both test suites
+docker-compose.yml              Collector, analytics, dashboard
+.github/workflows/ci.yml        Go job, Java job, image build job
 
 dashboard/{index.html,app.js,styles.css}
 ```
@@ -145,6 +167,13 @@ Changes to this schema must stay backward compatible — additive fields only, n
   (Java) or `logInfo/logWarn/logError` (Go). Reserved field names are `timestamp`, `level`,
   `service`, and `message`; an event's own level goes in `event_level`. Pass a `correlation_id`
   field wherever one is in scope.
+- **Tests:** every behaviour change needs a test. Java tests live in `com.main` so they can reach
+  package-private helpers; use `@TempDir` with `TestSupport.databaseUrl` rather than a shared file.
+  Go tests use `withCollector` to swap the package globals and restore them on cleanup. A change to
+  the Go/Java JSON contract must update `testdata/event-contract.json`, which both suites assert on.
+- **Configuration over constants:** ports, database path, and the shutdown grace are all in
+  `EngineConfiguration`. Anything a container or a test needs to vary belongs there, not in a
+  `static final`.
 - **Metrics:** add counters to `Metrics.java` / `metrics.go` rather than inventing ad-hoc counters.
   Label values must come from a fixed, bounded set — never a message, an event id, or a raw path.
 - **Secrets:** `.env` is gitignored and must stay that way. Never commit a real key; never print the
@@ -156,21 +185,30 @@ Changes to this schema must stay backward compatible — additive fields only, n
 
 ## 5. Current state — read before starting work
 
-**Phases 1–9 are complete.** Both services build and the test suite passes:
-`mvn -o compile` → BUILD SUCCESS; `go vet ./...` and `go test ./...` → clean.
+**Phases 1–10 are complete.** Everything is green:
 
-Phase 9 added structured JSON logging to both services, an end-to-end correlation ID, and
-hand-rolled Prometheus metrics on `GET /metrics` for each service — no new dependencies on either
-side. Verified end to end: a caller-supplied `X-Correlation-ID` appeared in the collector's capture
-log, the analytics store log, the response header, and the response body; duplicate delivery of a
-known `event_id` incremented `eventwatch_events_duplicate_total` rather than
-`..._received_total`; both `LOG_FORMAT` modes were exercised.
+- `cd java-analytics && mvn verify` → 90 tests, BUILD SUCCESS
+- `cd go-collector && go vet ./... && go test ./...` → pass
+- `docker compose up --build` → all three services healthy
 
-OpenTelemetry tracing is the one Phase 9 item **not** done — see section 9 for why it is a separate
-decision rather than an oversight.
+Phase 10 added the test suites that did not exist before (the project had no Java tests at all), plus
+Dockerfiles, Compose, and a CI pipeline. Verified in containers, not just asserted: the stack starts,
+an event flows collector → analytics → SQLite on a volume, and with the analytics container stopped
+three captures returned `503` and queued, then drained to zero and stored all of them once the
+container came back.
 
-B1–B8 in section 8 are all fixed. What remains unowned is Phase 10 onward plus the cross-cutting
-items in section 9.
+To make that possible the engine gained a real seam: `EngineConfiguration` holds every runtime
+setting, `AnalyticsEngine.start(configuration)` returns the running server, and
+`AnalyticsEngine.stop(server)` shuts it down — `main()` is now wiring only. Schema creation and the
+idempotent insert moved from `AnalyticsEngine` into `EventRepository`, where they can be tested
+directly.
+
+**Known wart:** `AnalyticsEngine` still keeps its collaborators in static fields, so only one engine
+can run per JVM and tests must run sequentially. `start()` resets the window, counter, and rate-limit
+map to compensate. Worth fixing when the routing extraction in section 9 happens.
+
+B1–B9 in section 9 are all fixed. What remains unowned is Phase 11 and the cross-cutting items in
+section 10.
 
 ## 6. Phase 8 as built — notifications
 
@@ -220,7 +258,43 @@ and per-alert routing rules.
   send custom headers. They expose counts, not content — but restrict them at the network layer
   before either service leaves localhost.
 
-## 8. Fixed defects and remaining quality work
+## 8. Phase 10 as built — tests and delivery
+
+**Layout.** Java tests sit in `com.main` so they can exercise package-private helpers
+(`validateEvent`, `boundedInteger`, `queryParameters`) without a public API just for testing.
+Every test that touches SQLite takes a `@TempDir` database through `TestSupport.databaseUrl`, which
+also converts Windows separators — SQLite needs forward slashes.
+
+**The integration test** starts the real `HttpServer` on port 0 and drives it with `HttpClient`
+over loopback. It covers auth, content type, size, malformed JSON, validation, rate limiting,
+the query API and its filter validation, the full alert lifecycle, notification history, metrics,
+and restart recovery against the same database file.
+
+**Speed matters.** The suite first took 158 seconds because `stop()` blocked for a flat five
+seconds per test. The shutdown grace is now `SHUTDOWN_GRACE_SECONDS` (5 in production,
+0 in `forTesting`), and the class runs in under five seconds. If a suite suddenly slows down, look
+for a fixed wait before assuming the work itself got slower.
+
+**The shared contract.** `testdata/event-contract.json` holds one canonical event. The Go suite
+asserts its marshalled payload has exactly those keys and values; the Java suite asserts the same
+file passes `validateEvent`, that removing any required field fails, and that the optional
+`correlation_id` may be absent. Change the contract and whichever side was not updated fails.
+
+**Containers.** Both Dockerfiles are multi-stage, run as a non-root user, pin their base image, and
+declare a health check. The analytics image is a shaded jar on a JRE; the collector is a static
+`CGO_ENABLED=0` binary on alpine. Each keeps its durable state on a volume — the database and the
+pending queue — because losing either on a restart defeats the reliability work of Phase 5.
+
+**A build gotcha worth remembering:** buildx caches tag resolution independently of `docker pull`,
+so `golang:1.27-alpine` kept resolving to a stale 1.25 image and failed the `go >= 1.27` check in
+`go.mod`. Base images are now pinned to a patch version.
+
+**CI** runs three jobs: Go (gofmt check, vet, `-race` tests, govulncheck), Java (`mvn verify`, with
+surefire reports uploaded on failure), and images (build both, validate the compose file). Images
+are built but never pushed — publishing is a deployment decision. Dependabot covers Go modules,
+Maven, both Dockerfiles, and the actions themselves.
+
+## 9. Fixed defects and remaining quality work
 
 ### Fixed (keep these fixed — each has a way to regress)
 
@@ -259,13 +333,20 @@ Verified: the same burst leaves exactly 400 files in `pending-events/` and the w
 Note what this means for `/stress`: a 500-event burst legitimately exceeds the rate limit and most of
 it arrives over the following minutes through the queue. That is the system working, not a failure.
 
+**B9 — Go metric labels did not escape backslashes.** Found by the new
+`TestMetricsEscapeLabelValues`: a heredoc had collapsed the replacement pair so
+`strings.NewReplacer` mapped a backslash to itself. A label value containing one would have emitted
+malformed Prometheus output. The Java side was already correct.
+
 ### Remaining quality work
 
 - **Connection handling.** Every repository call opens a fresh `DriverManager.getConnection`. A
   shared connection or small pool with `PRAGMA journal_mode=WAL` and `busy_timeout` would cut
   per-query overhead and lock contention under load.
-- **Routing.** `main()` is 300+ lines of inline lambdas. Extract handlers into their own classes and
-  keep `main()` to wiring.
+- **Routing and static state.** `start()` is still a long run of inline lambdas, and the engine's
+  collaborators live in static fields, so only one instance can run per JVM. Extracting handlers
+  into their own classes with an injected context would fix both and let the integration tests run
+  in parallel.
 - **Retention.** Nothing deletes from `telemetry_events` or `notification_deliveries`. Add a
   configurable retention window and a periodic prune.
 - **Timestamps.** Go now sends UTC `Z` values so lexical order matches chronological order, but rows
@@ -277,7 +358,7 @@ it arrives over the following minutes through the queue. That is the system work
   in memory alongside the SQL `lastDeliveredAt` lookup; a restart falls back to the SQL value, which
   is correct but means an in-flight reservation is lost. Fine for one instance, wrong for two.
 
-## 9. Roadmap — Phase 10 onward
+## 10. Roadmap — Phase 11 onward
 
 **Phase 9 — Observability.** Done except tracing (see section 7).
 
@@ -290,19 +371,10 @@ lines belong to this event?" — across the Go→Java hop. Recommendation: add i
 `traceparent` header at that point rather than inventing a second ID. If it is wanted sooner, the
 cheapest honest version is span timings emitted as structured log fields, with no SDK at all.
 
-**Phase 10 — Testing and delivery.** This is now the largest real gap: Java has **no tests and no test
-dependency in `pom.xml`**. Add JUnit 5 + `maven-surefire`, then cover — event validation (every
-rejection branch), moving averages, alert threshold and dedup logic, `AlertRepository` lifecycle
-against a temp SQLite file, and idempotent re-delivery of a duplicate `event_id`. Extend the Go
-tests to cover `forwardToJava` retry/backoff classification and `processPendingEvents` file
-outcomes with an `httptest` server, plus correlation-id propagation and the `/metrics` rendering on
-both sides. Add a `NotificationService` test with a
-local HTTP sink covering the cooldown, the 4xx stop, and the retry ladder — the behaviour verified by
-hand during Phase 8 should not stay hand-verified. Then an integration test that runs both services
-end to end, kills Java mid-flight, and asserts the queue drains without loss or duplication. Finally
-Dockerfiles, Compose, and a CI workflow running `go vet`/`go test`/`mvn verify` plus dependency
-scanning. Note that the Java service currently hardcodes port 8080 and a relative
-`jdbc:sqlite:events.db` — both need to become config before containerizing.
+**Phase 10 — Testing and delivery.** Done (see section 8). One gap remains from the original
+plan: there is no test that runs *both* services as processes and kills one mid-flight. Each side is
+covered against a stand-in for the other, and the compose stack was exercised by hand — a scripted
+version of that outage run would close it.
 
 **Phase 11 — Scale beyond SQLite.** Only when measurements justify it. Order: extract a storage
 interface behind the repositories → PostgreSQL or a time-series store for multi-collector or
@@ -316,7 +388,7 @@ instead of three global thresholds, and CORS origins moved to `.env`.
 
 ---
 
-## 10. Definition of done for a release
+## 11. Definition of done for a release
 
 - Events are authenticated, validated, persisted transactionally, deduplicated, and queryable.
 - A temporary Java outage loses nothing and duplicates nothing.

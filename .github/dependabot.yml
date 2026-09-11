@@ -1,0 +1,26 @@
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /go-collector
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: maven
+    directory: /java-analytics
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: docker
+    directory: /go-collector
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: docker
+    directory: /java-analytics
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

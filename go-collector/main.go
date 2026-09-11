@@ -280,6 +280,7 @@ func main() {
 		fmt.Printf("Unable to create pending event directory: %v\n", err)
 		return
 	}
+	collectorPort := getEnv("COLLECTOR_PORT", "8082")
 	go retryPendingEvents()
 
 	http.HandleFunc("/capture", logHandler)
@@ -289,13 +290,13 @@ func main() {
 	http.HandleFunc("/stress", stressHandler)
 
 	logInfo("collector started", logFields{
-		"address":        ":8082",
+		"address":        ":" + collectorPort,
 		"backend_url":    configuredBackendURL,
 		"queue_capacity": queueCapacity,
 		"queue_depth":    queueDepth(),
 	})
 
-	server := &http.Server{Addr: ":8082"}
+	server := &http.Server{Addr: ":" + collectorPort}
 	serverError := make(chan error, 1)
 	go func() {
 		serverError <- server.ListenAndServe()

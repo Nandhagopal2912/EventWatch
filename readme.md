@@ -2,7 +2,7 @@
 
 EventWatch is a two-service host telemetry and event-monitoring pipeline. A Go collector captures application events together with CPU and RAM usage, then forwards them to a Java analytics engine for processing, persistence, and reporting.
 
-The current implementation completes Phases 1–9. Future improvements are documented in `CLAUDE.md`.
+The current implementation completes Phases 1–10. Future improvements are documented in `CLAUDE.md`.
 
 ## Project Phase Status
 
@@ -17,7 +17,7 @@ The current implementation completes Phases 1–9. Future improvements are docum
 | **Phase 7**  | **✅ Completed** | Query API and dashboard          | Bounded event queries, summaries, alert lookup/filtering, a separate local dashboard, and operator alert workflows.                                                                                        |
 | **Phase 8**  | **✅ Completed** | Notifications                    | Webhook delivery on alert state changes, cooldown reminders, bounded retries, and a durable delivery-attempt audit trail.                                                  |
 | **Phase 9**  | **✅ Completed** | Observability                    | Structured JSON logs in both services, correlation IDs carried end to end, and Prometheus metrics for both services.                                          |
-| **Phase 10** | 🗓️ Planned       | Testing and delivery             | Unit, integration, load, and failure tests plus Docker and CI/CD automation.                                                                                                                               |
+| **Phase 10** | **✅ Completed** | Testing and delivery             | Unit, integration, failure and contract tests on both services, plus Dockerfiles, Docker Compose, and a CI pipeline.                                |
 | **Phase 11** | 🗓️ Planned       | Scaling beyond SQLite            | PostgreSQL or time-series storage, durable messaging, and independently scalable services when required.                                                                                                   |
 
 **Current state:** EventWatch is a working local telemetry and event-monitoring system. Go collects and forwards events, Java analyzes and persists them, alert state changes are delivered to a configured webhook, and the browser dashboard reports events, alerts, and delivery history.
@@ -27,11 +27,13 @@ The current implementation completes Phases 1–9. Future improvements are docum
 ```text
 go-collector/                   Go HTTP ingress
 	main.go
+	Dockerfile
 	logging.go                     Structured JSON log lines
 	metrics.go                     Prometheus counters and /metrics
 	go.mod
 java-analytics/                 Maven Java analytics service
 	pom.xml
+	Dockerfile
 	.mvn/jvm.config                Automatic Maven JVM memory settings
 	src/main/java/com/main/
 		AnalyticsEngine.java
@@ -51,6 +53,9 @@ dashboard/                      Local browser dashboard
 	index.html
 	app.js
 	styles.css
+testdata/                       Cross-language JSON contract fixture
+.github/workflows/ci.yml        Build, test, scan, and image pipeline
+docker-compose.yml              Collector, analytics, and dashboard together
 ```
 
 ## Architecture
@@ -66,6 +71,7 @@ dashboard/                      Local browser dashboard
 - **Phase 9 observability:** both services emit one JSON object per log line, expose `GET /metrics` in Prometheus text format, and carry an `X-Correlation-ID` from the collector through to the analytics response.
 - **Phase 8 notifications:** alert state changes (opened, reopened, acknowledged, resolved) are POSTed as versioned JSON to `NOTIFICATION_WEBHOOK_URL`. Repeat occurrences are suppressed until `NOTIFICATION_REMINDER_SECONDS` passes. Every attempt is recorded and readable at `GET /alerts/{alert_key}/notifications`.
 - **Dashboard:** `dashboard/index.html` displays summaries, recent events, active alerts, and per-alert delivery history. It reads the API key in the browser, escapes all event text before rendering it, and never accesses SQLite directly.
+- **Configuration:** `HTTP_PORT`, `COLLECTOR_PORT`, and `DATABASE_PATH` set the listening ports and database location, so neither service needs a source change to be deployed or containerized.
 - **SQLite database** (`java-analytics/events.db`): stores telemetry in the `telemetry_events` table. The database is created automatically when the Java service starts.
 
 ## End-to-End Flow
@@ -148,11 +154,45 @@ duplicated and rejected by reason, database failures, notification outcomes, HTT
 and status, active alerts, stored rows, and processing latency. Both `/metrics` endpoints are open
 like `/health`; restrict them at the network layer before exposing either service beyond localhost.
 
+## Tests
+
+Both suites run offline and need no services started.
+
+```powershell
+cd java-analytics; mvn verify
+```
+
+```powershell
+cd go-collector; go vet ./...; go test ./...
+```
+
+The Java suite covers event validation, query-parameter parsing, SQLite persistence and
+deduplication, the alert rules and lifecycle, webhook delivery against a local sink, the metric and
+log formats, and an end-to-end pass that drives the real HTTP server on an ephemeral port with a
+temporary database — including restart recovery. The Go suite covers retry classification, the
+capture handler, durable-queue outcomes, correlation IDs, metric rendering, and host sampling,
+using an `httptest` stand-in for the analytics service.
+
+`testdata/event-contract.json` is read by both suites, so a change to the shared JSON contract fails
+on whichever side was not updated.
+
+## Docker
+
+```powershell
+docker compose up --build
+```
+
+Compose starts the analytics service on `8080`, the collector on `8082`, and the dashboard on
+`3000`, and reads the same root `.env` file. Telemetry and the pending queue live on named volumes,
+so a container restart keeps both history and undelivered events. The collector waits for the
+analytics health check before starting.
+
 ## Requirements
 
 - Go 1.27 or newer
 - Java 17 or newer
 - Apache Maven
+- Docker with Compose, only for the container workflow
 - Internet access on the first Maven/Go dependency download
 
 The repository root contains a local `.env` file with the shared API key, service settings, alert thresholds, queue settings, and documented Maven memory settings. It is ignored by Git. Copy `.env.example` to `.env` and change the values when setting up a new checkout.

@@ -32,8 +32,6 @@ public class AnalyticsEngine {
     private static final int MAX_REQUESTS_PER_MINUTE = 100;
     private static final int WORKER_THREADS = 8;
     private static final int WORK_QUEUE_CAPACITY = 500;
-    private static final String DATABASE_URL = "jdbc:sqlite:events.db";
-    private static final String DATABASE_UNIQUE_INDEX = "idx_telemetry_events_event_id";
     private static final int TOP_ERROR_MESSAGES = 5;
     private static final int NOTIFICATION_HISTORY_LIMIT = 50;
     private static final long RATE_WINDOW_SWEEP_SECONDS = 60;
@@ -43,6 +41,10 @@ public class AnalyticsEngine {
     private static final ThreadLocal<String> CORRELATION_ID = new ThreadLocal<>();
     private static String apiKey;
     private static boolean textLogging;
+    private static String databaseUrl;
+    private static int shutdownGraceSeconds = 5;
+    private static ThreadPoolExecutor runningExecutor;
+    private static ScheduledExecutorService runningMaintenance;
     private static AlertRepository alertRepository;
     private static AlertEngine alertEngine;
     private static QueryService queryService;
@@ -101,37 +103,56 @@ public class AnalyticsEngine {
                 .directory("..")
                 .ignoreIfMissing()
                 .load();
-        String logFormat = getConfig(dotenv, "LOG_FORMAT", "json");
-        textLogging = "text".equalsIgnoreCase(logFormat);
-        StructuredLogger.configure(OBJECT_MAPPER, logFormat);
-        apiKey = dotenv.get("EVENTWATCH_API_KEY", System.getenv("EVENTWATCH_API_KEY"));
+        EngineConfiguration configuration = EngineConfiguration.fromDotenv(dotenv);
+        HttpServer server = start(configuration);
+
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            StructuredLogger.info("shutting down analytics engine", StructuredLogger.fields());
+            stop(server);
+        }));
+    }
+
+    /**
+     * Starts the HTTP server and every collaborator it needs. Returns the running server so
+     * {@code main} can register a shutdown hook and tests can stop it deterministically.
+     */
+    public static HttpServer start(EngineConfiguration configuration) throws IOException {
+        textLogging = "text".equalsIgnoreCase(configuration.logFormat());
+        StructuredLogger.configure(OBJECT_MAPPER, configuration.logFormat());
+        apiKey = configuration.apiKey();
+        databaseUrl = configuration.databaseUrl();
+        shutdownGraceSeconds = configuration.shutdownGraceSeconds();
         if (apiKey == null || apiKey.isBlank()) {
             throw new IOException("EVENTWATCH_API_KEY is required");
         }
 
+        recentEvents.clear();
+        storedEventCount.set(0);
+        rateWindows.clear();
+
         try {
-            initializeDatabase();
-            eventRepository = new EventRepository(DATABASE_URL);
+            eventRepository = new EventRepository(configuration.databaseUrl());
+            eventRepository.initializeSchema();
             loadRecentEvents();
-            alertRepository = new AlertRepository(DATABASE_URL);
-            notificationRepository = new NotificationRepository(DATABASE_URL);
+            alertRepository = new AlertRepository(configuration.databaseUrl());
+            notificationRepository = new NotificationRepository(configuration.databaseUrl());
             notificationService = new NotificationService(
                     notificationRepository,
                     OBJECT_MAPPER,
                     METRICS,
-                    Boolean.parseBoolean(getConfig(dotenv, "NOTIFICATIONS_ENABLED", "false")),
-                    getConfig(dotenv, "NOTIFICATION_WEBHOOK_URL", ""),
-                    getIntConfig(dotenv, "NOTIFICATION_TIMEOUT_SECONDS", 5),
-                    getIntConfig(dotenv, "NOTIFICATION_MAX_ATTEMPTS", 3),
-                    getIntConfig(dotenv, "NOTIFICATION_RETRY_DELAY_MILLIS", 1000),
-                    getIntConfig(dotenv, "NOTIFICATION_REMINDER_SECONDS", 900));
+                    configuration.notificationsEnabled(),
+                    configuration.notificationWebhookUrl(),
+                    configuration.notificationTimeoutSeconds(),
+                    configuration.notificationMaxAttempts(),
+                    configuration.notificationRetryDelayMillis(),
+                    configuration.notificationReminderSeconds());
             alertEngine = new AlertEngine(
                     alertRepository,
                     notificationService,
                     MOVING_AVERAGE_WINDOW,
-                    getDoubleConfig(dotenv, "CPU_ALERT_THRESHOLD", 85.0),
-                    getDoubleConfig(dotenv, "RAM_ALERT_THRESHOLD", 80.0),
-                    getIntConfig(dotenv, "REPEATED_ERROR_THRESHOLD", 5));
+                    configuration.cpuThreshold(),
+                    configuration.ramThreshold(),
+                    configuration.repeatedErrorThreshold());
             queryService = new QueryService(
                     eventRepository, alertRepository, OBJECT_MAPPER, MOVING_AVERAGE_WINDOW);
         } catch (SQLException exception) {
@@ -139,7 +160,7 @@ public class AnalyticsEngine {
         }
         StructuredLogger.info("loaded stored events",
                 StructuredLogger.fields("stored_events", storedEventCount.get()));
-        HttpServer server = HttpServer.create(new InetSocketAddress(8080), 0);
+        HttpServer server = HttpServer.create(new InetSocketAddress(configuration.port()), 0);
 
         server.createContext("/receive", new HttpHandler() {
             @Override
@@ -259,7 +280,7 @@ public class AnalyticsEngine {
                 sendResponse(exchange, 405, "Method not allowed");
                 return;
             }
-            try (Connection ignored = DriverManager.getConnection(DATABASE_URL)) {
+            try (Connection ignored = DriverManager.getConnection(databaseUrl)) {
                 sendJsonResponse(exchange, 200,
                         "{\"status\":\"ok\",\"service\":\"java-analytics\","
                                 + "\"message\":\"service is healthy\"}");
@@ -471,31 +492,41 @@ public class AnalyticsEngine {
                 () -> rateWindows.values().removeIf(window -> window.isExpired(System.currentTimeMillis())),
                 RATE_WINDOW_SWEEP_SECONDS, RATE_WINDOW_SWEEP_SECONDS, TimeUnit.SECONDS);
 
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            StructuredLogger.info("shutting down analytics engine", StructuredLogger.fields());
-            server.stop(5);
-            maintenance.shutdownNow();
-            notificationService.shutdown();
-            requestExecutor.shutdown();
-            try {
-                if (!requestExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
-                    requestExecutor.shutdownNow();
-                }
-            } catch (InterruptedException exception) {
-                requestExecutor.shutdownNow();
-                Thread.currentThread().interrupt();
-            }
-        }));
-
-        StructuredLogger.info("analytics engine started", StructuredLogger.fields(
-                "port", 8080,
-                "worker_threads", WORKER_THREADS,
-                "queue_capacity", WORK_QUEUE_CAPACITY));
+        runningExecutor = requestExecutor;
+        runningMaintenance = maintenance;
 
         server.start();
+        StructuredLogger.info("analytics engine started", StructuredLogger.fields(
+                "port", server.getAddress().getPort(),
+                "worker_threads", WORKER_THREADS,
+                "queue_capacity", WORK_QUEUE_CAPACITY));
+        return server;
     }
 
-    private static Instant parseTimestamp(String value) {
+    /** Stops new work, drains the request executor, and releases background threads. */
+    public static void stop(HttpServer server) {
+        server.stop(shutdownGraceSeconds);
+        if (runningMaintenance != null) {
+            runningMaintenance.shutdownNow();
+        }
+        if (notificationService != null) {
+            notificationService.shutdown();
+        }
+        if (runningExecutor == null) {
+            return;
+        }
+        runningExecutor.shutdown();
+        try {
+            if (!runningExecutor.awaitTermination(shutdownGraceSeconds, TimeUnit.SECONDS)) {
+                runningExecutor.shutdownNow();
+            }
+        } catch (InterruptedException exception) {
+            runningExecutor.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    static Instant parseTimestamp(String value) {
         try {
             return value == null ? Instant.now() : Instant.parse(value);
         } catch (RuntimeException exception) {
@@ -503,7 +534,7 @@ public class AnalyticsEngine {
         }
     }
 
-    private static String validateEvent(JsonNode json) {
+    static String validateEvent(JsonNode json) {
         Set<String> allowedLevels = Set.of("INFO", "WARN", "ERROR", "CRITICAL");
         if (!json.hasNonNull("event_id") || !json.path("event_id").isTextual()
                 || json.path("event_id").asText().isBlank() || json.path("event_id").asText().length() > 128) {
@@ -534,7 +565,7 @@ public class AnalyticsEngine {
         return null;
     }
 
-    private static boolean isValidPercentage(JsonNode json, String fieldName) {
+    static boolean isValidPercentage(JsonNode json, String fieldName) {
         if (!json.hasNonNull(fieldName) || !json.path(fieldName).isNumber()) {
             return false;
         }
@@ -582,36 +613,6 @@ public class AnalyticsEngine {
 
     }
 
-    private static void initializeDatabase() throws SQLException {
-        // Create the schema on first startup so no manual database setup is required.
-        try (Connection connection = DriverManager.getConnection(DATABASE_URL);
-                Statement statement = connection.createStatement()) {
-            statement.executeUpdate("""
-                    CREATE TABLE IF NOT EXISTS telemetry_events (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        event_id TEXT,
-                        level TEXT NOT NULL,
-                        message TEXT NOT NULL,
-                        event_timestamp TEXT NOT NULL,
-                        cpu_usage REAL NOT NULL,
-                        ram_usage REAL NOT NULL,
-                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-                    )
-                    """);
-            try {
-                statement.executeUpdate("ALTER TABLE telemetry_events ADD COLUMN event_id TEXT");
-            } catch (SQLException exception) {
-                if (!exception.getMessage().toLowerCase(Locale.ROOT).contains("duplicate column")) {
-                    throw exception;
-                }
-            }
-            statement.executeUpdate("CREATE UNIQUE INDEX IF NOT EXISTS " + DATABASE_UNIQUE_INDEX
-                    + " ON telemetry_events(event_id) WHERE event_id IS NOT NULL");
-            statement.executeUpdate("CREATE INDEX IF NOT EXISTS idx_telemetry_events_level "
-                    + "ON telemetry_events(level, event_timestamp)");
-        }
-    }
-
     private static synchronized void loadRecentEvents() throws SQLException {
         // Restore only the analytics window; SQLite remains the source of truth for history.
         storedEventCount.set(eventRepository.count(null, null, null));
@@ -628,28 +629,15 @@ public class AnalyticsEngine {
     private static synchronized boolean storeEvent(LogEntry event) throws SQLException {
         // Commit to SQLite before adding the event to memory, preventing acknowledged
         // data loss.
-        String query = "INSERT OR IGNORE INTO telemetry_events "
-                + "(event_id, level, message, event_timestamp, cpu_usage, ram_usage) VALUES (?, ?, ?, ?, ?, ?)";
-        try (Connection connection = DriverManager.getConnection(DATABASE_URL);
-                PreparedStatement statement = connection.prepareStatement(query)) {
-            connection.setAutoCommit(false);
-            statement.setString(1, event.eventId);
-            statement.setString(2, event.level);
-            statement.setString(3, event.message);
-            statement.setString(4, event.timestamp.toString());
-            statement.setDouble(5, event.cpuUsage);
-            statement.setDouble(6, event.ramUsage);
-            int inserted = statement.executeUpdate();
-            connection.commit();
-            if (inserted > 0) {
-                storedEventCount.incrementAndGet();
-                recentEvents.addLast(event);
-                while (recentEvents.size() > MOVING_AVERAGE_WINDOW) {
-                    recentEvents.removeFirst();
-                }
+        boolean inserted = eventRepository.insertIfAbsent(event);
+        if (inserted) {
+            storedEventCount.incrementAndGet();
+            recentEvents.addLast(event);
+            while (recentEvents.size() > MOVING_AVERAGE_WINDOW) {
+                recentEvents.removeFirst();
             }
-            return inserted > 0;
         }
+        return inserted;
     }
 
     private static void sendResponse(HttpExchange exchange, int status, String response) throws IOException {
@@ -714,7 +702,7 @@ public class AnalyticsEngine {
                 receivedKey.getBytes(StandardCharsets.UTF_8));
     }
 
-    private static Map<String, String> queryParameters(String rawQuery) {
+    static Map<String, String> queryParameters(String rawQuery) {
         Map<String, String> parameters = new HashMap<>();
         if (rawQuery == null || rawQuery.isBlank()) {
             return parameters;
@@ -728,11 +716,11 @@ public class AnalyticsEngine {
         return parameters;
     }
 
-    private static String optionalUpper(String value) {
+    static String optionalUpper(String value) {
         return value == null || value.isBlank() ? null : value.toUpperCase(Locale.ROOT);
     }
 
-    private static Instant optionalInstant(String value) {
+    static Instant optionalInstant(String value) {
         if (value == null || value.isBlank()) {
             return null;
         }
@@ -743,7 +731,7 @@ public class AnalyticsEngine {
         }
     }
 
-    private static int boundedInteger(String value, int fallback, int maximum) {
+    static int boundedInteger(String value, int fallback, int maximum) {
         if (value == null || value.isBlank()) {
             return fallback;
         }
@@ -755,26 +743,6 @@ public class AnalyticsEngine {
             return parsed;
         } catch (NumberFormatException exception) {
             throw new IllegalArgumentException("query limit and offset must be numbers");
-        }
-    }
-
-    private static String getConfig(Dotenv dotenv, String name, String fallback) {
-        return dotenv.get(name, System.getenv().getOrDefault(name, fallback));
-    }
-
-    private static double getDoubleConfig(Dotenv dotenv, String name, double fallback) {
-        try {
-            return Double.parseDouble(getConfig(dotenv, name, Double.toString(fallback)));
-        } catch (NumberFormatException exception) {
-            return fallback;
-        }
-    }
-
-    private static int getIntConfig(Dotenv dotenv, String name, int fallback) {
-        try {
-            return Integer.parseInt(getConfig(dotenv, name, Integer.toString(fallback)));
-        } catch (NumberFormatException exception) {
-            return fallback;
         }
     }
 
