@@ -26,10 +26,10 @@ func TestEnqueueEventHonorsCapacity(t *testing.T) {
 	queueCapacity = 1
 	payload := []byte(`{"event_id":"test-event","level":"INFO"}`)
 
-	if err := enqueueEvent(payload); err != nil {
+	if err := enqueueEvent(payload, "test-correlation"); err != nil {
 		t.Fatalf("first enqueue failed: %v", err)
 	}
-	if err := enqueueEvent(payload); err == nil {
+	if err := enqueueEvent(payload, "test-correlation"); err == nil {
 		t.Fatal("expected second enqueue to respect queue capacity")
 	}
 

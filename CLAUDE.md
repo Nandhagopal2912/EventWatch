@@ -69,7 +69,9 @@ curl.exe "http://localhost:8082/capture?level=ERROR&msg=Database%20transaction%2
 ## 3. Code map
 
 ```text
-go-collector/main.go            Single file: handlers, forwardToJava retries, durable file queue
+go-collector/main.go            Handlers, forwardToJava retries, durable file queue
+go-collector/logging.go         Structured JSON log lines, LOG_FORMAT switch
+go-collector/metrics.go         Prometheus counters, queue-depth gauge, /metrics handler
 go-collector/main_test.go       Event-ID uniqueness + queue capacity
 
 java-analytics/src/main/java/com/main/
@@ -83,6 +85,8 @@ java-analytics/src/main/java/com/main/
   NotificationRepository.java   notification_deliveries table + audit trail
   NotificationService.java      Webhook dispatch, retry, cooldown policy
   AlertTransition.java          OPENED/REOPENED/ACKNOWLEDGED/RESOLVED/OCCURRENCE
+  StructuredLogger.java         One JSON object per log line; LOG_FORMAT=text for humans
+  Metrics.java                  Prometheus counters, gauges, and text rendering
 
 dashboard/{index.html,app.js,styles.css}
 ```
@@ -92,10 +96,12 @@ dashboard/{index.html,app.js,styles.css}
 Go → Java `POST /receive`, header `X-EventWatch-Key`, `Content-Type: application/json`:
 
 ```json
-{ "event_id": "...", "level": "ERROR", "msg": "...",
+{ "event_id": "...", "correlation_id": "...", "level": "ERROR", "msg": "...",
   "timestamp": "2026-09-04T18:46:00Z", "cpu_usage": 88.4, "ram_usage": 12.1 }
 ```
 
+`correlation_id` is optional and carried in the payload so a queued event keeps it across a retry;
+the live request also sends it as the `X-Correlation-ID` header.
 Rules: `level` ∈ INFO|WARN|ERROR|CRITICAL; `msg` 1–1000 chars; `event_id` 1–128 chars and unique
 (partial unique index makes retries idempotent); usages are finite numbers 0–100; body ≤ 64 KiB.
 Changes to this schema must stay backward compatible — additive fields only, never renames.
@@ -106,6 +112,7 @@ Changes to this schema must stay backward compatible — additive fields only, n
 | --- | --- | --- | --- |
 | POST | `/receive` (8080) | key | Ingest; rate limited 100/min/IP |
 | GET | `/health` (8080, 8082) | none | 8080 also probes SQLite |
+| GET | `/metrics` (8080, 8082) | none | Prometheus text format |
 | GET | `/capture?level=&msg=` (8082) | none | Public ingress |
 | GET | `/stress` (8082) | none | 500 events, 32 concurrent |
 | GET | `/events?level=&from=&to=&limit=&offset=` | key | limit ≤ 200, default 50 |
@@ -134,6 +141,12 @@ Changes to this schema must stay backward compatible — additive fields only, n
 - **Config:** everything tunable comes from `.env` with an in-code fallback, through
   `getConfig/getDoubleConfig/getIntConfig` (Java) or `getEnv/getIntEnv` (Go). Never hardcode a new
   tunable. Add every new key to `.env.example`.
+- **Logging:** never `System.out.println` or `fmt.Printf` for a log line — use `StructuredLogger`
+  (Java) or `logInfo/logWarn/logError` (Go). Reserved field names are `timestamp`, `level`,
+  `service`, and `message`; an event's own level goes in `event_level`. Pass a `correlation_id`
+  field wherever one is in scope.
+- **Metrics:** add counters to `Metrics.java` / `metrics.go` rather than inventing ad-hoc counters.
+  Label values must come from a fixed, bounded set — never a message, an event id, or a raw path.
 - **Secrets:** `.env` is gitignored and must stay that way. Never commit a real key; never print the
   key in logs or responses.
 - **Commits:** phase-scoped, imperative, one phase per commit — matching existing history
@@ -143,21 +156,21 @@ Changes to this schema must stay backward compatible — additive fields only, n
 
 ## 5. Current state — read before starting work
 
-**Phases 1–8 are complete.** Both services build and the test suite passes:
+**Phases 1–9 are complete.** Both services build and the test suite passes:
 `mvn -o compile` → BUILD SUCCESS; `go vet ./...` and `go test ./...` → clean.
 
-Phase 8 delivers webhook notifications end to end: `AlertRepository` now reports an `AlertTransition`
-for every lifecycle change, `AlertEngine` and the operator endpoints hand those to
-`NotificationService`, which dispatches on a daemon thread with bounded retries and records every
-attempt in `notification_deliveries`. Verified against a local sink — open/reopen/acknowledge/resolve
-each delivered once, repeat occurrences were suppressed by the cooldown, a downed sink produced three
-`FAILED` rows with ascending attempt numbers, and the alert state stayed correct throughout.
+Phase 9 added structured JSON logging to both services, an end-to-end correlation ID, and
+hand-rolled Prometheus metrics on `GET /metrics` for each service — no new dependencies on either
+side. Verified end to end: a caller-supplied `X-Correlation-ID` appeared in the collector's capture
+log, the analytics store log, the response header, and the response body; duplicate delivery of a
+known `event_id` incremented `eventwatch_events_duplicate_total` rather than
+`..._received_total`; both `LOG_FORMAT` modes were exercised.
 
-Notifications are **off by default**: `NOTIFICATIONS_ENABLED=false` and an empty
-`NOTIFICATION_WEBHOOK_URL` make `handle()` a no-op.
+OpenTelemetry tracing is the one Phase 9 item **not** done — see section 9 for why it is a separate
+decision rather than an oversight.
 
-B1–B8 in the backlog below are all fixed. What remains unowned is Phase 9 onward plus the
-cross-cutting items in section 8.
+B1–B8 in section 8 are all fixed. What remains unowned is Phase 10 onward plus the cross-cutting
+items in section 9.
 
 ## 6. Phase 8 as built — notifications
 
@@ -187,7 +200,27 @@ next event.
 Still open for a later pass: email/SMTP, Slack and Teams channel formatters, HMAC request signing,
 and per-alert routing rules.
 
-## 7. Fixed defects and remaining quality work
+## 7. Phase 9 as built — observability
+
+- **Logs.** `StructuredLogger` (Java) and `logging.go` (Go) emit one JSON object per line.
+  Reserved keys — `timestamp`, `level`, `service`, `message` — are written *after* caller fields so
+  a caller can never overwrite them. That ordering exists because the first cut let an event's
+  `level` field clobber the log level; the event's level is now `event_level`.
+- **Correlation IDs.** The collector honours an inbound `X-Correlation-ID` and generates one
+  otherwise. It travels in the request header *and* the `correlation_id` payload field, so a queued
+  event keeps its ID through a retry — the header would be lost. Java prefers the header, falls back
+  to the payload, holds it in a `ThreadLocal`, and echoes it in the response header and body.
+- **Metrics.** Hand-rolled Prometheus text format on both sides — no client library, consistent with
+  the no-framework constraint and the 128 MB heap. Java counts HTTP responses centrally in
+  `recordResponse`, keyed by the registered context path, so the label set stays bounded no matter
+  what a client requests.
+- **The terminal report** prints only under `LOG_FORMAT=text`. Under `json` the same numbers are
+  emitted as a `telemetry snapshot` log line, because ASCII art in stdout breaks a log shipper.
+- **Both `/metrics` endpoints are unauthenticated**, matching `/health`, because scrapers rarely
+  send custom headers. They expose counts, not content — but restrict them at the network layer
+  before either service leaves localhost.
+
+## 8. Fixed defects and remaining quality work
 
 ### Fixed (keep these fixed — each has a way to regress)
 
@@ -244,21 +277,26 @@ it arrives over the following minutes through the queue. That is the system work
   in memory alongside the SQL `lastDeliveredAt` lookup; a restart falls back to the SQL value, which
   is correct but means an in-flight reservation is lost. Fine for one instance, wrong for two.
 
-## 8. Roadmap — Phase 9 onward
+## 9. Roadmap — Phase 10 onward
 
-**Phase 9 — Observability.** Structured JSON logs on both sides (replacing the emoji `Printf` /
-`System.out` calls, which are fine for a demo terminal but not parseable). A correlation ID
-generated by Go, carried on the request header, echoed in Java logs and responses. A
-`/metrics` endpoint in Prometheus text format: events received/rejected/deduplicated, processing
-latency, queue depth, pending-file count, notification success/failure, database error count. Add
-OpenTelemetry tracing across the Go→Java hop last, since it is the heaviest dependency.
+**Phase 9 — Observability.** Done except tracing (see section 7).
+
+**OpenTelemetry tracing — an open decision, not an oversight.** It is the only remaining Phase 9
+item, and it is the one that conflicts with the project's stated constraints: the Java SDK plus
+exporters is roughly a dozen jars against a 128 MB heap, and it needs a collector process to receive
+spans. The correlation ID already answers the question tracing was listed for here — "which log
+lines belong to this event?" — across the Go→Java hop. Recommendation: add it only alongside Phase
+11, when there are genuinely multiple services and hops worth measuring; adopt the W3C
+`traceparent` header at that point rather than inventing a second ID. If it is wanted sooner, the
+cheapest honest version is span timings emitted as structured log fields, with no SDK at all.
 
 **Phase 10 — Testing and delivery.** This is now the largest real gap: Java has **no tests and no test
 dependency in `pom.xml`**. Add JUnit 5 + `maven-surefire`, then cover — event validation (every
 rejection branch), moving averages, alert threshold and dedup logic, `AlertRepository` lifecycle
 against a temp SQLite file, and idempotent re-delivery of a duplicate `event_id`. Extend the Go
 tests to cover `forwardToJava` retry/backoff classification and `processPendingEvents` file
-outcomes with an `httptest` server. Add a `NotificationService` test with a
+outcomes with an `httptest` server, plus correlation-id propagation and the `/metrics` rendering on
+both sides. Add a `NotificationService` test with a
 local HTTP sink covering the cooldown, the 4xx stop, and the retry ladder — the behaviour verified by
 hand during Phase 8 should not stay hand-verified. Then an integration test that runs both services
 end to end, kills Java mid-flight, and asserts the queue drains without loss or duplication. Finally
@@ -278,7 +316,7 @@ instead of three global thresholds, and CORS origins moved to `.env`.
 
 ---
 
-## 9. Definition of done for a release
+## 10. Definition of done for a release
 
 - Events are authenticated, validated, persisted transactionally, deduplicated, and queryable.
 - A temporary Java outage loses nothing and duplicates nothing.

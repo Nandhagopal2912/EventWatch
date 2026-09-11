@@ -19,6 +19,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public class NotificationService {
     private final NotificationRepository repository;
     private final ObjectMapper objectMapper;
+    private final Metrics metrics;
     private final boolean enabled;
     private final URI webhookUrl;
     private final int timeoutSeconds;
@@ -34,10 +35,11 @@ public class NotificationService {
     });
 
     public NotificationService(NotificationRepository repository, ObjectMapper objectMapper,
-            boolean enabled, String webhookUrl, int timeoutSeconds, int maxAttempts,
+            Metrics metrics, boolean enabled, String webhookUrl, int timeoutSeconds, int maxAttempts,
             long retryDelayMillis, long reminderSeconds) {
         this.repository = repository;
         this.objectMapper = objectMapper;
+        this.metrics = metrics;
         this.enabled = enabled;
         this.webhookUrl = parseWebhookUrl(webhookUrl);
         this.timeoutSeconds = timeoutSeconds;
@@ -52,11 +54,15 @@ public class NotificationService {
         }
         try {
             String eventType = eventTypeToDeliver(transition);
-            if (eventType != null) {
-                dispatcher.submit(() -> deliver(transition.alert(), eventType));
+            if (eventType == null) {
+                metrics.recordNotification("SUPPRESSED");
+                return;
             }
+            dispatcher.submit(() -> deliver(transition.alert(), eventType));
         } catch (SQLException exception) {
-            System.err.println("Unable to evaluate notification policy: " + exception.getMessage());
+            metrics.recordNotification("FAILED");
+            StructuredLogger.error("unable to evaluate notification policy", StructuredLogger.fields(
+                    "alert_key", transition.alert().getAlertKey(), "error", exception.getMessage()));
         }
     }
 
@@ -109,6 +115,10 @@ public class NotificationService {
                 if (status >= 200 && status < 300) {
                     repository.record(new NotificationRecord(alert.getAlertKey(), eventType,
                             "DELIVERED", status, null, attempt, Instant.now()));
+                    metrics.recordNotification("DELIVERED");
+                    StructuredLogger.info("notification delivered", StructuredLogger.fields(
+                            "alert_key", alert.getAlertKey(), "event_type", eventType,
+                            "http_status", status, "attempt", attempt));
                     return;
                 }
                 failure = "Webhook returned HTTP " + status;
@@ -118,7 +128,8 @@ public class NotificationService {
                 Thread.currentThread().interrupt();
                 failure = "Webhook dispatch interrupted";
             } catch (SQLException exception) {
-                System.err.println("Unable to record notification delivery: " + exception.getMessage());
+                StructuredLogger.error("unable to record notification delivery", StructuredLogger.fields(
+                        "alert_key", alert.getAlertKey(), "error", exception.getMessage()));
                 return;
             }
             recordFailure(alert.getAlertKey(), eventType, status, failure, attempt);
@@ -152,11 +163,16 @@ public class NotificationService {
     }
 
     private void recordFailure(String alertKey, String eventType, Integer status, String message, int attempt) {
+        metrics.recordNotification("FAILED");
+        StructuredLogger.warn("notification delivery failed", StructuredLogger.fields(
+                "alert_key", alertKey, "event_type", eventType, "http_status", status,
+                "attempt", attempt, "error", message));
         try {
             repository.record(new NotificationRecord(alertKey, eventType, "FAILED", status,
                     message == null ? "Unknown delivery failure" : message, attempt, Instant.now()));
         } catch (SQLException exception) {
-            System.err.println("Unable to record notification failure: " + exception.getMessage());
+            StructuredLogger.error("unable to record notification failure", StructuredLogger.fields(
+                    "alert_key", alertKey, "error", exception.getMessage()));
         }
     }
 

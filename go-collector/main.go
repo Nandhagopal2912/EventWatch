@@ -24,12 +24,13 @@ import (
 
 // LogPayload is the JSON contract shared with the Java analytics service.
 type LogPayload struct {
-	EventID  string  `json:"event_id"`
-	Level    string  `json:"level"`
-	Messages string  `json:"msg"`
-	Time     string  `json:"timestamp"`
-	CPUUsage float64 `json:"cpu_usage"`
-	RAMUsage float64 `json:"ram_usage"`
+	EventID       string  `json:"event_id"`
+	CorrelationID string  `json:"correlation_id,omitempty"`
+	Level         string  `json:"level"`
+	Messages      string  `json:"msg"`
+	Time          string  `json:"timestamp"`
+	CPUUsage      float64 `json:"cpu_usage"`
+	RAMUsage      float64 `json:"ram_usage"`
 }
 
 const (
@@ -71,6 +72,13 @@ func logHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// An inbound correlation id is honoured so a caller can trace its own request.
+	correlationID := r.Header.Get("X-Correlation-ID")
+	if correlationID == "" {
+		correlationID = newEventID()
+	}
+	w.Header().Set("X-Correlation-ID", correlationID)
+
 	level := r.URL.Query().Get("level")
 	msg := r.URL.Query().Get("msg")
 
@@ -82,37 +90,55 @@ func logHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	cpuUsage, ramUsage, err := readHostMetrics()
 	if err != nil {
+		metrics.recordHostFailure()
+		logError("host metrics unavailable", logFields{"correlation_id": correlationID, "error": err.Error()})
 		writeMessage(w, http.StatusInternalServerError, "host metrics unavailable")
 		return
 	}
 
-	fmt.Printf("[%s]  🐹 Go Ingress: Captured log (%s , %s)\n", time.Now().Format("15:04:05"), level, msg)
-
 	payload := LogPayload{
-		EventID:  newEventID(),
-		Level:    level,
-		Messages: msg,
-		Time:     time.Now().UTC().Format(time.RFC3339),
-		CPUUsage: cpuUsage,
-		RAMUsage: ramUsage,
+		EventID:       newEventID(),
+		CorrelationID: correlationID,
+		Level:         level,
+		Messages:      msg,
+		Time:          time.Now().UTC().Format(time.RFC3339),
+		CPUUsage:      cpuUsage,
+		RAMUsage:      ramUsage,
 	}
-	jsonBytes, err := json.Marshal(payload)
+	metrics.recordCapture(level)
+	logInfo("captured event", logFields{
+		"correlation_id": correlationID,
+		"event_id":       payload.EventID,
+		"event_level":    level,
+		"cpu_usage":      cpuUsage,
+		"ram_usage":      ramUsage,
+	})
 
+	jsonBytes, err := json.Marshal(payload)
 	if err != nil {
-		fmt.Printf("❌ Error creating JSON: %v\n", err)
+		logError("event serialization failed", logFields{"correlation_id": correlationID, "error": err.Error()})
 		writeMessage(w, http.StatusInternalServerError, "internal payload error")
 		return
 	}
 
-	resp, err := forwardToJava(jsonBytes)
+	resp, err := forwardToJava(jsonBytes, correlationID)
 
 	if err != nil {
-		if queueErr := enqueueEvent(jsonBytes); queueErr != nil {
-			fmt.Printf("❌ Error forwarding to Java: %v; queueing failed: %v\n", err, queueErr)
+		if queueErr := enqueueEvent(jsonBytes, correlationID); queueErr != nil {
+			metrics.recordForward("failed")
+			logError("analytics unreachable and queueing failed", logFields{
+				"correlation_id": correlationID,
+				"error":          err.Error(),
+				"queue_error":    queueErr.Error(),
+			})
 			writeMessage(w, http.StatusServiceUnavailable, "backend unavailable and local queue is full")
 			return
 		}
-		fmt.Printf("⚠️ Java unavailable; event saved to local queue: %v\n", err)
+		metrics.recordForward("queued")
+		logWarn("analytics unavailable; event queued", logFields{
+			"correlation_id": correlationID,
+			"error":          err.Error(),
+		})
 		writeMessage(w, http.StatusServiceUnavailable, "backend unavailable; event queued for retry")
 		return
 	}
@@ -122,16 +148,37 @@ func logHandler(w http.ResponseWriter, r *http.Request) {
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		// Rate limiting is temporary, so queue it for retry exactly like a server failure.
 		if isRetryableStatus(resp.StatusCode) {
-			if queueErr := enqueueEvent(jsonBytes); queueErr != nil {
+			if queueErr := enqueueEvent(jsonBytes, correlationID); queueErr != nil {
+				metrics.recordForward("failed")
+				logError("retryable rejection and queueing failed", logFields{
+					"correlation_id": correlationID,
+					"status":         resp.StatusCode,
+					"queue_error":    queueErr.Error(),
+				})
 				writeMessage(w, http.StatusServiceUnavailable, "backend unavailable and local queue is full")
 				return
 			}
+			metrics.recordForward("queued")
+			logWarn("analytics returned a retryable status; event queued", logFields{
+				"correlation_id": correlationID,
+				"status":         resp.StatusCode,
+			})
 			writeMessage(w, http.StatusServiceUnavailable, "backend unavailable; event queued for retry")
 			return
 		}
+		metrics.recordForward("rejected")
+		logWarn("analytics rejected the event", logFields{
+			"correlation_id": correlationID,
+			"status":         resp.StatusCode,
+		})
 		writeMessage(w, resp.StatusCode, "Java backend rejected the log")
 		return
 	}
+	metrics.recordForward("delivered")
+	logInfo("event delivered to analytics", logFields{
+		"correlation_id": correlationID,
+		"event_id":       payload.EventID,
+	})
 	writeMessage(w, http.StatusOK, "log forwarded to analytics engine successfully")
 }
 
@@ -141,7 +188,12 @@ func stressHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fmt.Printf("⚡ STARTING MASS STRESS TEST: Firing %d logs...", stressEventCount)
+	correlationID := newEventID()
+	logInfo("starting stress test", logFields{
+		"correlation_id": correlationID,
+		"events":         stressEventCount,
+		"concurrency":    stressConcurrency,
+	})
 
 	fakeErrors := []string{
 		"Database transaction deadlock",
@@ -150,6 +202,7 @@ func stressHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	cpuUsage, ramUsage, err := readHostMetrics()
 	if err != nil {
+		metrics.recordHostFailure()
 		writeMessage(w, http.StatusInternalServerError, "host metrics unavailable")
 		return
 	}
@@ -160,34 +213,39 @@ func stressHandler(w http.ResponseWriter, r *http.Request) {
 		errorMsg := fakeErrors[i%len(fakeErrors)]
 
 		payload := LogPayload{
-			EventID:  newEventID(),
-			Level:    "ERROR",
-			Messages: fmt.Sprintf("%s (Log #%d)", errorMsg, i),
-			Time:     time.Now().UTC().Format(time.RFC3339),
-			CPUUsage: cpuUsage,
-			RAMUsage: ramUsage,
+			EventID:       newEventID(),
+			CorrelationID: correlationID,
+			Level:         "ERROR",
+			Messages:      fmt.Sprintf("%s (Log #%d)", errorMsg, i),
+			Time:          time.Now().UTC().Format(time.RFC3339),
+			CPUUsage:      cpuUsage,
+			RAMUsage:      ramUsage,
 		}
+		metrics.recordCapture(payload.Level)
 		jsonBytes, marshalErr := json.Marshal(payload)
 		if marshalErr != nil {
-			fmt.Printf("❌ Stress event dropped: %v\n", marshalErr)
+			logError("stress event dropped", logFields{
+				"correlation_id": correlationID, "error": marshalErr.Error()})
 			continue
 		}
 		slots <- struct{}{}
 		go func(data []byte) {
 			defer func() { <-slots }()
-			resp, err := forwardToJava(data)
+			resp, err := forwardToJava(data, correlationID)
 
 			if err != nil {
-				if queueErr := enqueueEvent(data); queueErr != nil {
-					fmt.Printf("❌ Stress event dropped: %v\n", queueErr)
-				}
+				queueOrDrop(data, correlationID)
 				return
 			}
 			defer resp.Body.Close()
 			if isRetryableStatus(resp.StatusCode) {
-				if queueErr := enqueueEvent(data); queueErr != nil {
-					fmt.Printf("❌ Stress event dropped: %v\n", queueErr)
-				}
+				queueOrDrop(data, correlationID)
+				return
+			}
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				metrics.recordForward("delivered")
+			} else {
+				metrics.recordForward("rejected")
 			}
 		}(jsonBytes)
 	}
@@ -201,6 +259,7 @@ func main() {
 	if javaBackendURL == "" {
 		javaBackendURL = "http://localhost:8080/receive"
 	}
+	configureLogging(getEnv("LOG_FORMAT", "json"))
 	apiKey := os.Getenv("EVENTWATCH_API_KEY")
 	if apiKey == "" {
 		fmt.Println("EVENTWATCH_API_KEY is required")
@@ -225,11 +284,16 @@ func main() {
 
 	http.HandleFunc("/capture", logHandler)
 	http.HandleFunc("/health", healthHandler)
+	http.HandleFunc("/metrics", metricsHandler)
 
 	http.HandleFunc("/stress", stressHandler)
 
-	fmt.Println("🐹 Go Cloud Log Collector is running on http://localhost:8082")
-	fmt.Println("Ready to capture cloud traffic.... Ready when you are")
+	logInfo("collector started", logFields{
+		"address":        ":8082",
+		"backend_url":    configuredBackendURL,
+		"queue_capacity": queueCapacity,
+		"queue_depth":    queueDepth(),
+	})
 
 	server := &http.Server{Addr: ":8082"}
 	serverError := make(chan error, 1)
@@ -241,22 +305,24 @@ func main() {
 	signal.Notify(shutdownSignal, os.Interrupt, syscall.SIGTERM)
 	select {
 	case signalReceived := <-shutdownSignal:
-		fmt.Printf("Shutting down Go collector after signal: %v\n", signalReceived)
+		logInfo("shutting down collector", logFields{"signal": signalReceived.String()})
 		shutdownContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := server.Shutdown(shutdownContext); err != nil {
-			fmt.Printf("Go collector shutdown error: %v\n", err)
+			logError("collector shutdown error", logFields{"error": err.Error()})
 		}
 		processPendingEvents()
 	case err := <-serverError:
 		if err != nil && err != http.ErrServerClosed {
-			fmt.Printf("Server failed to start: %v\n", err)
+			logError("server failed to start", logFields{"error": err.Error()})
 		}
 	}
 }
 
-func forwardToJava(jsonBytes []byte) (*http.Response, error) {
+func forwardToJava(jsonBytes []byte, correlationID string) (*http.Response, error) {
 	var lastError error
+	started := time.Now()
+	defer func() { metrics.observeForwardDuration(time.Since(started).Seconds()) }()
 	for attempt := 1; attempt <= maxBackendAttempts; attempt++ {
 		// Retry only transient transport/server failures; client errors are returned immediately.
 		request, err := http.NewRequest(http.MethodPost, configuredBackendURL, bytes.NewReader(jsonBytes))
@@ -265,6 +331,9 @@ func forwardToJava(jsonBytes []byte) (*http.Response, error) {
 		}
 		request.Header.Set("Content-Type", "application/json")
 		request.Header.Set("X-EventWatch-Key", configuredAPIKey)
+		if correlationID != "" {
+			request.Header.Set("X-Correlation-ID", correlationID)
+		}
 
 		response, err := backendClient.Do(request)
 		if err == nil && response.StatusCode < http.StatusInternalServerError {
@@ -278,10 +347,25 @@ func forwardToJava(jsonBytes []byte) (*http.Response, error) {
 		}
 
 		if attempt < maxBackendAttempts {
+			logWarn("retrying delivery to analytics", logFields{
+				"correlation_id": correlationID,
+				"attempt":        attempt,
+				"error":          fmt.Sprint(lastError),
+			})
 			time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
 		}
 	}
 	return nil, lastError
+}
+
+func queueOrDrop(data []byte, correlationID string) {
+	if queueErr := enqueueEvent(data, correlationID); queueErr != nil {
+		metrics.recordForward("failed")
+		logError("stress event dropped", logFields{
+			"correlation_id": correlationID, "error": queueErr.Error()})
+		return
+	}
+	metrics.recordForward("queued")
 }
 
 // A queued event is only abandoned on a permanent client error.
@@ -301,7 +385,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func enqueueEvent(data []byte) error {
+func enqueueEvent(data []byte, correlationID string) error {
 	queueMutex.Lock()
 	defer queueMutex.Unlock()
 
@@ -316,6 +400,7 @@ func enqueueEvent(data []byte) error {
 		}
 	}
 	if queued >= queueCapacity {
+		metrics.recordQueueDrop()
 		return fmt.Errorf("pending event queue is full (%d)", queueCapacity)
 	}
 
@@ -330,6 +415,12 @@ func enqueueEvent(data []byte) error {
 		_ = os.Remove(temporaryPath)
 		return err
 	}
+	metrics.recordQueueWrite()
+	logInfo("event written to pending queue", logFields{
+		"correlation_id": correlationID,
+		"queue_file":     name,
+		"queue_depth":    queued + 1,
+	})
 	select {
 	case queueWake <- struct{}{}:
 	default:
@@ -352,7 +443,7 @@ func retryPendingEvents() {
 func processPendingEvents() {
 	entries, err := os.ReadDir(queueDirectory)
 	if err != nil {
-		fmt.Printf("Unable to read pending event queue: %v\n", err)
+		logError("unable to read pending event queue", logFields{"error": err.Error()})
 		return
 	}
 	var names []string
@@ -368,22 +459,39 @@ func processPendingEvents() {
 		if err != nil {
 			continue
 		}
-		response, err := forwardToJava(data)
+		correlationID := correlationIDOf(data)
+		response, err := forwardToJava(data, correlationID)
 		if err != nil {
 			continue
 		}
 		status := response.StatusCode
 		response.Body.Close()
 		if status >= 200 && status < 300 {
+			metrics.recordForward("delivered")
 			if err := os.Remove(path); err != nil {
-				fmt.Printf("Unable to remove delivered event %s: %v\n", name, err)
+				logError("unable to remove delivered event", logFields{
+					"correlation_id": correlationID, "queue_file": name, "error": err.Error()})
 			} else {
-				fmt.Printf("✅ Queued event delivered successfully: %s (removed from pending queue)\n", name)
+				logInfo("queued event delivered", logFields{
+					"correlation_id": correlationID, "queue_file": name})
 			}
 		} else if !isRetryableStatus(status) {
+			metrics.recordForward("rejected")
+			metrics.recordQueueRejected()
+			logWarn("queued event permanently rejected", logFields{
+				"correlation_id": correlationID, "queue_file": name, "status": status})
 			moveToRejected(path, name)
 		}
 	}
+}
+
+// A retried event keeps the correlation id it was captured with.
+func correlationIDOf(data []byte) string {
+	var payload LogPayload
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return ""
+	}
+	return payload.CorrelationID
 }
 
 func moveToRejected(path, name string) {

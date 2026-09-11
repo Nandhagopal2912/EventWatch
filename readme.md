@@ -2,7 +2,7 @@
 
 EventWatch is a two-service host telemetry and event-monitoring pipeline. A Go collector captures application events together with CPU and RAM usage, then forwards them to a Java analytics engine for processing, persistence, and reporting.
 
-The current implementation completes Phases 1–8. Future improvements are documented in `CLAUDE.md`.
+The current implementation completes Phases 1–9. Future improvements are documented in `CLAUDE.md`.
 
 ## Project Phase Status
 
@@ -16,7 +16,7 @@ The current implementation completes Phases 1–8. Future improvements are docum
 | **Phase 6**  | **✅ Completed** | Analytics and alert rules        | Configurable CPU/RAM thresholds, moving-window detection, repeated-error alerts, SQLite alert state, deduplication, and the active-alerts endpoint.                                                        |
 | **Phase 7**  | **✅ Completed** | Query API and dashboard          | Bounded event queries, summaries, alert lookup/filtering, a separate local dashboard, and operator alert workflows.                                                                                        |
 | **Phase 8**  | **✅ Completed** | Notifications                    | Webhook delivery on alert state changes, cooldown reminders, bounded retries, and a durable delivery-attempt audit trail.                                                  |
-| **Phase 9**  | 🗓️ Planned       | Observability                    | Structured logs, Prometheus metrics, OpenTelemetry tracing, and correlation IDs.                                                                                                                           |
+| **Phase 9**  | **✅ Completed** | Observability                    | Structured JSON logs in both services, correlation IDs carried end to end, and Prometheus metrics for both services.                                          |
 | **Phase 10** | 🗓️ Planned       | Testing and delivery             | Unit, integration, load, and failure tests plus Docker and CI/CD automation.                                                                                                                               |
 | **Phase 11** | 🗓️ Planned       | Scaling beyond SQLite            | PostgreSQL or time-series storage, durable messaging, and independently scalable services when required.                                                                                                   |
 
@@ -27,12 +27,16 @@ The current implementation completes Phases 1–8. Future improvements are docum
 ```text
 go-collector/                   Go HTTP ingress
 	main.go
+	logging.go                     Structured JSON log lines
+	metrics.go                     Prometheus counters and /metrics
 	go.mod
 java-analytics/                 Maven Java analytics service
 	pom.xml
 	.mvn/jvm.config                Automatic Maven JVM memory settings
 	src/main/java/com/main/
 		AnalyticsEngine.java
+		Metrics.java
+		StructuredLogger.java
 		AlertEngine.java
 		AlertRecord.java
 		AlertRepository.java
@@ -59,6 +63,7 @@ dashboard/                      Local browser dashboard
 - **Alert acknowledgement:** `POST http://localhost:8080/alerts/{alert_key}/acknowledge` changes an `OPEN` alert to `ACKNOWLEDGED`.
 - **Alert resolution:** `POST http://localhost:8080/alerts/{alert_key}/resolve` changes an alert to `RESOLVED`, removing it from the active alerts response.
 - **Phase 7 query API:** `GET /events`, `GET /summary`, `GET /alerts`, and `GET /alerts/{alert_key}` provide bounded JSON data for the dashboard. All of them require the API key.
+- **Phase 9 observability:** both services emit one JSON object per log line, expose `GET /metrics` in Prometheus text format, and carry an `X-Correlation-ID` from the collector through to the analytics response.
 - **Phase 8 notifications:** alert state changes (opened, reopened, acknowledged, resolved) are POSTed as versioned JSON to `NOTIFICATION_WEBHOOK_URL`. Repeat occurrences are suppressed until `NOTIFICATION_REMINDER_SECONDS` passes. Every attempt is recorded and readable at `GET /alerts/{alert_key}/notifications`.
 - **Dashboard:** `dashboard/index.html` displays summaries, recent events, active alerts, and per-alert delivery history. It reads the API key in the browser, escapes all event text before rendering it, and never accesses SQLite directly.
 - **SQLite database** (`java-analytics/events.db`): stores telemetry in the `telemetry_events` table. The database is created automatically when the Java service starts.
@@ -110,6 +115,38 @@ If Java is temporarily unavailable, Go retries the request and writes the same e
 | **Delivery audit trail**    | Records every attempt with status, HTTP code, and attempt number.                                 | Makes a missed notification diagnosable instead of invisible.                 |
 | **Health endpoints**        | Reports Go availability and Java availability plus SQLite reachability.                           | Gives operators and future deployment tools a simple readiness check.         |
 | **Graceful shutdown**       | Stops new work, drains Java workers, and flushes the Go queue once.                               | Leaves the system in a recoverable state during restarts or deployments.      |
+
+## Observability
+
+Both services log one JSON object per line by default, so the output can be shipped and queried
+without parsing prose:
+
+```json
+{"correlation_id":"trace-abc-123","event_id":"d7b27bde-...","event_level":"ERROR","level":"INFO","message":"event stored","service":"java-analytics","timestamp":"2026-09-11T06:58:13.549Z"}
+```
+
+Set `LOG_FORMAT=text` in `.env` to switch both services back to human-readable lines. In text mode
+the Java service also prints the `LIVE CLOUD ALERT DASHBOARD` terminal report; in JSON mode the same
+numbers are emitted as a `telemetry snapshot` log line instead, so the ASCII output cannot corrupt a
+log stream.
+
+Every captured event is given a correlation ID. A caller may supply its own with the
+`X-Correlation-ID` header, and the collector generates one otherwise. It travels to Java in both the
+request header and the `correlation_id` payload field, so a queued event keeps its ID through a
+retry. Java echoes it in the `X-Correlation-ID` response header and in the JSON response body.
+
+Both services expose unauthenticated Prometheus metrics for local scraping:
+
+```powershell
+curl.exe http://localhost:8082/metrics
+curl.exe http://localhost:8080/metrics
+```
+
+The collector reports captured events by level, forwarding outcomes, queue depth, queue writes,
+drops and rejections, and forwarding latency. The analytics service reports events received,
+duplicated and rejected by reason, database failures, notification outcomes, HTTP responses by route
+and status, active alerts, stored rows, and processing latency. Both `/metrics` endpoints are open
+like `/health`; restrict them at the network layer before exposing either service beyond localhost.
 
 ## Requirements
 

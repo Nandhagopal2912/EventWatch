@@ -38,7 +38,11 @@ public class AnalyticsEngine {
     private static final int NOTIFICATION_HISTORY_LIMIT = 50;
     private static final long RATE_WINDOW_SWEEP_SECONDS = 60;
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+    private static final Metrics METRICS = new Metrics();
+    // Correlation ids are per-request state, so the response helpers read them from here.
+    private static final ThreadLocal<String> CORRELATION_ID = new ThreadLocal<>();
     private static String apiKey;
+    private static boolean textLogging;
     private static AlertRepository alertRepository;
     private static AlertEngine alertEngine;
     private static QueryService queryService;
@@ -97,6 +101,9 @@ public class AnalyticsEngine {
                 .directory("..")
                 .ignoreIfMissing()
                 .load();
+        String logFormat = getConfig(dotenv, "LOG_FORMAT", "json");
+        textLogging = "text".equalsIgnoreCase(logFormat);
+        StructuredLogger.configure(OBJECT_MAPPER, logFormat);
         apiKey = dotenv.get("EVENTWATCH_API_KEY", System.getenv("EVENTWATCH_API_KEY"));
         if (apiKey == null || apiKey.isBlank()) {
             throw new IOException("EVENTWATCH_API_KEY is required");
@@ -111,6 +118,7 @@ public class AnalyticsEngine {
             notificationService = new NotificationService(
                     notificationRepository,
                     OBJECT_MAPPER,
+                    METRICS,
                     Boolean.parseBoolean(getConfig(dotenv, "NOTIFICATIONS_ENABLED", "false")),
                     getConfig(dotenv, "NOTIFICATION_WEBHOOK_URL", ""),
                     getIntConfig(dotenv, "NOTIFICATION_TIMEOUT_SECONDS", 5),
@@ -129,33 +137,49 @@ public class AnalyticsEngine {
         } catch (SQLException exception) {
             throw new IOException("Unable to initialize SQLite database", exception);
         }
-        System.out.println("Loaded " + storedEventCount.get() + " stored events.");
+        StructuredLogger.info("loaded stored events",
+                StructuredLogger.fields("stored_events", storedEventCount.get()));
         HttpServer server = HttpServer.create(new InetSocketAddress(8080), 0);
 
         server.createContext("/receive", new HttpHandler() {
             @Override
             public void handle(HttpExchange exchange) throws IOException {
-                if ("POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+                long startedAt = System.nanoTime();
+                // Honour the collector's correlation id so one event is traceable across services.
+                String correlationId = exchange.getRequestHeaders().getFirst("X-Correlation-ID");
+                CORRELATION_ID.set(correlationId);
+                try {
+                    if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+                        exchange.getResponseHeaders().set("Allow", "POST");
+                        METRICS.recordEventRejected("method_not_allowed");
+                        sendResponse(exchange, 405, "Method not allowed");
+                        return;
+                    }
+
                     // Authenticate and reject abusive requests before parsing or storing data.
                     String receivedKey = exchange.getRequestHeaders().getFirst("X-EventWatch-Key");
                     if (!isValidApiKey(receivedKey)) {
+                        METRICS.recordEventRejected("unauthorized");
                         sendResponse(exchange, 401, "Unauthorized");
                         return;
                     }
                     String clientAddress = exchange.getRemoteAddress().getAddress().getHostAddress();
                     if (!rateWindows.computeIfAbsent(clientAddress, key -> new RateWindow()).allow()) {
+                        METRICS.recordEventRejected("rate_limited");
                         sendResponse(exchange, 429, "Rate limit exceeded");
                         return;
                     }
 
                     String contentType = exchange.getRequestHeaders().getFirst("Content-Type");
                     if (contentType == null || !contentType.toLowerCase(Locale.ROOT).startsWith("application/json")) {
+                        METRICS.recordEventRejected("content_type");
                         sendResponse(exchange, 415, "Content-Type must be application/json");
                         return;
                     }
 
                     byte[] bodyBytes = exchange.getRequestBody().readNBytes(MAX_REQUEST_BYTES + 1);
                     if (bodyBytes.length > MAX_REQUEST_BYTES) {
+                        METRICS.recordEventRejected("too_large");
                         sendResponse(exchange, 413, "Request body too large");
                         return;
                     }
@@ -165,16 +189,27 @@ public class AnalyticsEngine {
                     try {
                         json = OBJECT_MAPPER.readTree(body);
                     } catch (JsonProcessingException exception) {
+                        METRICS.recordEventRejected("invalid_json");
                         sendResponse(exchange, 400, "Invalid JSON");
                         return;
                     }
                     if (json == null || !json.isObject()) {
+                        METRICS.recordEventRejected("invalid_json");
                         sendResponse(exchange, 400, "JSON object required");
                         return;
                     }
 
+                    // A queued event carries its correlation id in the payload, not the header.
+                    if (correlationId == null || correlationId.isBlank()) {
+                        correlationId = json.path("correlation_id").asText(null);
+                        CORRELATION_ID.set(correlationId);
+                    }
+
                     String validationError = validateEvent(json);
                     if (validationError != null) {
+                        METRICS.recordEventRejected("validation");
+                        StructuredLogger.warn("event rejected", StructuredLogger.fields(
+                                "correlation_id", correlationId, "reason", validationError));
                         sendResponse(exchange, 400, validationError);
                         return;
                     }
@@ -186,23 +221,35 @@ public class AnalyticsEngine {
                     double cpuUsage = json.path("cpu_usage").asDouble();
                     double ramUsage = json.path("ram_usage").asDouble();
 
+                    boolean stored;
                     try {
-                        storeEvent(new LogEntry(eventId, level, msg, timestamp, cpuUsage, ramUsage));
+                        stored = storeEvent(new LogEntry(eventId, level, msg, timestamp, cpuUsage, ramUsage));
                         alertEngine.evaluate(recentEventsSnapshot());
                     } catch (SQLException exception) {
+                        METRICS.recordDatabaseFailure();
+                        StructuredLogger.error("database unavailable", StructuredLogger.fields(
+                                "correlation_id", correlationId, "event_id", eventId,
+                                "error", exception.getMessage()));
                         sendResponse(exchange, 503, "Database unavailable");
                         return;
                     }
 
+                    if (stored) {
+                        METRICS.recordEventReceived();
+                    } else {
+                        METRICS.recordEventDuplicate();
+                    }
+                    StructuredLogger.info(stored ? "event stored" : "duplicate event ignored",
+                            StructuredLogger.fields(
+                                    "correlation_id", correlationId, "event_id", eventId,
+                                    "event_level", level, "cpu_usage", cpuUsage, "ram_usage", ramUsage));
+
                     generateDashboardReport();
 
                     sendResponse(exchange, 200, "Log processed successfully");
-                }
-
-                else {
-                    exchange.getResponseHeaders().set("Allow", "POST");
-                    sendResponse(exchange, 405, "Method not allowed");
-
+                } finally {
+                    METRICS.observeProcessingDuration((System.nanoTime() - startedAt) / 1_000_000_000.0);
+                    CORRELATION_ID.remove();
                 }
             }
         });
@@ -220,6 +267,26 @@ public class AnalyticsEngine {
                 sendJsonResponse(exchange, 503,
                         "{\"status\":\"error\",\"service\":\"java-analytics\","
                                 + "\"message\":\"database unavailable\"}");
+            }
+        });
+
+        server.createContext("/metrics", exchange -> {
+            if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+                sendResponse(exchange, 405, "Method not allowed");
+                return;
+            }
+            long activeAlerts = 0;
+            try {
+                activeAlerts = alertRepository.findActive().size();
+            } catch (SQLException exception) {
+                METRICS.recordDatabaseFailure();
+            }
+            byte[] body = METRICS.render(activeAlerts, storedEventCount.get())
+                    .getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().set("Content-Type", "text/plain; version=0.0.4; charset=UTF-8");
+            exchange.sendResponseHeaders(200, body.length);
+            try (OutputStream output = exchange.getResponseBody()) {
+                output.write(body);
             }
         });
 
@@ -405,7 +472,7 @@ public class AnalyticsEngine {
                 RATE_WINDOW_SWEEP_SECONDS, RATE_WINDOW_SWEEP_SECONDS, TimeUnit.SECONDS);
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            System.out.println("Shutting down Java analytics engine...");
+            StructuredLogger.info("shutting down analytics engine", StructuredLogger.fields());
             server.stop(5);
             maintenance.shutdownNow();
             notificationService.shutdown();
@@ -420,7 +487,10 @@ public class AnalyticsEngine {
             }
         }));
 
-        System.out.println("Waiting for logs....(Test with one or two entries first)\n");
+        StructuredLogger.info("analytics engine started", StructuredLogger.fields(
+                "port", 8080,
+                "worker_threads", WORKER_THREADS,
+                "queue_capacity", WORK_QUEUE_CAPACITY));
 
         server.start();
     }
@@ -481,7 +551,19 @@ public class AnalyticsEngine {
         try {
             errorCounts = eventRepository.topErrorMessages(TOP_ERROR_MESSAGES);
         } catch (SQLException exception) {
+            METRICS.recordDatabaseFailure();
             errorCounts = Map.of();
+        }
+
+        // The ASCII report would corrupt a JSON log stream, so each format gets its own shape.
+        if (!textLogging) {
+            StructuredLogger.info("telemetry snapshot", StructuredLogger.fields(
+                    "total_events", storedEventCount.get(),
+                    "window_size", window.size(),
+                    "average_cpu", averageCpu,
+                    "average_ram", averageRam,
+                    "top_errors", errorCounts));
+            return;
         }
 
         System.out.println("\n================ LIVE CLOUD ALERT DASHBOARD ================");
@@ -543,7 +625,7 @@ public class AnalyticsEngine {
         return new ArrayList<>(recentEvents);
     }
 
-    private static synchronized void storeEvent(LogEntry event) throws SQLException {
+    private static synchronized boolean storeEvent(LogEntry event) throws SQLException {
         // Commit to SQLite before adding the event to memory, preventing acknowledged
         // data loss.
         String query = "INSERT OR IGNORE INTO telemetry_events "
@@ -566,6 +648,7 @@ public class AnalyticsEngine {
                     recentEvents.removeFirst();
                 }
             }
+            return inserted > 0;
         }
     }
 
@@ -573,7 +656,12 @@ public class AnalyticsEngine {
         ObjectNode body = OBJECT_MAPPER.createObjectNode();
         body.put("status", status >= 400 ? "error" : "ok");
         body.put("message", response);
+        String correlationId = CORRELATION_ID.get();
+        if (correlationId != null && !correlationId.isBlank()) {
+            body.put("correlation_id", correlationId);
+        }
         byte[] responseBytes = OBJECT_MAPPER.writeValueAsBytes(body);
+        recordResponse(exchange, status);
         addCorsHeaders(exchange);
         exchange.getResponseHeaders().set("Content-Type", "application/json; charset=UTF-8");
         exchange.sendResponseHeaders(status, responseBytes.length);
@@ -584,11 +672,21 @@ public class AnalyticsEngine {
 
     private static void sendJsonResponse(HttpExchange exchange, int status, String response) throws IOException {
         byte[] responseBytes = response.getBytes(StandardCharsets.UTF_8);
+        recordResponse(exchange, status);
         addCorsHeaders(exchange);
         exchange.getResponseHeaders().set("Content-Type", "application/json; charset=UTF-8");
         exchange.sendResponseHeaders(status, responseBytes.length);
         try (OutputStream output = exchange.getResponseBody()) {
             output.write(responseBytes);
+        }
+    }
+
+    // Routes are counted by their registered context path so the label set stays bounded.
+    private static void recordResponse(HttpExchange exchange, int status) {
+        METRICS.recordHttpRequest(exchange.getHttpContext().getPath(), status);
+        String correlationId = CORRELATION_ID.get();
+        if (correlationId != null && !correlationId.isBlank()) {
+            exchange.getResponseHeaders().set("X-Correlation-ID", correlationId);
         }
     }
 
