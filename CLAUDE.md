@@ -18,7 +18,7 @@ downstream — per-host windows, per-host alert keys, the fleet listing — foll
 | Service | Language | Port | Role |
 | --- | --- | --- | --- |
 | `go-collector/` | Go 1.27, stdlib + gopsutil + godotenv | 8082 | One per machine: stable identity, host CPU/RAM, durable retry queue |
-| `java-analytics/` | Java 17, Maven, `com.sun.net.httpserver` + Jackson + sqlite-jdbc | 8080 | Validates, persists to SQLite, evaluates alerts, serves query API |
+| `java-analytics/` | Java 17, Maven, `com.sun.net.httpserver` + Jackson + sqlite-jdbc/PostgreSQL + HikariCP | 8080 | Validates, persists, evaluates per-host rules, serves query and rules API |
 | `dashboard/` | Static HTML/CSS/JS, no build step | 3000 (any static server) | Reads the Java query API only; never touches SQLite |
 
 Deliberate constraint: **no web frameworks, no ORM, no DI container** on either side. Spring, Gin,
@@ -63,8 +63,8 @@ Notes:
 - `java-analytics/.mvn/jvm.config` pins `-Xms64m -Xmx128m`; do not remove it — it exists because the
   dev machine has a small paging file.
 - `events.db` is created on first Java start. It is gitignored and disposable; delete it to reset.
-- Open the dashboard at exactly `http://localhost:3000` — the Java CORS allowlist is hardcoded to
-  `localhost:3000` / `127.0.0.1:3000` ([AnalyticsEngine.java:597](java-analytics/src/main/java/com/main/AnalyticsEngine.java:597)).
+- Open the dashboard at `http://localhost:3000`, which is what `CORS_ALLOWED_ORIGINS` allows by
+  default. Serve it from anywhere else and that origin has to be added to the list.
 
 Smoke test end to end:
 
@@ -85,6 +85,8 @@ go-collector/metrics.go         Prometheus counters, queue-depth gauge, /metrics
 go-collector/main_test.go       Event-ID uniqueness + queue capacity
 go-collector/collector_test.go  Retries, capture handler, queue outcomes, metrics
 go-collector/contract_test.go   Shared JSON contract, against testdata/
+go-collector/identity_test.go   Identity generation, persistence, overrides
+go-collector/security_test.go   Bind policy, capture auth, backend TLS trust
 go-collector/Dockerfile         Static binary on alpine, queue on a volume
 
 java-analytics/src/main/java/com/main/
@@ -107,6 +109,9 @@ java-analytics/src/main/java/com/main/
   SqliteDialect.java / PostgresDialect.java
   RetentionService.java         Prunes telemetry and delivery history past the window
   TlsSupport.java               HTTPS listener from a keystore, TLS 1.2+
+  AlertRule.java                One stored rule; scope '*' means fleet-wide
+  AlertRuleRepository.java      alert_rules table, portable upsert on (rule_type, scope)
+  AlertRules.java               Host → fleet → default precedence, validation, cache
 
 java-analytics/src/test/java/com/main/
   AnalyticsEngineIntegrationTest.java   Real server on an ephemeral port, temp database
@@ -118,6 +123,11 @@ java-analytics/src/test/java/com/main/
   ContractTest.java             Shared JSON contract, against testdata/
   PostgresBackendTest.java      The storage layer against a real PostgreSQL; skipped without one
   RetentionServiceTest.java     Prune boundaries and failure handling
+  EngineLifecycleTest.java      Pool released on stop and on every failed start
+  SecurityTest.java             CORS, metrics auth, and a real TLS handshake (TestKeystore)
+  AlertRulesTest.java           Rule precedence, validation, persistence
+  RulesApiTest.java             The rules API changing which machines alert, end to end
+  AlertRulesPostgresTest.java   Rule storage on a real PostgreSQL; skipped without one
 java-analytics/Dockerfile       Shaded jar on a JRE, database on a volume
 
 loadtest/main.go                Throughput and latency harness (its own module, stdlib only)
@@ -151,11 +161,11 @@ Changes to this schema must stay backward compatible — additive fields only, n
 
 | Method | Path | Auth | Notes |
 | --- | --- | --- | --- |
-| POST | `/receive` (8080) | key | Ingest; rate limited 100/min/IP |
+| POST | `/receive` (8080) | key | Ingest; rate limited per IP by `RATE_LIMIT_PER_MINUTE` (default 100) |
 | GET | `/health` (8080, 8082) | none | 8080 also probes SQLite |
 | GET | `/metrics` (8080, 8082) | none, or key when `METRICS_REQUIRE_KEY` | Prometheus text format |
 | GET | `/capture?level=&msg=` (8082) | none on loopback, key when exposed | Agent ingress |
-| GET | `/stress` (8082) | none | 500 events, 32 concurrent |
+| GET | `/stress` (8082) | same as `/capture` | 500 events, 32 concurrent |
 | GET | `/events?level=&host_id=&from=&to=&limit=&offset=` | key | limit ≤ 200, default 50 |
 | GET | `/hosts?limit=` | key | Fleet listing with last-seen |
 | GET | `/summary` | key | Totals, active alerts, 5-event averages |
@@ -163,6 +173,10 @@ Changes to this schema must stay backward compatible — additive fields only, n
 | GET | `/alerts/{key}` | key | Single alert |
 | POST | `/alerts/{key}/acknowledge`, `/resolve` | key | Operator actions; both notify |
 | GET | `/alerts/{key}/notifications?limit=` | key | Delivery audit trail, limit ≤ 200 |
+| GET | `/rules` | key | Stored rules plus the `.env` defaults beneath them |
+| PUT | `/rules` | key | Upsert one rule: `rule_type`, optional `host_id`, `threshold`, `enabled` |
+| DELETE | `/rules?rule_type=&host_id=` | key | Remove an override; omit `host_id` for the fleet rule |
+| GET | `/rules/effective?host_id=` | key | What applies to one machine, with its source tier |
 
 ---
 
@@ -179,9 +193,9 @@ Changes to this schema must stay backward compatible — additive fields only, n
   are permanent and move the queued file to `pending-events/rejected-events/`.
 - **SQL:** always `PreparedStatement` with parameters. Schema is created idempotently at startup
   (`CREATE TABLE IF NOT EXISTS`), so there is no migration tool — new columns go in as guarded
-  `ALTER TABLE` following the `event_id` pattern in `initializeDatabase()`.
+  `ALTER TABLE` in `SqlDialect.applyLegacyMigrations`, for both dialects.
 - **Config:** everything tunable comes from `.env` with an in-code fallback, through
-  `getConfig/getDoubleConfig/getIntConfig` (Java) or `getEnv/getIntEnv` (Go). Never hardcode a new
+  `EngineConfiguration.fromDotenv` (Java) or `getEnv/getIntEnv` (Go). Never hardcode a new
   tunable. Add every new key to `.env.example`.
 - **Logging:** never `System.out.println` or `fmt.Printf` for a log line — use `StructuredLogger`
   (Java) or `logInfo/logWarn/logError` (Go). Reserved field names are `timestamp`, `level`,
@@ -205,23 +219,22 @@ Changes to this schema must stay backward compatible — additive fields only, n
 
 ## 5. Current state — read before starting work
 
-**Phases 1–13 are complete.** Everything is green:
+**Phases 1–14 are complete.** Everything is green:
 
-- `cd java-analytics && mvn verify` → 134 tests, BUILD SUCCESS
+- `cd java-analytics && mvn verify` → 160 tests, BUILD SUCCESS (12 of them need
+  `EVENTWATCH_TEST_POSTGRES_URL`; CI supplies a server, locally they skip)
 - `cd go-collector && go vet ./... && go test ./...` → 43 tests, pass
 - `cd loadtest && go vet ./... && go test ./...` → 4 tests, pass
 - `docker compose up --build` → all services healthy
 
-Phase 13 made a deployment defensible. The agent binds to loopback by default and **refuses to
-start** on any other address without a capture key. The analytics API serves TLS from a keystore,
-and the agent verifies it against a configured CA. CORS origins and metrics auth are configuration.
-Verified end to end: a real agent delivered an event to a real TLS listener with certificate
-verification, and plain HTTP against that listener failed as it should.
+Phase 14 moved thresholds out of `.env` and into per-host rules: a machine's own rule, then a
+fleet-wide rule, then the `.env` default. A mixed fleet now works — the build box can run at 95%
+without alerting while the database alerts at 85% — and that exact case is a test in `RulesApiTest`.
 
-**What is still open:** the dashboard holds the API key in page memory. Eliminating that needs
-same-origin serving plus an HttpOnly cookie — see section 13.
+**What is still open:** the dashboard holds the API key in page memory (section 14), and nothing yet
+detects an agent that has gone silent. That second one is Phase 15.
 
-B1–B15 in section 12 are all fixed.
+B1–B15 in section 13 are all fixed.
 
 ## 6. Phase 8 as built — notifications
 
@@ -336,7 +349,7 @@ filters meaning exactly the same thing everywhere.
 sweeps rate windows. The cutoff is exclusive, delivery history is pruned alongside the events that
 produced it, and a failed sweep is logged rather than thrown so the timer thread survives.
 
-**What is deliberately NOT done, and when to revisit** — see section 11. Short version: the file
+**What is deliberately NOT done, and when to revisit** — see section 14. Short version: the file
 queue and the two-service shape are both still comfortably inside what the measurements justify.
 
 ## 10. Phase 12 as built — host identity
@@ -388,7 +401,42 @@ running JDK. The test performs a real handshake rather than asserting on configu
 **CORS was a hardcoded origin** (`localhost:3000`) that made the dashboard undeployable anywhere
 else. It is now a comma-separated allowlist; an empty list allows nothing.
 
-## 12. Fixed defects and remaining quality work
+## 12. Phase 14 as built — per-host alert rules
+
+**Precedence is the whole design.** For each rule type the most specific stored rule wins: the
+machine's own, then fleet-wide, then the `.env` value. The `.env` thresholds did not go away — they
+became the bottom tier, so an install with no rules behaves exactly as before and an upgrade needs
+no migration of intent. `GET /rules/effective?host_id=` reports the winning tier (`host`, `fleet`,
+`default`) because "why did this fire?" is the first question an operator asks.
+
+**Fleet-wide is the sentinel `'*'`, not NULL.** The table's key is `(rule_type, scope)`, and both
+SQLite and PostgreSQL treat NULLs as distinct in a unique key — NULL would have allowed two
+fleet-wide rules of one type. The sentinel never reaches the API: a fleet rule serializes with
+`"host_id": null`, and `"*"` is refused as a host id.
+
+**A disabled rule is a decision, not an absence.** A disabled host rule still beats an enabled
+fleet rule, and the engine resolves an alert whose rule is now disabled on that machine's next
+event, so nothing is left firing under a rule that no longer applies.
+
+**Validation refuses rules that can never fire.** A `REPEATED_ERROR` threshold above the 5-event
+window is rejected at the API rather than stored and silently dead. The same condition in `.env`
+logs a startup warning.
+
+**Rules are read on every event, so they are cached** in `AlertRules` and replaced wholesale on
+each write. That is correct for one analytics instance; a second instance would need a refresh
+interval or change notification — the same limitation as notification reminders in section 13.
+
+**A wiring bug the tests caught before commit:** the CORS preflight still advertised
+`GET, POST, OPTIONS`, because the edit replaced the first of two identical strings — in the
+`/alerts/` handler — and missed `handleCorsPreflight`. The dashboard's cross-origin PUT and DELETE
+would have been blocked. `RulesApiTest.thePreflightAllowsTheMethodsTheEditorUses` caught it; both
+places now carry one API-wide policy.
+
+**Pre-existing behaviour, now documented:** repeated-error alerts never auto-resolve. CPU and RAM
+alerts resolve when the average recovers; an error has no equivalent "recovered" signal, so those
+alerts wait for an operator.
+
+## 13. Fixed defects and remaining quality work
 
 ### Fixed (keep these fixed — each has a way to regress)
 
@@ -470,13 +518,11 @@ unaffected: at 3000 samples both percentile formulas select the same index.)
 - **Timestamps.** Go now sends UTC `Z` values so lexical order matches chronological order, but rows
   written by older builds may carry a local offset. A one-off normalization pass would make range
   filters exact for that history.
-- **Stale artifacts.** `java-analytics/alerts_history.json` is a Phase 2 leftover that is no longer
-  written — delete it and the `readme.md` note referencing it.
 - **Notification reminders are per-process.** `NotificationService` keeps a `reminderScheduledAt` map
   in memory alongside the SQL `lastDeliveredAt` lookup; a restart falls back to the SQL value, which
   is correct but means an in-flight reservation is lost. Fine for one instance, wrong for two.
 
-## 13. Roadmap and deferred work
+## 14. Roadmap and deferred work
 
 **Phase 9 — Observability.** Done except tracing (see section 7).
 
@@ -518,10 +564,9 @@ serving the dashboard from the analytics service itself so it is same-origin, th
 HttpOnly `SameSite=Strict` cookie from a `POST /session` endpoint. That also deletes the CORS
 configuration entirely, which is a good sign it is the right shape. Worth doing alongside Phase 15.
 
-**Phase 14 — Alert rules worth having.** Three global thresholds do not survive a mixed fleet: a
-build box at 90% CPU is healthy, a database at 90% is not. Per-host and per-rule configuration in a
-table rather than `.env`, with a rules API and a dashboard editor. Phase 12's per-host alert keys
-are the foundation this sits on.
+**Phase 14 — Per-host alert rules.** Done (see section 12). Not done: rule types beyond the
+original three (disk, a metric the agent does not yet sample), and alerts that fire on a time window
+rather than an event count. Both need the agent to report more than CPU and RAM first.
 
 **Phase 15 — Fleet operations.** A host list with staleness — "agent silent for 10 minutes" is
 often the most important alert and nothing currently detects it — per-host drill-down, and agents
@@ -531,7 +576,7 @@ self-reporting their version and queue depth.
 
 ---
 
-## 14. Definition of done for a release
+## 15. Definition of done for a release
 
 - Events are authenticated, validated, persisted transactionally, deduplicated, and queryable.
 - A temporary Java outage loses nothing and duplicates nothing.

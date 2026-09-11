@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.sql.SQLException;
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 
 public class QueryService {
     public static final int DEFAULT_LIMIT = 50;
@@ -92,6 +93,51 @@ public class QueryService {
             items.add(node);
         }
         return items;
+    }
+
+    /** Stored rules plus the configuration defaults they override. */
+    public ObjectNode rules(List<AlertRule> rules, Map<String, Double> defaults) {
+        ObjectNode response = objectMapper.createObjectNode();
+        ObjectNode defaultNode = response.putObject("defaults");
+        for (String ruleType : AlertRules.RULE_TYPES) {
+            defaultNode.put(ruleType, defaults.get(ruleType));
+        }
+        ArrayNode items = response.putArray("rules");
+        for (AlertRule rule : rules) {
+            items.add(ruleJson(rule));
+        }
+        return response;
+    }
+
+    public ObjectNode ruleJson(AlertRule rule) {
+        ObjectNode node = objectMapper.createObjectNode();
+        node.put("rule_type", rule.ruleType());
+        // A fleet-wide rule has no host; the storage sentinel never leaks into the API.
+        if (rule.fleetWide()) {
+            node.putNull("host_id");
+        } else {
+            node.put("host_id", rule.scope());
+        }
+        node.put("threshold", rule.threshold());
+        node.put("enabled", rule.enabled());
+        node.put("updated_at", rule.updatedAt().toString());
+        return node;
+    }
+
+    /** What applies to one machine, and which tier it came from. */
+    public ObjectNode effectiveRules(String hostId, List<AlertRules.EffectiveRule> effective) {
+        ObjectNode response = objectMapper.createObjectNode();
+        response.put("host_id", hostId);
+        ArrayNode items = response.putArray("rules");
+        for (AlertRules.EffectiveRule rule : effective) {
+            ObjectNode node = objectMapper.createObjectNode();
+            node.put("rule_type", rule.ruleType());
+            node.put("threshold", rule.threshold());
+            node.put("enabled", rule.enabled());
+            node.put("source", rule.source().name().toLowerCase(java.util.Locale.ROOT));
+            items.add(node);
+        }
+        return response;
     }
 
     /** One row per machine the analytics service has heard from. */

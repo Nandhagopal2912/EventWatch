@@ -13,23 +13,20 @@ public class AlertEngine {
     private final AlertRepository repository;
     private final NotificationService notificationService;
     private final int movingWindowSize;
-    private final double cpuThreshold;
-    private final double ramThreshold;
-    private final int repeatedErrorThreshold;
+    private final AlertRules rules;
 
     public AlertEngine(AlertRepository repository, NotificationService notificationService,
-            int movingWindowSize, double cpuThreshold, double ramThreshold, int repeatedErrorThreshold) {
+            int movingWindowSize, AlertRules rules) {
         this.repository = repository;
         this.notificationService = notificationService;
         this.movingWindowSize = movingWindowSize;
-        this.cpuThreshold = cpuThreshold;
-        this.ramThreshold = ramThreshold;
-        this.repeatedErrorThreshold = repeatedErrorThreshold;
+        this.rules = rules;
     }
 
     /**
-     * Evaluates one machine's window. Alert keys are scoped to the host, so a fleet sharing
-     * one analytics service raises one alert per machine instead of fighting over a single row.
+     * Evaluates one machine's window against the rules that apply to that machine. Alert keys
+     * are scoped to the host, so a fleet sharing one analytics service raises one alert per
+     * machine instead of fighting over a single row.
      */
     public void evaluate(List<AnalyticsEngine.LogEntry> events) throws SQLException {
         if (events.isEmpty()) {
@@ -49,11 +46,15 @@ public class AlertEngine {
                 .average()
                 .orElse(0.0);
 
-        evaluateThreshold(alertKey("cpu-high", hostId), "HIGH_CPU", hostId, averageCpu, cpuThreshold,
-                "CPU average is %.1f%% (threshold %.1f%%)".formatted(averageCpu, cpuThreshold), now);
-        evaluateThreshold(alertKey("ram-high", hostId), "HIGH_RAM", hostId, averageRam, ramThreshold,
-                "RAM average is %.1f%% (threshold %.1f%%)".formatted(averageRam, ramThreshold), now);
+        evaluateThreshold(alertKey("cpu-high", hostId), rules.effective(AlertRules.HIGH_CPU, hostId),
+                hostId, "CPU", averageCpu, now);
+        evaluateThreshold(alertKey("ram-high", hostId), rules.effective(AlertRules.HIGH_RAM, hostId),
+                hostId, "RAM", averageRam, now);
 
+        AlertRules.EffectiveRule errorRule = rules.effective(AlertRules.REPEATED_ERROR, hostId);
+        if (!errorRule.enabled()) {
+            return;
+        }
         Map<String, Integer> errorCounts = new HashMap<>();
         for (AnalyticsEngine.LogEntry event : recentEvents) {
             if ("ERROR".equalsIgnoreCase(event.level) || "CRITICAL".equalsIgnoreCase(event.level)) {
@@ -62,17 +63,19 @@ public class AlertEngine {
         }
         for (Map.Entry<String, Integer> entry : errorCounts.entrySet()) {
             String key = alertKey("repeated-error-" + stableKey(entry.getKey()), hostId);
-            if (entry.getValue() >= repeatedErrorThreshold) {
-                notify(repository.saveOccurrence(new AlertRecord(key, "REPEATED_ERROR", hostId,
+            if (entry.getValue() >= errorRule.threshold()) {
+                notify(repository.saveOccurrence(new AlertRecord(key, AlertRules.REPEATED_ERROR, hostId,
                         entry.getKey() + " occurred " + entry.getValue() + " times", now)));
             }
         }
     }
 
-    private void evaluateThreshold(String alertKey, String alertType, String hostId, double value,
-            double threshold, String message, Instant timestamp) throws SQLException {
-        if (value >= threshold) {
-            notify(repository.saveOccurrence(new AlertRecord(alertKey, alertType, hostId, message, timestamp)));
+    private void evaluateThreshold(String alertKey, AlertRules.EffectiveRule rule, String hostId,
+            String resource, double value, Instant timestamp) throws SQLException {
+        // A disabled rule no longer describes this machine, so an alert it raised is resolved.
+        if (rule.enabled() && value >= rule.threshold()) {
+            String message = "%s average is %.1f%% (threshold %.1f%%)".formatted(resource, value, rule.threshold());
+            notify(repository.saveOccurrence(new AlertRecord(alertKey, rule.ruleType(), hostId, message, timestamp)));
         } else {
             notify(repository.resolve(alertKey, timestamp));
         }

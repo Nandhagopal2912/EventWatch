@@ -5,6 +5,16 @@ const notice = document.querySelector("#connection");
 const eventsBody = document.querySelector("#events-body");
 const alertsList = document.querySelector("#alerts-list");
 const hostFilter = document.querySelector("#host-filter");
+const ruleForm = document.querySelector("#rule-form");
+const ruleHost = document.querySelector("#rule-host");
+const rulesBody = document.querySelector("#rules-body");
+const ruleDefaults = document.querySelector("#rule-defaults");
+const ruleLabels = {
+  HIGH_CPU: "High CPU",
+  HIGH_RAM: "High RAM",
+  REPEATED_ERROR: "Repeated error",
+};
+let knownHosts = [];
 
 // Event and alert text is operator-supplied data: escape it before it reaches innerHTML.
 function escapeHtml(value) {
@@ -36,6 +46,58 @@ async function getJson(path) {
   const body = await response.json();
   if (!response.ok) throw new Error(body.message || "Request failed");
   return body;
+}
+
+async function sendJson(method, path, body) {
+  const options = { method, headers: headers() };
+  if (body !== undefined) {
+    options.headers = { ...headers(), "Content-Type": "application/json" };
+    options.body = JSON.stringify(body);
+  }
+  const response = await fetch(`${apiBase}${path}`, options);
+  const result = await response.json();
+  if (!response.ok) throw new Error(result.message || "Request failed");
+  return result;
+}
+
+function hostLabel(hostId) {
+  if (!hostId) return "All machines";
+  const host = knownHosts.find((candidate) => candidate.host_id === hostId);
+  return host?.hostname ?? hostId;
+}
+
+function renderRules(response) {
+  rulesBody.innerHTML =
+    response.rules
+      .map(
+        (rule) => `
+    <tr><td>${escapeHtml(ruleLabels[rule.rule_type] ?? rule.rule_type)}</td>
+    <td class="host-tag">${escapeHtml(hostLabel(rule.host_id))}</td>
+    <td>${Number(rule.threshold)}${rule.rule_type === "REPEATED_ERROR" ? "" : "%"}</td>
+    <td>${rule.enabled ? "Enabled" : "Disabled"}</td>
+    <td><button class="quiet" type="button" data-rule-type="${escapeHtml(rule.rule_type)}" data-host-id="${escapeHtml(rule.host_id ?? "")}">Remove</button></td></tr>`,
+      )
+      .join("") ||
+    '<tr><td colspan="5" class="empty">No rules stored. Every machine uses the configured defaults.</td></tr>';
+  const defaults = response.defaults;
+  ruleDefaults.textContent =
+    `Defaults from configuration: CPU ${Number(defaults.HIGH_CPU)}% · ` +
+    `RAM ${Number(defaults.HIGH_RAM)}% · repeated error ${Number(defaults.REPEATED_ERROR)}`;
+}
+
+function renderRuleHostOptions(hosts) {
+  const selected = ruleHost.value;
+  ruleHost.innerHTML =
+    '<option value="">All machines</option>' +
+    hosts
+      .map(
+        (host) =>
+          `<option value="${escapeHtml(host.host_id)}">${escapeHtml(host.hostname ?? host.host_id)}</option>`,
+      )
+      .join("");
+  if (selected && hosts.some((host) => host.host_id === selected)) {
+    ruleHost.value = selected;
+  }
 }
 
 function renderSummary(summary) {
@@ -137,13 +199,17 @@ async function refresh() {
     const eventsPath = host
       ? `/events?limit=50&host_id=${encodeURIComponent(host)}`
       : "/events?limit=50";
-    const [summary, events, alerts, hosts] = await Promise.all([
+    const [summary, events, alerts, hosts, rules] = await Promise.all([
       getJson("/summary"),
       getJson(eventsPath),
       getJson("/alerts"),
       getJson("/hosts"),
+      getJson("/rules"),
     ]);
+    knownHosts = hosts;
     renderHostOptions(hosts);
+    renderRuleHostOptions(hosts);
+    renderRules(rules);
     renderSummary(summary);
     renderEvents(events);
     renderAlerts(alerts);
@@ -166,6 +232,30 @@ form.addEventListener("submit", (event) => {
   refresh();
 });
 document.querySelector("#refresh").addEventListener("click", refresh);
+
+function reportFailure(error) {
+  notice.textContent = error.message;
+  notice.style.borderColor = "var(--coral)";
+}
+
+ruleForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const body = {
+    rule_type: document.querySelector("#rule-type").value,
+    threshold: Number(document.querySelector("#rule-threshold").value),
+    enabled: document.querySelector("#rule-enabled").checked,
+  };
+  if (ruleHost.value) body.host_id = ruleHost.value;
+  sendJson("PUT", "/rules", body).then(refresh).catch(reportFailure);
+});
+
+rulesBody.addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-rule-type]");
+  if (!button) return;
+  const query = new URLSearchParams({ rule_type: button.dataset.ruleType });
+  if (button.dataset.hostId) query.set("host_id", button.dataset.hostId);
+  sendJson("DELETE", `/rules?${query}`).then(refresh).catch(reportFailure);
+});
 hostFilter.addEventListener("change", refresh);
 alertsList.addEventListener("click", (event) => {
   const button = event.target.closest("button[data-action]");

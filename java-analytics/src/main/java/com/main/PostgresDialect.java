@@ -62,7 +62,17 @@ public class PostgresDialect implements SqlDialect {
                 )
                 """,
                 "CREATE INDEX IF NOT EXISTS idx_notification_deliveries_alert "
-                        + "ON notification_deliveries(alert_key, id DESC)");
+                        + "ON notification_deliveries(alert_key, id DESC)",
+                """
+                CREATE TABLE IF NOT EXISTS alert_rules (
+                    rule_type TEXT NOT NULL,
+                    scope TEXT NOT NULL,
+                    threshold DOUBLE PRECISION NOT NULL,
+                    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (rule_type, scope)
+                )
+                """);
     }
 
     @Override

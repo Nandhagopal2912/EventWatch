@@ -57,3 +57,9 @@ td:nth-child(2) { max-width: 250px; overflow: hidden; text-overflow: ellipsis; }
 .panel-controls { display: flex; gap: 8px; align-items: center; }
 .panel-controls select { background: transparent; color: var(--muted); border: 1px solid var(--muted); border-radius: 6px; padding: 6px 8px; font-size: 11px; font-family: inherit; }
 .host-tag { color: var(--muted); font-size: 11px; white-space: nowrap; }
+.rules-panel { margin-top: 20px; }
+.rules-help { color: var(--muted); font-size: 12px; margin: 0 0 12px; }
+.rule-form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
+.rule-form select, .rule-form input[type="number"] { background: transparent; color: inherit; border: 1px solid var(--muted); border-radius: 6px; padding: 7px 9px; font-size: 12px; font-family: inherit; }
+.rule-form input[type="number"] { width: 110px; }
+.rule-enabled { display: flex; gap: 6px; align-items: center; color: var(--muted); font-size: 12px; }

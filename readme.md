@@ -2,7 +2,7 @@
 
 EventWatch is a self-hosted fleet monitor for a small number of machines. A lightweight Go agent runs on each host, captures application events together with that machine's CPU and RAM usage, and forwards them to a Java analytics service that keeps per-host history, evaluates per-host alert rules, and notifies an operator.
 
-The current implementation completes Phases 1–13. Future improvements are documented in `CLAUDE.md`.
+The current implementation completes Phases 1–14. Future improvements are documented in `CLAUDE.md`.
 
 ## Project Phase Status
 
@@ -21,11 +21,11 @@ The current implementation completes Phases 1–13. Future improvements are docu
 | **Phase 11** | **✅ Completed** | Scaling beyond SQLite            | Pluggable storage with a PostgreSQL backend, connection pooling, a retention policy, and a load harness. Messaging and service splits remain deliberately deferred. |
 | **Phase 12** | **✅ Completed** | Host identity                    | A stable per-agent identity on every event, per-host moving windows and alert keys, host filters, and a fleet listing.                     |
 | **Phase 13** | **✅ Completed** | Agent security                   | Loopback-by-default agent binding, mandatory authentication when exposed, TLS between agent and analytics, configurable CORS origins, and optional metrics auth. |
-| **Phase 14** | 🗓️ Planned       | Per-host alert rules             | Rules stored in a table rather than `.env`, scoped per host and per rule, with a rules API and dashboard editor. |
+| **Phase 14** | **✅ Completed** | Per-host alert rules             | Thresholds stored as rules, resolved host → fleet → `.env` default, with a rules API, an effective-rule view, and a dashboard editor. |
 | **Phase 15** | 🗓️ Planned       | Fleet operations                 | Agent staleness alerts, per-host drill-down, and agents self-reporting version and queue depth. |
 
 **Current state:** EventWatch runs a fleet. An agent on each machine reports that machine's events
-and resource usage, the analytics service keeps per-host history and raises per-host alerts, state
+and resource usage, the analytics service keeps per-host history and raises per-host alerts against thresholds you can set per machine, state
 changes reach a webhook, and the dashboard shows every machine with filters and delivery history.
 
 **Deployable on a trusted network.** The agent binds to loopback by default and refuses to bind
@@ -60,6 +60,9 @@ java-analytics/                 Maven Java analytics service
 		AlertRepository.java
 		AlertStatus.java
 		AlertTransition.java
+		AlertRule.java                 One stored rule
+		AlertRuleRepository.java       Rule storage, portable SQL
+		AlertRules.java                Host, fleet, default precedence and validation
 		QueryService.java              JSON shaping for the query API
 		NotificationService.java       Webhook dispatch, cooldown, retries
 		NotificationRecord.java
@@ -67,7 +70,7 @@ java-analytics/                 Maven Java analytics service
 		RetentionService.java          Prunes history past the window
 		Metrics.java                   Prometheus counters and gauges
 		StructuredLogger.java          One JSON object per log line
-	src/test/java/com/main/            126 tests, including a live PostgreSQL suite
+	src/test/java/com/main/            160 tests, including a live PostgreSQL suite
 dashboard/                      Local browser dashboard
 	index.html
 	app.js
@@ -117,10 +120,13 @@ docker-compose.yml              Agent, analytics, dashboard, optional PostgreSQL
 - **Observability:** both services emit one JSON object per log line, expose `GET /metrics` in
   Prometheus text format, and carry an `X-Correlation-ID` from the agent through to the analytics
   response.
+- **Alert rules:** thresholds are rules in the database, resolved per machine — that host's
+  rule, then a fleet-wide rule, then the `.env` default. `GET /rules`, `PUT /rules`,
+  `DELETE /rules`, and `GET /rules/effective?host_id=` manage and explain them.
 - **Retention:** `RETENTION_DAYS` prunes telemetry and delivery history older than the window.
   Disabled by default.
 - **Dashboard:** `dashboard/index.html` shows the fleet, summaries, recent events filtered by
-  machine, active alerts, and per-alert delivery history. It reads the API key in the browser,
+  machine, active alerts, per-alert delivery history, and an alert rules editor. It reads the API key in the browser,
   escapes all event text before rendering it, and never touches the database directly.
 - **Configuration:** `HTTP_PORT`, `COLLECTOR_PORT`, `DATABASE_PATH`, and `DATABASE_URL` set ports
   and storage, so neither service needs a source change to be deployed or containerized.
@@ -169,6 +175,7 @@ If the analytics service is temporarily unavailable, the agent retries and write
 | **Bounded processing**      | Limits Java workers and queued requests.                                                          | Applies backpressure and prevents traffic spikes from exhausting memory.      |
 | **Moving-window analytics** | Evaluates the latest five events *per machine* for CPU and RAM trends.                            | Detects sustained pressure without averaging unrelated machines together.     |
 | **Alert engine**            | Creates and updates `HIGH_CPU`, `HIGH_RAM`, and `REPEATED_ERROR` alerts, keyed per host.           | Turns raw telemetry into incidents an operator can act on machine by machine. |
+| **Per-host alert rules**    | Stores thresholds per machine and fleet-wide, over the `.env` defaults.                            | A build box at 90% CPU is healthy; a database at 90% is not.                  |
 | **Alert lifecycle**         | Supports `OPEN`, `ACKNOWLEDGED`, and `RESOLVED` states.                                           | Shows whether an issue is new, being handled, or no longer active.            |
 | **Webhook notifications**   | Delivers alert state changes to an external endpoint and retries transient failures.              | Reaches an operator who is not watching the dashboard.                        |
 | **Delivery audit trail**    | Records every attempt with status, HTTP code, and attempt number.                                 | Makes a missed notification diagnosable instead of invisible.                 |
@@ -302,6 +309,41 @@ An event from an agent older than Phase 12 carries no identity and is attributed
 its own machine only. To accept events from elsewhere set `COLLECTOR_BIND` and a `CAPTURE_API_KEY`
 — the agent refuses to start on a non-loopback address without one, because an open ingress lets
 anyone on that network forge telemetry for the host and trigger its alerts.
+
+## Alert rules
+
+Thresholds are rules stored in the database rather than three values in `.env`. For each rule
+type — `HIGH_CPU`, `HIGH_RAM`, `REPEATED_ERROR` — the most specific rule wins:
+
+1. a rule for that machine,
+2. a fleet-wide rule,
+3. the default from `.env` (`CPU_ALERT_THRESHOLD`, `RAM_ALERT_THRESHOLD`, `REPEATED_ERROR_THRESHOLD`).
+
+With no rules stored, every machine behaves exactly as it did before rules existed. Manage rules
+from the dashboard's **Alert rules** panel or through the API:
+
+```powershell
+# The build box may run hot; every other machine keeps the default.
+curl.exe -X PUT "http://localhost:8080/rules" -H "X-EventWatch-Key: local-secret" `
+  -H "Content-Type: application/json" -d '{"rule_type":"HIGH_CPU","host_id":"build-01","threshold":95}'
+
+# See what applies to a machine and which tier it came from: host, fleet, or default.
+curl.exe "http://localhost:8080/rules/effective?host_id=build-01" -H "X-EventWatch-Key: local-secret"
+
+# Remove the override; the machine falls back to the fleet rule or the default.
+curl.exe -X DELETE "http://localhost:8080/rules?rule_type=HIGH_CPU&host_id=build-01" -H "X-EventWatch-Key: local-secret"
+```
+
+Omit `host_id` for a fleet-wide rule. CPU and RAM thresholds are percentages from 0 to 100. A
+`REPEATED_ERROR` threshold is a whole number from 1 to 5, because the rule only sees each machine's
+last five events — a larger value could never fire, so it is refused rather than stored.
+
+Set `"enabled": false` to switch a rule off for its scope. A disabled rule on one machine still
+takes precedence over a fleet-wide rule, and an alert it raised resolves on that machine's next
+event. Every change applies from each machine's next event.
+
+Repeated-error alerts are not resolved automatically — an error does not "recover" the way CPU
+load does — so resolve them from the dashboard or the API once handled.
 
 ## Securing a deployment
 
@@ -444,7 +486,8 @@ The Java suite covers event validation, query-parameter parsing, persistence and
 both backends, the per-host alert rules and lifecycle, webhook delivery against a local sink, the
 engine start/stop lifecycle, retention, the metric and log formats, and an end-to-end pass that
 drives the real HTTP server on an ephemeral port with a temporary database — including restart
-recovery and two machines staying independent. The Go suite covers retry classification, the capture
+recovery, two machines staying independent, and per-host rules changing which machines
+alert. The Go suite covers retry classification, the capture
 handler, durable-queue outcomes, correlation IDs, host identity and its persistence across restarts,
 and metric rendering, using an `httptest` stand-in for the analytics service.
 

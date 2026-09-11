@@ -41,6 +41,24 @@
         <div id="alerts-list" class="alerts-list"></div>
       </article>
     </section>
+
+    <section class="panel rules-panel">
+      <div class="panel-heading"><div><p class="eyebrow">ALERT RULES</p><h2>Thresholds</h2></div></div>
+      <p class="rules-help">The most specific rule wins: a machine's own rule, then a fleet-wide rule, then the default from configuration. Changes apply to each machine's next event.</p>
+      <form id="rule-form" class="rule-form" autocomplete="off">
+        <select id="rule-type" aria-label="Rule type">
+          <option value="HIGH_CPU">High CPU (%)</option>
+          <option value="HIGH_RAM">High RAM (%)</option>
+          <option value="REPEATED_ERROR">Repeated error (count in last 5 events)</option>
+        </select>
+        <select id="rule-host" aria-label="Applies to"><option value="">All machines</option></select>
+        <input id="rule-threshold" type="number" step="any" min="0" max="100" placeholder="Threshold" required aria-label="Threshold">
+        <label class="rule-enabled"><input id="rule-enabled" type="checkbox" checked> Enabled</label>
+        <button type="submit">Save rule</button>
+      </form>
+      <div class="table-wrap"><table><thead><tr><th>Rule</th><th>Applies to</th><th>Threshold</th><th>State</th><th></th></tr></thead><tbody id="rules-body"></tbody></table></div>
+      <p id="rule-defaults" class="empty"></p>
+    </section>
   </main>
   <script src="app.js"></script>
 </body>

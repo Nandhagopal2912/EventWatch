@@ -56,6 +56,7 @@ public class AnalyticsEngine {
     private static ScheduledExecutorService runningMaintenance;
     private static AlertRepository alertRepository;
     private static AlertEngine alertEngine;
+    private static AlertRules alertRules;
     private static QueryService queryService;
     private static EventRepository eventRepository;
     private static NotificationRepository notificationRepository;
@@ -183,13 +184,18 @@ public class AnalyticsEngine {
                     configuration.notificationMaxAttempts(),
                     configuration.notificationRetryDelayMillis(),
                     configuration.notificationReminderSeconds());
+            // The .env thresholds become the fallback tier beneath stored rules.
+            alertRules = new AlertRules(
+                    new AlertRuleRepository(database.connections()),
+                    configuration.cpuThreshold(),
+                    configuration.ramThreshold(),
+                    configuration.repeatedErrorThreshold(),
+                    MOVING_AVERAGE_WINDOW);
             alertEngine = new AlertEngine(
                     alertRepository,
                     notificationService,
                     MOVING_AVERAGE_WINDOW,
-                    configuration.cpuThreshold(),
-                    configuration.ramThreshold(),
-                    configuration.repeatedErrorThreshold());
+                    alertRules);
             queryService = new QueryService(
                     eventRepository, alertRepository, OBJECT_MAPPER, MOVING_AVERAGE_WINDOW);
             retentionService = new RetentionService(
@@ -438,6 +444,111 @@ public class AnalyticsEngine {
             }
         });
 
+        server.createContext("/rules", exchange -> {
+            if (handleCorsPreflight(exchange)) {
+                return;
+            }
+            if (!isValidApiKey(exchange.getRequestHeaders().getFirst("X-EventWatch-Key"))) {
+                sendResponse(exchange, 401, "Unauthorized");
+                return;
+            }
+            String method = exchange.getRequestMethod().toUpperCase(Locale.ROOT);
+            String path = exchange.getRequestURI().getPath();
+            boolean effectiveRoute = "/rules/effective".equals(path);
+            if (!effectiveRoute && !"/rules".equals(path)) {
+                sendResponse(exchange, 404, "Rule route not found");
+                return;
+            }
+            try {
+                Map<String, String> parameters = queryParameters(exchange.getRequestURI().getRawQuery());
+                if (effectiveRoute) {
+                    if (!"GET".equals(method)) {
+                        sendResponse(exchange, 405, "Method not allowed");
+                        return;
+                    }
+                    String hostId = parameters.get("host_id");
+                    if (hostId == null || hostId.isBlank()) {
+                        sendResponse(exchange, 400, "host_id is required");
+                        return;
+                    }
+                    sendJsonResponse(exchange, 200,
+                            queryService.effectiveRules(hostId, alertRules.effectiveFor(hostId)).toString());
+                    return;
+                }
+                switch (method) {
+                    case "GET" -> sendJsonResponse(exchange, 200,
+                            queryService.rules(alertRules.all(), alertRules.defaults()).toString());
+                    case "PUT" -> {
+                        String contentType = exchange.getRequestHeaders().getFirst("Content-Type");
+                        if (contentType == null
+                                || !contentType.toLowerCase(Locale.ROOT).startsWith("application/json")) {
+                            sendResponse(exchange, 415, "Content-Type must be application/json");
+                            return;
+                        }
+                        byte[] bodyBytes = exchange.getRequestBody().readNBytes(MAX_REQUEST_BYTES + 1);
+                        if (bodyBytes.length > MAX_REQUEST_BYTES) {
+                            sendResponse(exchange, 413, "Request body too large");
+                            return;
+                        }
+                        JsonNode json;
+                        try {
+                            json = OBJECT_MAPPER.readTree(new String(bodyBytes, StandardCharsets.UTF_8));
+                        } catch (JsonProcessingException exception) {
+                            sendResponse(exchange, 400, "Invalid JSON");
+                            return;
+                        }
+                        if (json == null || !json.isObject()) {
+                            sendResponse(exchange, 400, "JSON object required");
+                            return;
+                        }
+                        JsonNode hostNode = json.path("host_id");
+                        if (!hostNode.isMissingNode() && !hostNode.isNull() && !hostNode.isTextual()) {
+                            sendResponse(exchange, 400, "host_id must be a text value");
+                            return;
+                        }
+                        if (!json.path("threshold").isNumber()) {
+                            sendResponse(exchange, 400, "threshold must be a number");
+                            return;
+                        }
+                        JsonNode enabledNode = json.path("enabled");
+                        if (!enabledNode.isMissingNode() && !enabledNode.isBoolean()) {
+                            sendResponse(exchange, 400, "enabled must be true or false");
+                            return;
+                        }
+                        AlertRule saved = alertRules.save(
+                                optionalUpper(textOrNull(json, "rule_type")),
+                                hostNode.isTextual() ? hostNode.asText() : null,
+                                json.path("threshold").asDouble(),
+                                enabledNode.isMissingNode() || enabledNode.asBoolean());
+                        StructuredLogger.info("alert rule saved", StructuredLogger.fields(
+                                "rule_type", saved.ruleType(), "scope", saved.scope(),
+                                "threshold", saved.threshold(), "enabled", saved.enabled()));
+                        sendJsonResponse(exchange, 200, queryService.ruleJson(saved).toString());
+                    }
+                    case "DELETE" -> {
+                        String hostId = parameters.get("host_id");
+                        boolean removed = alertRules.delete(
+                                optionalUpper(parameters.get("rule_type")),
+                                hostId == null || hostId.isEmpty() ? null : hostId);
+                        if (removed) {
+                            sendResponse(exchange, 200, "Rule removed");
+                        } else {
+                            sendResponse(exchange, 404, "No such rule");
+                        }
+                    }
+                    default -> {
+                        exchange.getResponseHeaders().set("Allow", "GET, PUT, DELETE");
+                        sendResponse(exchange, 405, "Method not allowed");
+                    }
+                }
+            } catch (IllegalArgumentException exception) {
+                sendResponse(exchange, 400, exception.getMessage());
+            } catch (SQLException exception) {
+                METRICS.recordDatabaseFailure();
+                sendResponse(exchange, 503, "Rule storage unavailable");
+            }
+        });
+
         server.createContext("/hosts", exchange -> {
             if (handleCorsPreflight(exchange)) {
                 return;
@@ -483,7 +594,7 @@ public class AnalyticsEngine {
         server.createContext("/alerts/", exchange -> {
             if ("OPTIONS".equalsIgnoreCase(exchange.getRequestMethod())) {
                 addCorsHeaders(exchange);
-                exchange.getResponseHeaders().set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+                exchange.getResponseHeaders().set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
                 exchange.sendResponseHeaders(204, -1);
                 return;
             }
@@ -848,7 +959,7 @@ public class AnalyticsEngine {
             return false;
         }
         addCorsHeaders(exchange);
-        exchange.getResponseHeaders().set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        exchange.getResponseHeaders().set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
         exchange.sendResponseHeaders(204, -1);
         return true;
     }
