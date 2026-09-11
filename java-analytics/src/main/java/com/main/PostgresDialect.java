@@ -25,6 +25,8 @@ public class PostgresDialect implements SqlDialect {
                     event_timestamp TEXT NOT NULL,
                     host_id TEXT,
                     hostname TEXT,
+                    agent_version TEXT,
+                    queue_depth INTEGER,
                     cpu_usage DOUBLE PRECISION NOT NULL,
                     ram_usage DOUBLE PRECISION NOT NULL,
                     created_at TEXT NOT NULL DEFAULT (now() AT TIME ZONE 'utc')::text
@@ -81,14 +83,17 @@ public class PostgresDialect implements SqlDialect {
         statement.executeUpdate("ALTER TABLE telemetry_events ADD COLUMN IF NOT EXISTS host_id TEXT");
         statement.executeUpdate("ALTER TABLE telemetry_events ADD COLUMN IF NOT EXISTS hostname TEXT");
         statement.executeUpdate("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS host_id TEXT");
+        statement.executeUpdate("ALTER TABLE telemetry_events ADD COLUMN IF NOT EXISTS agent_version TEXT");
+        statement.executeUpdate("ALTER TABLE telemetry_events ADD COLUMN IF NOT EXISTS queue_depth INTEGER");
     }
 
     @Override
     public String insertEventIgnoringDuplicates() {
         return "INSERT INTO telemetry_events "
-                + "(event_id, level, message, event_timestamp, host_id, hostname, cpu_usage, ram_usage) "
+                + "(event_id, level, message, event_timestamp, host_id, hostname, agent_version, queue_depth, "
+                + "cpu_usage, ram_usage) "
                 // The arbiter is a partial index, so PostgreSQL needs its predicate repeated here.
-                + "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 + "ON CONFLICT (event_id) WHERE event_id IS NOT NULL DO NOTHING";
     }
 }

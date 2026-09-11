@@ -52,6 +52,7 @@ public class AnalyticsEngine {
     private static int maxRequestsPerMinute = 100;
     private static int shutdownGraceSeconds = 5;
     private static RetentionService retentionService;
+    private static AgentSilenceMonitor agentSilenceMonitor;
     private static ThreadPoolExecutor runningExecutor;
     private static ScheduledExecutorService runningMaintenance;
     private static AlertRepository alertRepository;
@@ -102,6 +103,8 @@ public class AnalyticsEngine {
         String eventId;
         String hostId;
         String hostname;
+        String agentVersion;
+        Integer queueDepth;
         Instant timestamp;
         double cpuUsage;
         double ramUsage;
@@ -113,6 +116,13 @@ public class AnalyticsEngine {
 
         LogEntry(String eventId, String level, String message, Instant timestamp,
                 String hostId, String hostname, double cpuUsage, double ramUsage) {
+            this(eventId, level, message, timestamp, hostId, hostname, null, null, cpuUsage, ramUsage);
+        }
+
+        LogEntry(String eventId, String level, String message, Instant timestamp, String hostId,
+                String hostname, String agentVersion, Integer queueDepth, double cpuUsage, double ramUsage) {
+            this.agentVersion = agentVersion;
+            this.queueDepth = queueDepth;
             this.eventId = eventId;
             this.level = level;
             this.message = message;
@@ -190,6 +200,7 @@ public class AnalyticsEngine {
                     configuration.cpuThreshold(),
                     configuration.ramThreshold(),
                     configuration.repeatedErrorThreshold(),
+                    configuration.agentSilenceMinutes(),
                     MOVING_AVERAGE_WINDOW);
             alertEngine = new AlertEngine(
                     alertRepository,
@@ -200,6 +211,9 @@ public class AnalyticsEngine {
                     eventRepository, alertRepository, OBJECT_MAPPER, MOVING_AVERAGE_WINDOW);
             retentionService = new RetentionService(
                     database.connections(), METRICS, configuration.retentionDays());
+            agentSilenceMonitor = new AgentSilenceMonitor(
+                    eventRepository, alertRepository, alertRules, notificationService, METRICS,
+                    MAX_HOSTS_LISTED, java.time.Duration.ofHours(configuration.agentSilenceForgetHours()));
         } catch (SQLException | RuntimeException exception) {
             String backend = database.dialect().name();
             releaseDatabase();
@@ -296,10 +310,13 @@ public class AnalyticsEngine {
                     double ramUsage = json.path("ram_usage").asDouble();
                     String hostId = textOrNull(json, "host_id");
                     String hostname = textOrNull(json, "hostname");
+                    String agentVersion = textOrNull(json, "agent_version");
+                    JsonNode depthNode = json.path("queue_depth");
+                    Integer queueDepth = depthNode.isIntegralNumber() ? depthNode.asInt() : null;
 
                     boolean stored;
                     LogEntry event = new LogEntry(eventId, level, msg, timestamp,
-                            hostId, hostname, cpuUsage, ramUsage);
+                            hostId, hostname, agentVersion, queueDepth, cpuUsage, ramUsage);
                     try {
                         stored = storeEvent(event);
                         alertEngine.evaluate(recentEventsSnapshot(event.hostId));
@@ -561,10 +578,34 @@ public class AnalyticsEngine {
                 sendResponse(exchange, 401, "Unauthorized");
                 return;
             }
+            String path = exchange.getRequestURI().getPath();
             try {
+                Instant now = Instant.now();
+                if (path.startsWith("/hosts/")) {
+                    String hostId = java.net.URLDecoder.decode(
+                            path.substring("/hosts/".length()), StandardCharsets.UTF_8);
+                    EventRepository.HostSummary host = hostId.isBlank() ? null : eventRepository.host(hostId);
+                    if (host == null) {
+                        sendResponse(exchange, 404, "Host not found");
+                        return;
+                    }
+                    // Few enough alerts to filter here rather than widen the shared alert query.
+                    List<AlertRecord> hostAlerts = new ArrayList<>();
+                    for (AlertRecord alert : alertRepository.findActive()) {
+                        if (hostId.equals(alert.getHostId())) {
+                            hostAlerts.add(alert);
+                        }
+                    }
+                    sendJsonResponse(exchange, 200, queryService.hostDetail(
+                            host, alertRules, now,
+                            eventRepository.find(null, hostId, null, null, MOVING_AVERAGE_WINDOW, 0),
+                            eventRepository.levelCounts(hostId),
+                            hostAlerts).toString());
+                    return;
+                }
                 Map<String, String> parameters = queryParameters(exchange.getRequestURI().getRawQuery());
                 int limit = boundedInteger(parameters.get("limit"), MAX_HOSTS_LISTED, QueryService.MAX_LIMIT);
-                sendJsonResponse(exchange, 200, queryService.hosts(limit).toString());
+                sendJsonResponse(exchange, 200, queryService.hosts(limit, alertRules, now).toString());
             } catch (IllegalArgumentException exception) {
                 sendResponse(exchange, 400, exception.getMessage());
             } catch (SQLException exception) {
@@ -697,6 +738,11 @@ public class AnalyticsEngine {
                     "sweep_minutes", sweepMinutes));
         }
 
+        // Silence is the one condition no event can reveal, so it runs on the timer.
+        long silenceSweepSeconds = configuration.agentSilenceSweepSeconds();
+        maintenance.scheduleWithFixedDelay(agentSilenceMonitor::sweep,
+                silenceSweepSeconds, silenceSweepSeconds, TimeUnit.SECONDS);
+
         runningExecutor = requestExecutor;
         runningMaintenance = maintenance;
 
@@ -746,6 +792,11 @@ public class AnalyticsEngine {
         return database;
     }
 
+    /** Visible for tests that drive a silence sweep without waiting for the timer. */
+    static AgentSilenceMonitor agentSilenceMonitor() {
+        return agentSilenceMonitor;
+    }
+
     /** Visible for tests that assert work in flight keeps its database until it finishes. */
     static ThreadPoolExecutor requestExecutor() {
         return runningExecutor;
@@ -793,7 +844,18 @@ public class AnalyticsEngine {
         if (identityError == null) {
             identityError = validateIdentity(json, "hostname");
         }
-        return identityError;
+        if (identityError == null) {
+            identityError = validateIdentity(json, "agent_version");
+        }
+        if (identityError != null) {
+            return identityError;
+        }
+        JsonNode queueDepth = json.path("queue_depth");
+        if (!queueDepth.isMissingNode() && !queueDepth.isNull()
+                && (!queueDepth.isIntegralNumber() || queueDepth.asLong() < 0)) {
+            return "queue_depth must be a whole number of zero or more";
+        }
+        return null;
     }
 
     private static String validateIdentity(JsonNode json, String fieldName) {

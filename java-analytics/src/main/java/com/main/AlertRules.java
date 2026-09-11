@@ -18,7 +18,11 @@ public class AlertRules {
     public static final String HIGH_CPU = "HIGH_CPU";
     public static final String HIGH_RAM = "HIGH_RAM";
     public static final String REPEATED_ERROR = "REPEATED_ERROR";
-    public static final List<String> RULE_TYPES = List.of(HIGH_CPU, HIGH_RAM, REPEATED_ERROR);
+    public static final String AGENT_SILENT = "AGENT_SILENT";
+    public static final List<String> RULE_TYPES =
+            List.of(HIGH_CPU, HIGH_RAM, REPEATED_ERROR, AGENT_SILENT);
+    /** A week: beyond this a silence threshold is a decommissioning policy, not an alert. */
+    private static final int MAX_SILENCE_MINUTES = 10_080;
     private static final int MAX_HOST_ID_LENGTH = 128;
 
     /** Where an effective rule came from, most specific first. */
@@ -36,13 +40,14 @@ public class AlertRules {
     private volatile Map<String, AlertRule> cache = Map.of();
 
     public AlertRules(AlertRuleRepository repository, double cpuThreshold, double ramThreshold,
-            int repeatedErrorThreshold, int movingWindowSize) throws SQLException {
+            int repeatedErrorThreshold, int agentSilenceMinutes, int movingWindowSize) throws SQLException {
         this.repository = repository;
         this.movingWindowSize = movingWindowSize;
         Map<String, Double> configured = new LinkedHashMap<>();
         configured.put(HIGH_CPU, cpuThreshold);
         configured.put(HIGH_RAM, ramThreshold);
         configured.put(REPEATED_ERROR, (double) repeatedErrorThreshold);
+        configured.put(AGENT_SILENT, (double) agentSilenceMinutes);
         this.defaults = Map.copyOf(configured);
         if (repeatedErrorThreshold > movingWindowSize) {
             StructuredLogger.warn("REPEATED_ERROR_THRESHOLD can never fire", StructuredLogger.fields(
@@ -53,9 +58,10 @@ public class AlertRules {
 
     /** Rules backed by configuration alone, for callers with no database. */
     public static AlertRules defaultsOnly(double cpuThreshold, double ramThreshold,
-            int repeatedErrorThreshold, int movingWindowSize) {
+            int repeatedErrorThreshold, int agentSilenceMinutes, int movingWindowSize) {
         try {
-            return new AlertRules(null, cpuThreshold, ramThreshold, repeatedErrorThreshold, movingWindowSize);
+            return new AlertRules(null, cpuThreshold, ramThreshold, repeatedErrorThreshold,
+                    agentSilenceMinutes, movingWindowSize);
         } catch (SQLException exception) {
             throw new IllegalStateException("a rule set without a repository cannot fail to load", exception);
         }
@@ -127,7 +133,12 @@ public class AlertRules {
         if (!Double.isFinite(threshold)) {
             return "threshold must be a finite number";
         }
-        if (REPEATED_ERROR.equals(ruleType)) {
+        if (AGENT_SILENT.equals(ruleType)) {
+            if (threshold != Math.rint(threshold) || threshold < 1 || threshold > MAX_SILENCE_MINUTES) {
+                return "an AGENT_SILENT threshold must be a whole number of minutes from 1 to "
+                        + MAX_SILENCE_MINUTES;
+            }
+        } else if (REPEATED_ERROR.equals(ruleType)) {
             if (threshold != Math.rint(threshold) || threshold < 1 || threshold > movingWindowSize) {
                 return "a REPEATED_ERROR threshold must be a whole number from 1 to " + movingWindowSize
                         + ": the rule sees only the last " + movingWindowSize
@@ -141,7 +152,7 @@ public class AlertRules {
 
     private String validateScope(String ruleType, String hostId) {
         if (ruleType == null || !RULE_TYPES.contains(ruleType)) {
-            return "rule_type must be HIGH_CPU, HIGH_RAM, or REPEATED_ERROR";
+            return "rule_type must be one of HIGH_CPU, HIGH_RAM, REPEATED_ERROR, AGENT_SILENT";
         }
         if (hostId == null) {
             return null;

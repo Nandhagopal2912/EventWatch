@@ -214,6 +214,32 @@ func TestCaptureDeliversAndReportsSuccess(t *testing.T) {
 	}
 }
 
+func TestCapturedEventsCarryTheAgentVersionAndQueueDepth(t *testing.T) {
+	stub := newBackendStub(t)
+	withCollector(t, stub)
+	// One event already waiting, so the reported depth is not trivially zero.
+	if err := enqueueEvent([]byte(`{"event_id":"pending"}`), "trace"); err != nil {
+		t.Fatalf("unable to seed the queue: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	logHandler(recorder, httptest.NewRequest(http.MethodGet, "/capture?msg=versioned", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	var payload LogPayload
+	if err := json.Unmarshal([]byte(stub.header(stub.lastBody)), &payload); err != nil {
+		t.Fatalf("backend received invalid JSON: %v", err)
+	}
+	if payload.AgentVersion != agentVersion {
+		t.Errorf("every event should name the agent version, got %q", payload.AgentVersion)
+	}
+	if payload.QueueDepth != 1 {
+		t.Errorf("expected the pending backlog to be reported, got %d", payload.QueueDepth)
+	}
+}
+
 func TestCaptureAppliesDefaults(t *testing.T) {
 	stub := newBackendStub(t)
 	withCollector(t, stub)
@@ -419,12 +445,19 @@ func TestHealthEndpointReportsService(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", recorder.Code)
 	}
-	var body map[string]string
+	var body map[string]any
 	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
 		t.Fatalf("health must answer with JSON: %v", err)
 	}
 	if body["status"] != "ok" || body["service"] != "go-collector" {
 		t.Errorf("unexpected health body: %v", body)
+	}
+	// An operator checks the agent version and its backlog from here.
+	if body["version"] != agentVersion {
+		t.Errorf("expected the agent version, got %v", body["version"])
+	}
+	if _, present := body["queue_depth"].(float64); !present {
+		t.Errorf("expected a numeric queue depth, got %v", body["queue_depth"])
 	}
 }
 

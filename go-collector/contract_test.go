@@ -33,6 +33,8 @@ func TestCollectorPayloadMatchesTheSharedContract(t *testing.T) {
 		CorrelationID: "2b1f7c90-4d5e-4a11-9d3c-71b0f0a9c8e2",
 		HostID:        "9c1f4b2e-7a35-4c88-b0d1-3e6a9f2c5d47",
 		Hostname:      "web-01",
+		AgentVersion:  "0.15.0",
+		QueueDepth:    0,
 		Level:         "ERROR",
 		Messages:      "High CPU Saturation Alert",
 		Time:          "2026-09-04T18:46:00Z",
@@ -78,7 +80,8 @@ func TestCorrelationIdIsTheOnlyOptionalField(t *testing.T) {
 		t.Error("an empty correlation id should be omitted, not sent as an empty string")
 	}
 	for _, required := range []string{
-		"event_id", "host_id", "hostname", "level", "msg", "timestamp", "cpu_usage", "ram_usage"} {
+		"event_id", "host_id", "hostname", "agent_version", "queue_depth",
+		"level", "msg", "timestamp", "cpu_usage", "ram_usage"} {
 		if _, present := produced[required]; !present {
 			t.Errorf("required contract field %q was omitted", required)
 		}

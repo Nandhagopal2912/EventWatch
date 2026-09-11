@@ -9,6 +9,8 @@ const ruleForm = document.querySelector("#rule-form");
 const ruleHost = document.querySelector("#rule-host");
 const rulesBody = document.querySelector("#rules-body");
 const ruleDefaults = document.querySelector("#rule-defaults");
+const fleetBody = document.querySelector("#fleet-body");
+const hostDetail = document.querySelector("#host-detail");
 const ruleLabels = {
   HIGH_CPU: "High CPU",
   HIGH_RAM: "High RAM",
@@ -98,6 +100,74 @@ function renderRuleHostOptions(hosts) {
   if (selected && hosts.some((host) => host.host_id === selected)) {
     ruleHost.value = selected;
   }
+}
+
+function describeSilence(seconds) {
+  const total = Number(seconds) || 0;
+  if (total < 60) return `${total}s ago`;
+  if (total < 3600) return `${Math.floor(total / 60)}m ago`;
+  if (total < 86400) return `${Math.floor(total / 3600)}h ago`;
+  return `${Math.floor(total / 86400)}d ago`;
+}
+
+function renderFleet(hosts) {
+  fleetBody.innerHTML =
+    hosts
+      .map(
+        (host) => `
+    <tr><td>${escapeHtml(host.hostname ?? host.host_id)}</td>
+    <td><span class="badge ${host.status === "silent" ? "badge-silent" : ""}">${escapeHtml(host.status)}</span></td>
+    <td>${escapeHtml(describeSilence(host.silent_seconds))}</td>
+    <td>${Number(host.event_count)}</td>
+    <td class="host-tag">${escapeHtml(host.agent_version ?? "unknown")}</td>
+    <td>${host.queue_depth === null || host.queue_depth === undefined ? "--" : Number(host.queue_depth)}</td>
+    <td><button class="quiet" type="button" data-host="${escapeHtml(host.host_id)}">Details</button></td></tr>`,
+      )
+      .join("") ||
+    '<tr><td colspan="7" class="empty">No machines have reported yet.</td></tr>';
+}
+
+async function showHostDetail(hostId) {
+  // Toggle: a second click on the same machine closes the panel.
+  if (hostDetail.dataset.host === hostId) {
+    hostDetail.innerHTML = "";
+    hostDetail.dataset.host = "";
+    return;
+  }
+  const host = await getJson(`/hosts/${encodeURIComponent(hostId)}`);
+  const levels = Object.entries(host.levels ?? {})
+    .map(([level, count]) => `${escapeHtml(level)} ${Number(count)}`)
+    .join(" · ");
+  const alerts = host.alerts.length
+    ? host.alerts
+        .map(
+          (alert) =>
+            `<li>${escapeHtml(alert.alert_type)} · ${escapeHtml(alert.status)} — ${escapeHtml(alert.message)}</li>`,
+        )
+        .join("")
+    : "<li>None active</li>";
+  const rules = host.rules
+    .map(
+      (rule) =>
+        `<li>${escapeHtml(rule.rule_type)} ${Number(rule.threshold)}` +
+        `${rule.enabled ? "" : " (disabled)"} · from ${escapeHtml(rule.source)}</li>`,
+    )
+    .join("");
+
+  hostDetail.dataset.host = hostId;
+  hostDetail.innerHTML = `
+    <h3>${escapeHtml(host.hostname ?? host.host_id)}</h3>
+    <p class="alert-meta">${escapeHtml(host.host_id)} · agent ${escapeHtml(host.agent_version ?? "unknown")} ·
+    queue ${host.queue_depth ?? "--"} · ${Number(host.event_count)} events ·
+    first seen ${escapeHtml(new Date(host.first_seen).toLocaleString())} ·
+    last seen ${escapeHtml(new Date(host.last_seen).toLocaleString())}</p>
+    <p>Last ${Number(host.averages.window)} events: CPU ${Number(host.averages.cpu).toFixed(1)}% ·
+    RAM ${Number(host.averages.ram).toFixed(1)}%</p>
+    <p class="alert-meta">${levels || "No events"}</p>
+    <div class="host-detail-columns">
+      <div><strong>Active alerts</strong><ul>${alerts}</ul></div>
+      <div><strong>Effective rules</strong><ul>${rules}</ul></div>
+    </div>`;
 }
 
 function renderSummary(summary) {
@@ -210,6 +280,7 @@ async function refresh() {
     renderHostOptions(hosts);
     renderRuleHostOptions(hosts);
     renderRules(rules);
+    renderFleet(hosts);
     renderSummary(summary);
     renderEvents(events);
     renderAlerts(alerts);
@@ -247,6 +318,12 @@ ruleForm.addEventListener("submit", (event) => {
   };
   if (ruleHost.value) body.host_id = ruleHost.value;
   sendJson("PUT", "/rules", body).then(refresh).catch(reportFailure);
+});
+
+fleetBody.addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-host]");
+  if (!button) return;
+  showHostDetail(button.dataset.host).catch(reportFailure);
 });
 
 rulesBody.addEventListener("click", (event) => {

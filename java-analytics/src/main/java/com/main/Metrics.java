@@ -13,6 +13,7 @@ public final class Metrics {
     private final AtomicLong eventsReceived = new AtomicLong();
     private final AtomicLong eventsDuplicate = new AtomicLong();
     private final AtomicLong databaseFailures = new AtomicLong();
+    private final AtomicLong silentAgents = new AtomicLong();
     private final AtomicLong processingObserved = new AtomicLong();
     private final DoubleAdder processingSeconds = new DoubleAdder();
     private final Map<String, AtomicLong> eventsRejected = new ConcurrentHashMap<>();
@@ -30,6 +31,11 @@ public final class Metrics {
     /** reason is a fixed slug such as validation, unauthorized, or rate_limited. */
     public void recordEventRejected(String reason) {
         eventsRejected.computeIfAbsent(reason, key -> new AtomicLong()).incrementAndGet();
+    }
+
+    /** Machines currently past their silence threshold, refreshed by each sweep. */
+    public void recordSilentAgents(long count) {
+        silentAgents.set(count);
     }
 
     public void recordDatabaseFailure() {
@@ -67,6 +73,8 @@ public final class Metrics {
 
         gauge(builder, "eventwatch_alerts_active",
                 "Alerts currently OPEN or ACKNOWLEDGED.", activeAlerts);
+        gauge(builder, "eventwatch_agents_silent",
+                "Machines that have stopped reporting within the forget window.", silentAgents.get());
         gauge(builder, "eventwatch_events_stored",
                 "Telemetry rows currently held in SQLite.", storedEvents);
 

@@ -63,3 +63,9 @@ td:nth-child(2) { max-width: 250px; overflow: hidden; text-overflow: ellipsis; }
 .rule-form select, .rule-form input[type="number"] { background: transparent; color: inherit; border: 1px solid var(--muted); border-radius: 6px; padding: 7px 9px; font-size: 12px; font-family: inherit; }
 .rule-form input[type="number"] { width: 110px; }
 .rule-enabled { display: flex; gap: 6px; align-items: center; color: var(--muted); font-size: 12px; }
+.fleet-panel { margin-top: 20px; }
+.badge-silent { background: var(--coral); color: #fff; }
+.host-detail:not(:empty) { margin-top: 14px; border-top: 1px solid var(--muted); padding-top: 12px; }
+.host-detail h3 { margin: 0 0 4px; font-size: 16px; }
+.host-detail ul { margin: 4px 0 0; padding-left: 16px; color: var(--muted); font-size: 12px; line-height: 1.6; }
+.host-detail-columns { display: flex; gap: 24px; flex-wrap: wrap; margin-top: 8px; }

@@ -46,6 +46,9 @@ public class AlertEngine {
                 .average()
                 .orElse(0.0);
 
+        // This machine just reported, so it is no longer silent.
+        notify(repository.resolve(alertKey(AgentSilenceMonitor.ALERT_RULE, hostId), now));
+
         evaluateThreshold(alertKey("cpu-high", hostId), rules.effective(AlertRules.HIGH_CPU, hostId),
                 hostId, "CPU", averageCpu, now);
         evaluateThreshold(alertKey("ram-high", hostId), rules.effective(AlertRules.HIGH_RAM, hostId),

@@ -132,11 +132,14 @@ func TestHealthReportsTheAgentIdentity(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	healthHandler(recorder, httptest.NewRequest(http.MethodGet, "/health", nil))
 
-	var body map[string]string
+	var body map[string]any
 	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
 		t.Fatalf("health must answer with JSON: %v", err)
 	}
 	if body["host_id"] != "health-host" || body["hostname"] != "health-name" {
 		t.Errorf("health should identify the agent, got %v", body)
+	}
+	if body["version"] != agentVersion {
+		t.Errorf("health should report the agent version, got %v", body["version"])
 	}
 }

@@ -17,7 +17,7 @@ downstream — per-host windows, per-host alert keys, the fleet listing — foll
 
 | Service | Language | Port | Role |
 | --- | --- | --- | --- |
-| `go-collector/` | Go 1.27, stdlib + gopsutil + godotenv | 8082 | One per machine: stable identity, host CPU/RAM, durable retry queue |
+| `go-collector/` | Go 1.27, stdlib + gopsutil + godotenv | 8082 | One per machine: stable identity, version, host CPU/RAM, durable retry queue |
 | `java-analytics/` | Java 17, Maven, `com.sun.net.httpserver` + Jackson + sqlite-jdbc/PostgreSQL + HikariCP | 8080 | Validates, persists, evaluates per-host rules, serves query and rules API |
 | `dashboard/` | Static HTML/CSS/JS, no build step | 3000 (any static server) | Reads the Java query API only; never touches SQLite |
 
@@ -112,6 +112,7 @@ java-analytics/src/main/java/com/main/
   AlertRule.java                One stored rule; scope '*' means fleet-wide
   AlertRuleRepository.java      alert_rules table, portable upsert on (rule_type, scope)
   AlertRules.java               Host → fleet → default precedence, validation, cache
+  AgentSilenceMonitor.java      Raises agent-silent@{host}; AlertEngine resolves it
 
 java-analytics/src/test/java/com/main/
   AnalyticsEngineIntegrationTest.java   Real server on an ephemeral port, temp database
@@ -128,6 +129,8 @@ java-analytics/src/test/java/com/main/
   AlertRulesTest.java           Rule precedence, validation, persistence
   RulesApiTest.java             The rules API changing which machines alert, end to end
   AlertRulesPostgresTest.java   Rule storage on a real PostgreSQL; skipped without one
+  AgentSilenceMonitorTest.java  Silence thresholds, the forget window, the gauge
+  FleetApiTest.java             Fleet listing, drill-down, silence raised and resolved
 java-analytics/Dockerfile       Shaded jar on a JRE, database on a volume
 
 loadtest/main.go                Throughput and latency harness (its own module, stdlib only)
@@ -144,6 +147,7 @@ Go → Java `POST /receive`, header `X-EventWatch-Key`, `Content-Type: applicati
 
 ```json
 { "event_id": "...", "correlation_id": "...", "host_id": "...", "hostname": "web-01",
+  "agent_version": "0.15.0", "queue_depth": 0,
   "level": "ERROR", "msg": "...", "timestamp": "2026-09-04T18:46:00Z",
   "cpu_usage": 88.4, "ram_usage": 12.1 }
 ```
@@ -152,7 +156,8 @@ Go → Java `POST /receive`, header `X-EventWatch-Key`, `Content-Type: applicati
 the live request also sends it as the `X-Correlation-ID` header. `host_id` and `hostname` are
 optional too — an agent older than Phase 12 sends neither and its events are attributed to the host
 `unknown` — but bounded to 128 characters when present, because `host_id` becomes part of an alert
-key and a metric label.
+key and a metric label. `agent_version` is bounded the same way and `queue_depth` must be a
+whole number of zero or more; both are optional, so an older agent still reports.
 Rules: `level` ∈ INFO|WARN|ERROR|CRITICAL; `msg` 1–1000 chars; `event_id` 1–128 chars and unique
 (partial unique index makes retries idempotent); usages are finite numbers 0–100; body ≤ 64 KiB.
 Changes to this schema must stay backward compatible — additive fields only, never renames.
@@ -167,7 +172,8 @@ Changes to this schema must stay backward compatible — additive fields only, n
 | GET | `/capture?level=&msg=` (8082) | none on loopback, key when exposed | Agent ingress |
 | GET | `/stress` (8082) | same as `/capture` | 500 events, 32 concurrent |
 | GET | `/events?level=&host_id=&from=&to=&limit=&offset=` | key | limit ≤ 200, default 50 |
-| GET | `/hosts?limit=` | key | Fleet listing with last-seen |
+| GET | `/hosts?limit=` | key | Fleet listing: status, silent_seconds, version, queue depth |
+| GET | `/hosts/{host_id}` | key | One machine: averages, level counts, its alerts and rules |
 | GET | `/summary` | key | Totals, active alerts, 5-event averages |
 | GET | `/alerts?status=&type=` | key | Active alerts |
 | GET | `/alerts/{key}` | key | Single alert |
@@ -219,22 +225,23 @@ Changes to this schema must stay backward compatible — additive fields only, n
 
 ## 5. Current state — read before starting work
 
-**Phases 1–14 are complete.** Everything is green:
+**Phases 1–15 are complete.** Everything is green:
 
-- `cd java-analytics && mvn verify` → 160 tests, BUILD SUCCESS (12 of them need
+- `cd java-analytics && mvn verify` → 180 tests, BUILD SUCCESS (12 of them need
   `EVENTWATCH_TEST_POSTGRES_URL`; CI supplies a server, locally they skip)
-- `cd go-collector && go vet ./... && go test ./...` → 43 tests, pass
+- `cd go-collector && go vet ./... && go test ./...` → 44 tests, pass
 - `cd loadtest && go vet ./... && go test ./...` → 4 tests, pass
 - `docker compose up --build` → all services healthy
 
-Phase 14 moved thresholds out of `.env` and into per-host rules: a machine's own rule, then a
-fleet-wide rule, then the `.env` default. A mixed fleet now works — the build box can run at 95%
-without alerting while the database alerts at 85% — and that exact case is a test in `RulesApiTest`.
+Phase 15 closed the last gap in the fleet story: a machine that stops reporting now raises
+`agent-silent@{host}`, and its next event resolves it. Agents report their version and pending-queue
+depth, and `GET /hosts/{host_id}` is the per-machine view.
 
-**What is still open:** the dashboard holds the API key in page memory (section 14), and nothing yet
-detects an agent that has gone silent. That second one is Phase 15.
+**The roadmap through Phase 15 is finished.** What remains is in section 15: the dashboard session,
+the deferred Phase 11 items, OpenTelemetry, and the scripted two-process outage test. None is
+blocking; pick by what the project is for next.
 
-B1–B15 in section 13 are all fixed.
+B1–B15 in section 14 are all fixed.
 
 ## 6. Phase 8 as built — notifications
 
@@ -349,7 +356,7 @@ filters meaning exactly the same thing everywhere.
 sweeps rate windows. The cutoff is exclusive, delivery history is pruned alongside the events that
 produced it, and a failed sweep is logged rather than thrown so the timer thread survives.
 
-**What is deliberately NOT done, and when to revisit** — see section 14. Short version: the file
+**What is deliberately NOT done, and when to revisit** — see section 15. Short version: the file
 queue and the two-service shape are both still comfortably inside what the measurements justify.
 
 ## 10. Phase 12 as built — host identity
@@ -424,7 +431,7 @@ logs a startup warning.
 
 **Rules are read on every event, so they are cached** in `AlertRules` and replaced wholesale on
 each write. That is correct for one analytics instance; a second instance would need a refresh
-interval or change notification — the same limitation as notification reminders in section 13.
+interval or change notification — the same limitation as notification reminders in section 14.
 
 **A wiring bug the tests caught before commit:** the CORS preflight still advertised
 `GET, POST, OPTIONS`, because the edit replaced the first of two identical strings — in the
@@ -436,7 +443,33 @@ places now carry one API-wide policy.
 alerts resolve when the average recovers; an error has no equivalent "recovered" signal, so those
 alerts wait for an operator.
 
-## 13. Fixed defects and remaining quality work
+## 13. Phase 15 as built — fleet operations
+
+**Silence is a rule type, not a special case.** `AGENT_SILENT` joins the three Phase 14 types, so a
+machine gets its own window through the same host → fleet → default precedence, and a laptop that
+sleeps overnight is one stored rule rather than a code path. Disabling it resolves the alert it
+raised, exactly like the other types.
+
+**The forget window is what makes it usable.** `AGENT_SILENCE_FORGET_HOURS` (a week) stops machines
+that were decommissioned long ago from alerting forever. Without it, the first sweep after an
+upgrade would raise an alert for every machine that ever reported — the feature would be turned off
+within a day, which is the same as not having it.
+
+**Raise on a timer, resolve on an event.** The sweep only raises; `AlertEngine.evaluate` resolves
+`agent-silent@{host}` because a machine that just reported is by definition not silent. That keeps
+recovery immediate rather than waiting for the next sweep, and it reuses the transition and
+notification path every other alert already goes through.
+
+**Latest, not aggregate.** The fleet listing reads each machine's newest `agent_version` and
+`queue_depth` through a correlated subquery, because `MAX(agent_version)` would report the highest
+string rather than the current one — "0.9.0" sorts above "0.15.0". The listing is bounded by
+`MAX_HOSTS_LISTED`, so the repeated lookup stays cheap.
+
+**Queue depth is the agent's own backlog**, sampled at capture time. A rising value means that agent
+is holding events the analytics service has not accepted — the early warning that the pipeline is
+degrading before events are actually lost.
+
+## 14. Fixed defects and remaining quality work
 
 ### Fixed (keep these fixed — each has a way to regress)
 
@@ -522,7 +555,7 @@ unaffected: at 3000 samples both percentile formulas select the same index.)
   in memory alongside the SQL `lastDeliveredAt` lookup; a restart falls back to the SQL value, which
   is correct but means an in-flight reservation is lost. Fine for one instance, wrong for two.
 
-## 14. Roadmap and deferred work
+## 15. Roadmap and deferred work
 
 **Phase 9 — Observability.** Done except tracing (see section 7).
 
@@ -568,15 +601,16 @@ configuration entirely, which is a good sign it is the right shape. Worth doing 
 original three (disk, a metric the agent does not yet sample), and alerts that fire on a time window
 rather than an event count. Both need the agent to report more than CPU and RAM first.
 
-**Phase 15 — Fleet operations.** A host list with staleness — "agent silent for 10 minutes" is
-often the most important alert and nothing currently detects it — per-host drill-down, and agents
-self-reporting their version and queue depth.
+**Phase 15 — Fleet operations.** Done (see section 13). Not done: notifying on silence through a
+channel that does not depend on the analytics service itself. If the whole host running analytics
+dies, nothing reports that — the classic "who watches the watcher" gap, and the honest answer is an
+external uptime check rather than more code here.
 
 **Still unowned:** OpenTelemetry (see above), and a scripted two-process outage test.
 
 ---
 
-## 15. Definition of done for a release
+## 16. Definition of done for a release
 
 - Events are authenticated, validated, persisted transactionally, deduplicated, and queryable.
 - A temporary Java outage loses nothing and duplicates nothing.

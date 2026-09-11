@@ -30,7 +30,7 @@ class AlertEngineTest {
         database = TestSupport.openDatabase(temporaryDirectory, "alerts.db");
         alerts = new AlertRepository(database.connections());
         // A null notification service keeps these tests focused on the rules themselves.
-        engine = new AlertEngine(alerts, null, WINDOW, AlertRules.defaultsOnly(85.0, 80.0, 3, WINDOW));
+        engine = new AlertEngine(alerts, null, WINDOW, AlertRules.defaultsOnly(85.0, 80.0, 3, 10, WINDOW));
     }
 
     @AfterEach

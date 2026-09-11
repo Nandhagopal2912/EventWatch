@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import java.sql.SQLException;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
@@ -141,17 +142,64 @@ public class QueryService {
     }
 
     /** One row per machine the analytics service has heard from. */
-    public ArrayNode hosts(int limit) throws SQLException {
+    public ArrayNode hosts(int limit, AlertRules rules, Instant now) throws SQLException {
         ArrayNode items = objectMapper.createArrayNode();
         for (EventRepository.HostSummary host : eventRepository.hosts(limit)) {
-            ObjectNode node = objectMapper.createObjectNode();
-            node.put("host_id", host.hostId());
-            node.put("hostname", host.hostname());
-            node.put("event_count", host.eventCount());
-            node.put("last_seen", host.lastSeen().toString());
-            items.add(node);
+            items.add(hostJson(host, rules, now));
         }
         return items;
+    }
+
+    /** Everything known about one machine, for the drill-down view. */
+    public ObjectNode hostDetail(EventRepository.HostSummary host, AlertRules rules, Instant now,
+            List<AnalyticsEngine.LogEntry> recentEvents, Map<String, Long> levelCounts,
+            List<AlertRecord> activeAlerts) {
+        ObjectNode response = hostJson(host, rules, now);
+        response.put("first_seen", host.firstSeen().toString());
+
+        ObjectNode averages = response.putObject("averages");
+        averages.put("cpu", recentEvents.stream().mapToDouble(event -> event.cpuUsage).average().orElse(0.0));
+        averages.put("ram", recentEvents.stream().mapToDouble(event -> event.ramUsage).average().orElse(0.0));
+        averages.put("window", recentEvents.size());
+
+        ObjectNode levels = response.putObject("levels");
+        levelCounts.forEach(levels::put);
+
+        ArrayNode alerts = response.putArray("alerts");
+        for (AlertRecord alert : activeAlerts) {
+            alerts.add(alertJson(alert));
+        }
+        ArrayNode effective = response.putArray("rules");
+        for (AlertRules.EffectiveRule rule : rules.effectiveFor(host.hostId())) {
+            ObjectNode node = objectMapper.createObjectNode();
+            node.put("rule_type", rule.ruleType());
+            node.put("threshold", rule.threshold());
+            node.put("enabled", rule.enabled());
+            node.put("source", rule.source().name().toLowerCase(java.util.Locale.ROOT));
+            effective.add(node);
+        }
+        return response;
+    }
+
+    private ObjectNode hostJson(EventRepository.HostSummary host, AlertRules rules, Instant now) {
+        ObjectNode node = objectMapper.createObjectNode();
+        node.put("host_id", host.hostId());
+        node.put("hostname", host.hostname());
+        node.put("agent_version", host.agentVersion());
+        if (host.queueDepth() == null) {
+            node.putNull("queue_depth");
+        } else {
+            node.put("queue_depth", host.queueDepth());
+        }
+        node.put("event_count", host.eventCount());
+        node.put("last_seen", host.lastSeen().toString());
+
+        long silentSeconds = Math.max(0, Duration.between(host.lastSeen(), now).getSeconds());
+        node.put("silent_seconds", silentSeconds);
+        AlertRules.EffectiveRule silence = rules.effective(AlertRules.AGENT_SILENT, host.hostId());
+        boolean silent = silence.enabled() && silentSeconds >= (long) silence.threshold() * 60;
+        node.put("status", silent ? "silent" : "reporting");
+        return node;
     }
 
     private ObjectNode eventJson(AnalyticsEngine.LogEntry event) {

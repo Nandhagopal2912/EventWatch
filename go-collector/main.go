@@ -29,6 +29,8 @@ type LogPayload struct {
 	CorrelationID string  `json:"correlation_id,omitempty"`
 	HostID        string  `json:"host_id"`
 	Hostname      string  `json:"hostname"`
+	AgentVersion  string  `json:"agent_version"`
+	QueueDepth    int     `json:"queue_depth"`
 	Level         string  `json:"level"`
 	Messages      string  `json:"msg"`
 	Time          string  `json:"timestamp"`
@@ -41,6 +43,9 @@ const (
 	stressEventCount   = 500
 	stressConcurrency  = 32
 )
+
+// Overridable at build time: go build -ldflags "-X main.agentVersion=1.2.3"
+var agentVersion = "0.15.0"
 
 var (
 	backendClient        *http.Client
@@ -108,6 +113,8 @@ func logHandler(w http.ResponseWriter, r *http.Request) {
 		CorrelationID: correlationID,
 		HostID:        configuredHostID,
 		Hostname:      configuredHostname,
+		AgentVersion:  agentVersion,
+		QueueDepth:    queueDepth(),
 		Level:         level,
 		Messages:      msg,
 		Time:          time.Now().UTC().Format(time.RFC3339),
@@ -231,6 +238,8 @@ func stressHandler(w http.ResponseWriter, r *http.Request) {
 			CorrelationID: correlationID,
 			HostID:        configuredHostID,
 			Hostname:      configuredHostname,
+			AgentVersion:  agentVersion,
+			QueueDepth:    queueDepth(),
 			Level:         "ERROR",
 			Messages:      fmt.Sprintf("%s (Log #%d)", errorMsg, i),
 			Time:          time.Now().UTC().Format(time.RFC3339),
@@ -429,12 +438,14 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 		writeMessage(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{
-		"status":   "ok",
-		"service":  "go-collector",
-		"host_id":  configuredHostID,
-		"hostname": configuredHostname,
-		"message":  "service is healthy",
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":      "ok",
+		"service":     "go-collector",
+		"host_id":     configuredHostID,
+		"hostname":    configuredHostname,
+		"version":     agentVersion,
+		"queue_depth": queueDepth(),
+		"message":     "service is healthy",
 	})
 }
 

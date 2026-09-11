@@ -32,7 +32,7 @@ class AlertRulesTest {
                 TestSupport.databaseUrl(temporaryDirectory, "rules.db"), "rules-secret"));
         database.initializeSchema();
         repository = new AlertRuleRepository(database.connections());
-        rules = new AlertRules(repository, 85.0, 80.0, 5, WINDOW);
+        rules = new AlertRules(repository, 85.0, 80.0, 5, 10, WINDOW);
     }
 
     @AfterEach
@@ -102,7 +102,7 @@ class AlertRulesTest {
         rules.save(AlertRules.HIGH_CPU, "web-01", 91.0, true);
         rules.save(AlertRules.HIGH_CPU, null, 60.0, true);
 
-        AlertRules reloaded = new AlertRules(repository, 85.0, 80.0, 5, WINDOW);
+        AlertRules reloaded = new AlertRules(repository, 85.0, 80.0, 5, 10, WINDOW);
         assertEquals(91.0, reloaded.effective(AlertRules.HIGH_CPU, "web-01").threshold());
         assertEquals(60.0, reloaded.effective(AlertRules.HIGH_CPU, "db-01").threshold());
         assertTrue(reloaded.all().stream().anyMatch(AlertRule::fleetWide));
@@ -164,7 +164,7 @@ class AlertRulesTest {
 
     @Test
     void aConfigurationOnlyRuleSetResolvesButCannotBeChanged() {
-        AlertRules configurationOnly = AlertRules.defaultsOnly(85.0, 80.0, 5, WINDOW);
+        AlertRules configurationOnly = AlertRules.defaultsOnly(85.0, 80.0, 5, 10, WINDOW);
         assertEquals(85.0, configurationOnly.effective(AlertRules.HIGH_CPU, "web-01").threshold());
         assertThrows(IllegalStateException.class,
                 () -> configurationOnly.save(AlertRules.HIGH_CPU, null, 50.0, true));

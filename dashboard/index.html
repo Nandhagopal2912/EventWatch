@@ -42,6 +42,12 @@
       </article>
     </section>
 
+    <section class="panel fleet-panel">
+      <div class="panel-heading"><div><p class="eyebrow">FLEET</p><h2>Machines</h2></div></div>
+      <div class="table-wrap"><table><thead><tr><th>Machine</th><th>Status</th><th>Last seen</th><th>Events</th><th>Agent</th><th>Queue</th><th></th></tr></thead><tbody id="fleet-body"></tbody></table></div>
+      <div id="host-detail" class="host-detail"></div>
+    </section>
+
     <section class="panel rules-panel">
       <div class="panel-heading"><div><p class="eyebrow">ALERT RULES</p><h2>Thresholds</h2></div></div>
       <p class="rules-help">The most specific rule wins: a machine's own rule, then a fleet-wide rule, then the default from configuration. Changes apply to each machine's next event.</p>

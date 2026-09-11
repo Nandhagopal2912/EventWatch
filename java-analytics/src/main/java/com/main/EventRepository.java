@@ -34,8 +34,14 @@ public class EventRepository {
             statement.setString(4, event.timestamp.toString());
             statement.setString(5, event.hostId);
             statement.setString(6, event.hostname);
-            statement.setDouble(7, event.cpuUsage);
-            statement.setDouble(8, event.ramUsage);
+            statement.setString(7, event.agentVersion);
+            if (event.queueDepth == null) {
+                statement.setNull(8, java.sql.Types.INTEGER);
+            } else {
+                statement.setInt(8, event.queueDepth);
+            }
+            statement.setDouble(9, event.cpuUsage);
+            statement.setDouble(10, event.ramUsage);
             int inserted = statement.executeUpdate();
             connection.commit();
             return inserted > 0;
@@ -50,7 +56,7 @@ public class EventRepository {
     public List<AnalyticsEngine.LogEntry> find(String level, String hostId, Instant from, Instant to,
             int limit, int offset) throws SQLException {
         StringBuilder query = new StringBuilder(
-                "SELECT event_id, level, message, event_timestamp, host_id, hostname, cpu_usage, ram_usage "
+                "SELECT event_id, level, message, event_timestamp, host_id, hostname, agent_version, queue_depth, cpu_usage, ram_usage "
                         + "FROM telemetry_events WHERE 1 = 1");
         List<String> parameters = new ArrayList<>();
         if (level != null) {
@@ -147,32 +153,76 @@ public class EventRepository {
 
     /** One row per machine that has ever reported, with its last-seen time. */
     public List<HostSummary> hosts(int limit) throws SQLException {
-        String query = "SELECT host_id, MAX(hostname) AS hostname, COUNT(*) AS event_count, "
-                + "MAX(event_timestamp) AS last_seen FROM telemetry_events "
-                + "WHERE host_id IS NOT NULL GROUP BY host_id ORDER BY last_seen DESC LIMIT ?";
+        return hostQuery(null, limit);
+    }
+
+    /** The same aggregate for one machine, or null when it has never reported. */
+    public HostSummary host(String hostId) throws SQLException {
+        List<HostSummary> found = hostQuery(hostId, 1);
+        return found.isEmpty() ? null : found.get(0);
+    }
+
+    private List<HostSummary> hostQuery(String hostId, int limit) throws SQLException {
+        // The correlated subqueries read each machine's newest values rather than an
+        // aggregate of them: MAX(agent_version) would report the highest string, not the
+        // current one. The listing is bounded, so the repeated lookup stays cheap.
+        String query = "SELECT t.host_id, MAX(t.hostname) AS hostname, COUNT(*) AS event_count, "
+                + "MIN(t.event_timestamp) AS first_seen, MAX(t.event_timestamp) AS last_seen, "
+                + "(SELECT l.agent_version FROM telemetry_events l WHERE l.host_id = t.host_id "
+                + "ORDER BY l.event_timestamp DESC LIMIT 1) AS agent_version, "
+                + "(SELECT l.queue_depth FROM telemetry_events l WHERE l.host_id = t.host_id "
+                + "ORDER BY l.event_timestamp DESC LIMIT 1) AS queue_depth "
+                + "FROM telemetry_events t WHERE t.host_id IS NOT NULL"
+                + (hostId == null ? "" : " AND t.host_id = ?")
+                + " GROUP BY t.host_id ORDER BY last_seen DESC LIMIT ?";
         List<HostSummary> hosts = new ArrayList<>();
         try (Connection connection = connections.getConnection();
                 PreparedStatement statement = connection.prepareStatement(query)) {
-            statement.setInt(1, limit);
+            int index = 1;
+            if (hostId != null) {
+                statement.setString(index++, hostId);
+            }
+            statement.setInt(index, limit);
             try (ResultSet results = statement.executeQuery()) {
                 while (results.next()) {
                     hosts.add(new HostSummary(
                             results.getString("host_id"),
                             results.getString("hostname"),
                             results.getLong("event_count"),
-                            Instant.parse(results.getString("last_seen"))));
+                            Instant.parse(results.getString("first_seen")),
+                            Instant.parse(results.getString("last_seen")),
+                            results.getString("agent_version"),
+                            results.getObject("queue_depth") == null ? null : results.getInt("queue_depth")));
                 }
             }
         }
         return hosts;
     }
 
+    /** How many events of each level one machine has reported. */
+    public Map<String, Long> levelCounts(String hostId) throws SQLException {
+        String query = "SELECT level, COUNT(*) AS occurrences FROM telemetry_events "
+                + "WHERE host_id = ? GROUP BY level ORDER BY level";
+        Map<String, Long> counts = new LinkedHashMap<>();
+        try (Connection connection = connections.getConnection();
+                PreparedStatement statement = connection.prepareStatement(query)) {
+            statement.setString(1, hostId);
+            try (ResultSet results = statement.executeQuery()) {
+                while (results.next()) {
+                    counts.put(results.getString("level"), results.getLong("occurrences"));
+                }
+            }
+        }
+        return counts;
+    }
+
     /** A machine as the analytics service knows it. */
-    public record HostSummary(String hostId, String hostname, long eventCount, Instant lastSeen) {
+    public record HostSummary(String hostId, String hostname, long eventCount, Instant firstSeen,
+            Instant lastSeen, String agentVersion, Integer queueDepth) {
     }
 
     public AnalyticsEngine.LogEntry latest() throws SQLException {
-        String query = "SELECT event_id, level, message, event_timestamp, host_id, hostname, cpu_usage, ram_usage "
+        String query = "SELECT event_id, level, message, event_timestamp, host_id, hostname, agent_version, queue_depth, cpu_usage, ram_usage "
                 + "FROM telemetry_events ORDER BY event_timestamp DESC LIMIT 1";
         try (Connection connection = connections.getConnection();
                 PreparedStatement statement = connection.prepareStatement(query);
@@ -193,6 +243,8 @@ public class EventRepository {
                 Instant.parse(results.getString("event_timestamp")),
                 results.getString("host_id"),
                 results.getString("hostname"),
+                results.getString("agent_version"),
+                results.getObject("queue_depth") == null ? null : results.getInt("queue_depth"),
                 results.getDouble("cpu_usage"),
                 results.getDouble("ram_usage"));
     }

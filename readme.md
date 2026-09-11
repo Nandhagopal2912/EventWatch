@@ -2,7 +2,7 @@
 
 EventWatch is a self-hosted fleet monitor for a small number of machines. A lightweight Go agent runs on each host, captures application events together with that machine's CPU and RAM usage, and forwards them to a Java analytics service that keeps per-host history, evaluates per-host alert rules, and notifies an operator.
 
-The current implementation completes Phases 1–14. Future improvements are documented in `CLAUDE.md`.
+The current implementation completes Phases 1–15. Future improvements are documented in `CLAUDE.md`.
 
 ## Project Phase Status
 
@@ -22,10 +22,10 @@ The current implementation completes Phases 1–14. Future improvements are docu
 | **Phase 12** | **✅ Completed** | Host identity                    | A stable per-agent identity on every event, per-host moving windows and alert keys, host filters, and a fleet listing.                     |
 | **Phase 13** | **✅ Completed** | Agent security                   | Loopback-by-default agent binding, mandatory authentication when exposed, TLS between agent and analytics, configurable CORS origins, and optional metrics auth. |
 | **Phase 14** | **✅ Completed** | Per-host alert rules             | Thresholds stored as rules, resolved host → fleet → `.env` default, with a rules API, an effective-rule view, and a dashboard editor. |
-| **Phase 15** | 🗓️ Planned       | Fleet operations                 | Agent staleness alerts, per-host drill-down, and agents self-reporting version and queue depth. |
+| **Phase 15** | **✅ Completed** | Fleet operations                 | Silence detection as an alert rule, a fleet listing with per-machine drill-down, and agents reporting their version and queue depth. |
 
 **Current state:** EventWatch runs a fleet. An agent on each machine reports that machine's events
-and resource usage, the analytics service keeps per-host history and raises per-host alerts against thresholds you can set per machine, state
+and resource usage, the analytics service keeps per-host history and raises per-host alerts against thresholds you can set per machine, and notices when a machine stops reporting at all, state
 changes reach a webhook, and the dashboard shows every machine with filters and delivery history.
 
 **Deployable on a trusted network.** The agent binds to loopback by default and refuses to bind
@@ -38,6 +38,7 @@ verification. See [Securing a deployment](#securing-a-deployment).
 go-collector/                   Go agent, one per machine
 	main.go                        Handlers, forwarding, durable queue
 	identity.go                    Stable host_id, persisted beside the queue
+	security.go                    Bind policy, capture auth, backend TLS trust
 	logging.go                     Structured JSON log lines
 	metrics.go                     Prometheus counters and /metrics
 	Dockerfile
@@ -63,6 +64,7 @@ java-analytics/                 Maven Java analytics service
 		AlertRule.java                 One stored rule
 		AlertRuleRepository.java       Rule storage, portable SQL
 		AlertRules.java                Host, fleet, default precedence and validation
+		AgentSilenceMonitor.java       Raises an alert for a machine that stopped reporting
 		QueryService.java              JSON shaping for the query API
 		NotificationService.java       Webhook dispatch, cooldown, retries
 		NotificationRecord.java
@@ -70,7 +72,7 @@ java-analytics/                 Maven Java analytics service
 		RetentionService.java          Prunes history past the window
 		Metrics.java                   Prometheus counters and gauges
 		StructuredLogger.java          One JSON object per log line
-	src/test/java/com/main/            160 tests, including a live PostgreSQL suite
+	src/test/java/com/main/            180 tests, including a live PostgreSQL suite
 dashboard/                      Local browser dashboard
 	index.html
 	app.js
@@ -120,13 +122,20 @@ docker-compose.yml              Agent, analytics, dashboard, optional PostgreSQL
 - **Observability:** both services emit one JSON object per log line, expose `GET /metrics` in
   Prometheus text format, and carry an `X-Correlation-ID` from the agent through to the analytics
   response.
+- **Fleet view:** `GET /hosts` lists every machine with its status, last-seen time, agent
+  version, and pending-queue depth. `GET /hosts/{host_id}` is the per-machine view: averages,
+  level counts, its active alerts, and the rules it is judged by.
+- **Silence detection:** a background sweep raises `agent-silent@{host}` for a machine that has
+  stopped reporting, and the machine's next event resolves it. Nothing else notices silence,
+  because every other rule needs an event to evaluate.
 - **Alert rules:** thresholds are rules in the database, resolved per machine — that host's
   rule, then a fleet-wide rule, then the `.env` default. `GET /rules`, `PUT /rules`,
   `DELETE /rules`, and `GET /rules/effective?host_id=` manage and explain them.
 - **Retention:** `RETENTION_DAYS` prunes telemetry and delivery history older than the window.
   Disabled by default.
-- **Dashboard:** `dashboard/index.html` shows the fleet, summaries, recent events filtered by
-  machine, active alerts, per-alert delivery history, and an alert rules editor. It reads the API key in the browser,
+- **Dashboard:** `dashboard/index.html` shows the fleet with each machine's status and a
+  drill-down, summaries, recent events filtered by machine, active alerts, per-alert delivery
+  history, and an alert rules editor. It reads the API key in the browser,
   escapes all event text before rendering it, and never touches the database directly.
 - **Configuration:** `HTTP_PORT`, `COLLECTOR_PORT`, `DATABASE_PATH`, and `DATABASE_URL` set ports
   and storage, so neither service needs a source change to be deployed or containerized.
@@ -176,6 +185,8 @@ If the analytics service is temporarily unavailable, the agent retries and write
 | **Moving-window analytics** | Evaluates the latest five events *per machine* for CPU and RAM trends.                            | Detects sustained pressure without averaging unrelated machines together.     |
 | **Alert engine**            | Creates and updates `HIGH_CPU`, `HIGH_RAM`, and `REPEATED_ERROR` alerts, keyed per host.           | Turns raw telemetry into incidents an operator can act on machine by machine. |
 | **Per-host alert rules**    | Stores thresholds per machine and fleet-wide, over the `.env` defaults.                            | A build box at 90% CPU is healthy; a database at 90% is not.                  |
+| **Silence detection**       | Alerts when a machine stops reporting, and resolves when it returns.                              | A dead agent is invisible to every rule that needs an event.                  |
+| **Agent self-reporting**    | Each event carries the agent version and its pending-queue depth.                                  | Confirms a fleet upgrade landed, and shows a backlog building up.             |
 | **Alert lifecycle**         | Supports `OPEN`, `ACKNOWLEDGED`, and `RESOLVED` states.                                           | Shows whether an issue is new, being handled, or no longer active.            |
 | **Webhook notifications**   | Delivers alert state changes to an external endpoint and retries transient failures.              | Reaches an operator who is not watching the dashboard.                        |
 | **Delivery audit trail**    | Records every attempt with status, HTTP code, and attempt number.                                 | Makes a missed notification diagnosable instead of invisible.                 |
@@ -309,6 +320,38 @@ An event from an agent older than Phase 12 carries no identity and is attributed
 its own machine only. To accept events from elsewhere set `COLLECTOR_BIND` and a `CAPTURE_API_KEY`
 — the agent refuses to start on a non-loopback address without one, because an open ingress lets
 anyone on that network forge telemetry for the host and trigger its alerts.
+
+## Fleet operations
+
+```powershell
+# Every machine, newest activity first.
+curl.exe "http://localhost:8080/hosts" -H "X-EventWatch-Key: local-secret"
+
+# One machine: averages, level counts, its alerts, and the rules it is judged by.
+curl.exe "http://localhost:8080/hosts/web-01" -H "X-EventWatch-Key: local-secret"
+```
+
+Each row carries `status` (`reporting` or `silent`), `silent_seconds`, `agent_version`, and
+`queue_depth`. A rising queue depth means that agent is holding events the analytics service has
+not accepted.
+
+**Silence.** A machine that stops reporting is the failure nothing else can see: every other rule
+needs an event to evaluate, and a dead agent sends none. A background sweep raises
+`agent-silent@{host}` once a machine has been quiet past its threshold, and the machine's next
+event resolves the alert automatically.
+
+`AGENT_SILENCE_MINUTES` (default 10) is the fleet-wide default, and `AGENT_SILENCE_SWEEP_SECONDS`
+(default 60) is how often the check runs. Silence is an ordinary rule type, so one machine can have
+its own window — a laptop that sleeps overnight — or be exempted entirely:
+
+```powershell
+curl.exe -X PUT "http://localhost:8080/rules" -H "X-EventWatch-Key: local-secret" `
+  -H "Content-Type: application/json" -d '{"rule_type":"AGENT_SILENT","host_id":"laptop-01","threshold":240}'
+```
+
+`AGENT_SILENCE_FORGET_HOURS` (default 168, a week) stops old machines alerting forever: one quiet
+for longer than this is treated as decommissioned rather than lost. Without it, every upgrade would
+raise an alert for every machine that ever reported.
 
 ## Alert rules
 
@@ -486,8 +529,8 @@ The Java suite covers event validation, query-parameter parsing, persistence and
 both backends, the per-host alert rules and lifecycle, webhook delivery against a local sink, the
 engine start/stop lifecycle, retention, the metric and log formats, and an end-to-end pass that
 drives the real HTTP server on an ephemeral port with a temporary database — including restart
-recovery, two machines staying independent, and per-host rules changing which machines
-alert. The Go suite covers retry classification, the capture
+recovery, two machines staying independent, per-host rules changing which machines
+alert, and a silent machine raising and then resolving its own alert. The Go suite covers retry classification, the capture
 handler, durable-queue outcomes, correlation IDs, host identity and its persistence across restarts,
 and metric rendering, using an `httptest` stand-in for the analytics service.
 
