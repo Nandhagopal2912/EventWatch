@@ -125,7 +125,7 @@ jobs:
 
       # Build only: publishing images is a deployment decision, not a CI one.
       - name: Build the collector image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ./go-collector
           push: false
@@ -133,7 +133,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Build the analytics image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: java-analytics/Dockerfile
