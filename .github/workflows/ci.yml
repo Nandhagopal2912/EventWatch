@@ -143,3 +143,10 @@ jobs:
 
       - name: Validate the compose file
         run: EVENTWATCH_API_KEY=ci-placeholder docker compose config --quiet
+
+      # A separate build from the two steps above: compose builds through its own bake, so this
+      # pays for another image build rather than reusing the GHA cache from those steps. Kept
+      # simple on purpose rather than wiring load:true and matching tags between them for a
+      # couple of minutes saved.
+      - name: Two-process outage test
+        run: scripts/outage-test.sh

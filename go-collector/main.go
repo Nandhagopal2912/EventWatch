@@ -38,11 +38,7 @@ type LogPayload struct {
 	RAMUsage      float64 `json:"ram_usage"`
 }
 
-const (
-	maxBackendAttempts = 3
-	stressEventCount   = 500
-	stressConcurrency  = 32
-)
+const maxBackendAttempts = 3
 
 // Overridable at build time: go build -ldflags "-X main.agentVersion=1.2.3"
 var agentVersion = "0.15.0"
@@ -201,84 +197,6 @@ func logHandler(w http.ResponseWriter, r *http.Request) {
 	writeMessage(w, http.StatusOK, "log forwarded to analytics engine successfully")
 }
 
-func stressHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeMessage(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	if !authorizeCapture(r) {
-		writeMessage(w, http.StatusUnauthorized, "unauthorized")
-		return
-	}
-
-	correlationID := newEventID()
-	logInfo("starting stress test", logFields{
-		"correlation_id": correlationID,
-		"events":         stressEventCount,
-		"concurrency":    stressConcurrency,
-	})
-
-	fakeErrors := []string{
-		"Database transaction deadlock",
-		"Unauthorized API access attempt",
-		"Out of memory error in payment service",
-	}
-	cpuUsage, ramUsage, err := readHostMetrics()
-	if err != nil {
-		metrics.recordHostFailure()
-		writeMessage(w, http.StatusInternalServerError, "host metrics unavailable")
-		return
-	}
-
-	// Bound the fan-out so the test measures pipeline throughput rather than goroutine spawning.
-	slots := make(chan struct{}, stressConcurrency)
-	for i := 0; i < stressEventCount; i++ {
-		errorMsg := fakeErrors[i%len(fakeErrors)]
-
-		payload := LogPayload{
-			EventID:       newEventID(),
-			CorrelationID: correlationID,
-			HostID:        configuredHostID,
-			Hostname:      configuredHostname,
-			AgentVersion:  agentVersion,
-			QueueDepth:    queueDepth(),
-			Level:         "ERROR",
-			Messages:      fmt.Sprintf("%s (Log #%d)", errorMsg, i),
-			Time:          time.Now().UTC().Format(time.RFC3339),
-			CPUUsage:      cpuUsage,
-			RAMUsage:      ramUsage,
-		}
-		metrics.recordCapture(payload.Level)
-		jsonBytes, marshalErr := json.Marshal(payload)
-		if marshalErr != nil {
-			logError("stress event dropped", logFields{
-				"correlation_id": correlationID, "error": marshalErr.Error()})
-			continue
-		}
-		slots <- struct{}{}
-		go func(data []byte) {
-			defer func() { <-slots }()
-			resp, err := forwardToJava(data, correlationID)
-
-			if err != nil {
-				queueOrDrop(data, correlationID)
-				return
-			}
-			defer resp.Body.Close()
-			if isRetryableStatus(resp.StatusCode) {
-				queueOrDrop(data, correlationID)
-				return
-			}
-			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				metrics.recordForward("delivered")
-			} else {
-				metrics.recordForward("rejected")
-			}
-		}(jsonBytes)
-	}
-	writeMessage(w, http.StatusOK, fmt.Sprintf("%d logs queued for the analytics engine", stressEventCount))
-}
-
 func main() {
 	// Both services read the same root .env file for local configuration.
 	_ = godotenv.Load("../.env", ".env")
@@ -354,8 +272,6 @@ func main() {
 	http.HandleFunc("/health", healthHandler)
 	http.HandleFunc("/metrics", metricsHandler)
 
-	http.HandleFunc("/stress", stressHandler)
-
 	logInfo("agent started", logFields{
 		"host_id":              configuredHostID,
 		"hostname":             configuredHostname,
@@ -427,16 +343,6 @@ func forwardToJava(jsonBytes []byte, correlationID string) (*http.Response, erro
 		}
 	}
 	return nil, lastError
-}
-
-func queueOrDrop(data []byte, correlationID string) {
-	if queueErr := enqueueEvent(data, correlationID); queueErr != nil {
-		metrics.recordForward("failed")
-		logError("stress event dropped", logFields{
-			"correlation_id": correlationID, "error": queueErr.Error()})
-		return
-	}
-	metrics.recordForward("queued")
 }
 
 // A queued event is only abandoned on a permanent client error.

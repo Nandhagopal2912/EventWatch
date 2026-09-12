@@ -79,6 +79,7 @@ go-collector/identity.go        Stable per-agent host_id, persisted beside the q
 go-collector/security.go        Bind policy, capture auth, backend TLS trust,
                                 ingestion credential resolution (shared key vs. AGENT_TOKEN)
 go-collector/watchdog.go        Delivery-health tracking, agent alerts
+                                (/stress is gone; loadtest/ covers synthetic load — see Phase 20)
 go-collector/logging.go         Structured JSON log lines, LOG_FORMAT switch
 go-collector/metrics.go         Prometheus counters, queue-depth gauge, /metrics handler
 go-collector/main_test.go       Event-ID uniqueness + queue capacity
@@ -168,6 +169,7 @@ java-analytics/Dockerfile       Shaded jar on a JRE, database on a volume
 loadtest/main.go                Throughput and latency harness (its own module, stdlib only)
 testdata/event-contract.json    One canonical event, read by both test suites
 docker-compose.yml              Collector and analytics; the dashboard ships in the analytics image
+scripts/outage-test.sh          Builds both images, kills analytics mid-traffic, proves zero loss
 .github/workflows/ci.yml        Go job, Java job, image build job
 
 dashboard/{index.html,app.js,styles.css}
@@ -209,7 +211,6 @@ Changes to this schema must stay backward compatible — additive fields only, n
 | POST | `/agents` (8080) | key | Mints one: `host_id`, optional `label`; token shown once |
 | DELETE | `/agents/{id}` (8080) | key | Revoke; the row stays for history |
 | GET | `/capture?level=&msg=` (8082) | none on loopback, key when exposed | Agent ingress |
-| GET | `/stress` (8082) | same as `/capture` | 500 events, 32 concurrent |
 | GET | `/events?level=&host_id=&from=&to=&limit=&offset=` | key | limit ≤ 200, default 50 |
 | GET | `/hosts?limit=` | key | Fleet listing: status, silent_seconds, version, queue depth |
 | GET | `/hosts/{host_id}` | key | One machine: averages, level counts, its alerts and rules |
@@ -256,6 +257,10 @@ Changes to this schema must stay backward compatible — additive fields only, n
   one class stay sequential. A class that touches process-wide state must say so with
   `@ResourceLock` - `Resources.GLOBAL` for `System.out` or the logger, a named lock for a shared
   external server. Anything else must isolate itself with `@TempDir` and port 0.
+- **System-level behaviour that needs two real processes** does not fit `go test` (which stands in
+  a fake analytics service with `httptest`) or the Java integration tests (one in-process
+  `HttpServer`). That belongs in `scripts/`, run against real containers, wired into the `images`
+  CI job rather than the language-specific ones.
 - **Configuration over constants:** ports, database path, and the shutdown grace are all in
   `EngineConfiguration`. Anything a container or a test needs to vary belongs there, not in a
   `static final`.
@@ -270,25 +275,26 @@ Changes to this schema must stay backward compatible — additive fields only, n
 
 ## 5. Current state — read before starting work
 
-**Phases 1–19 are complete.** Everything is green:
+**Phases 1–20 are complete — the whole planned roadmap.** Everything is green:
 
 - `cd java-analytics && mvn verify` → 241 tests, BUILD SUCCESS (12 of them need
-  `EVENTWATCH_TEST_POSTGRES_URL`; CI supplies a server, locally they skip). Verified against a
-  real PostgreSQL 16 container with all 241 running.
-- `cd go-collector && go vet ./... && go test ./...` → 58 tests, pass
+  `EVENTWATCH_TEST_POSTGRES_URL`; CI supplies a server, locally they skip)
+- `cd go-collector && go vet ./... && go test ./...` → 57 tests, pass
 - `cd loadtest && go vet ./... && go test ./...` → 4 tests, pass
-- `docker compose up --build` → both services healthy; minting a token and ingesting through it
-  verified live in containers, spoof attempt included
+- `docker compose up --build` → both services healthy
+- `scripts/outage-test.sh` → builds both images, kills analytics mid-traffic, proves zero loss;
+  runs in CI on every push
 
-The phase roadmap (1–15) delivered the system; 16 onward is hardening for real use, planned in
-section 19. Phase 19 gave every agent its own ingestion credential: `POST /agents` mints one bound
-to a host, `DELETE /agents/{id}` revokes it, and the shared key still works behind
-`SHARED_KEY_INGESTION_ENABLED` during migration.
+Phase 20 closed the three items the roadmap had left open: a real two-process outage test now
+runs automatically instead of being reverified by hand each phase; `/stress` is gone from the
+shipped binary now that `loadtest/` properly supersedes it; and the assumed timestamp-normalisation
+task turned out, on inspection, not to be needed — see section 18 for why.
 
-**Next is Phase 20, cleanup and closing gaps:** the scripted two-process outage test, one-off
-timestamp normalisation for pre-Phase-9 rows, and removing `/stress` from the shipped binary.
+**The five hardening phases (16–20) are done.** What is next is a separate conversation: more host
+samples beyond CPU and RAM (disk, network, process liveness, custom application metrics), which
+Phase 14's rule machinery already accepts without structural change.
 
-B1–B17 in section 17 are all fixed.
+B1–B17 in section 19 are all fixed.
 
 ## 6. Phase 8 as built — notifications
 
@@ -403,7 +409,7 @@ filters meaning exactly the same thing everywhere.
 sweeps rate windows. The cutoff is exclusive, delivery history is pruned alongside the events that
 produced it, and a failed sweep is logged rather than thrown so the timer thread survives.
 
-**What is deliberately NOT done, and when to revisit** — see section 19. Short version: the file
+**What is deliberately NOT done, and when to revisit** — see section 20. Short version: the file
 queue and the two-service shape are both still comfortably inside what the measurements justify.
 
 ## 10. Phase 12 as built — host identity
@@ -478,7 +484,7 @@ logs a startup warning.
 
 **Rules are read on every event, so they are cached** in `AlertRules` and replaced wholesale on
 each write. That is correct for one analytics instance; a second instance would need a refresh
-interval or change notification — the same limitation as notification reminders in section 18.
+interval or change notification — the same limitation as notification reminders in section 19.
 
 **A wiring bug the tests caught before commit:** the CORS preflight still advertised
 `GET, POST, OPTIONS`, because the edit replaced the first of two identical strings — in the
@@ -682,7 +688,37 @@ exposes externally is application-generated text — `event_id`, `alert_key` —
 autoincrement value read back through `getGeneratedKeys`. The agent `id` follows that precedent
 rather than introducing a new one.
 
-## 18. Fixed defects and remaining quality work
+## 18. Phase 20 as built — cleanup and closing gaps
+
+**The outage test is now a script, not a ritual.** `scripts/outage-test.sh` builds both images,
+starts the real stack, sends events, `docker compose stop analytics` while the collector keeps
+running, sends more events into the durable queue, restarts analytics, and asserts every event
+landed and the queue is empty. This is exactly what got verified by hand at the end of nearly
+every phase since Phase 10 — the difference is that it now runs on every push in the `images` CI
+job instead of depending on someone remembering to do it. It asserts on `queue_depth` from the
+agent's own `/health`, the same count the agent already trusts internally, rather than reaching
+into the container to count files by hand.
+
+**The timestamp-normalisation item turned out not to exist.** The roadmap assumed rows written by
+a pre-Phase-9 agent might carry a local UTC offset instead of `Z`, requiring a one-off migration.
+Checking the code instead of the assumption: `EventRepository` stores `event.timestamp.toString()`,
+where `event.timestamp` is a Java `Instant` parsed from the incoming payload — and `Instant.toString()`
+is always canonical UTC with `Z`, regardless of what offset the original string used.
+`Instant.parse("...+05:30")` is accepted and correctly converts to the equivalent UTC instant before
+it is ever written. Every row in `telemetry_events.event_timestamp`, including 187 rows in this
+project's own database going back to Phase 5, has therefore always been Z-normalised — confirmed by
+querying the real file, not just by reading the code. There is nothing to migrate, so nothing was
+written; a migration for data that cannot exist would be dead code asserting a false premise. The
+invariant is now pinned down by a regression test instead of an assumption in a document.
+
+**`/stress` is gone.** `loadtest -mode collector` does everything it did — synthetic events through
+the real `/capture` path — with a configurable count and concurrency instead of a hardcoded 500/32,
+and it reports percentile latency rather than only "logs queued." Carrying an unauthenticated-unless-
+configured load generator in the production binary bought nothing `loadtest/` does not already cover
+better. `queueOrDrop`, the two stress-only constants, and the one test that asserted the route was
+still behind the key all went with it.
+
+## 19. Fixed defects and remaining quality work
 
 ### Fixed (keep these fixed — each has a way to regress)
 
@@ -783,7 +819,7 @@ by reading `docker compose ps` rather than trusting that the stack was up.
   in memory alongside the SQL `lastDeliveredAt` lookup; a restart falls back to the SQL value, which
   is correct but means an in-flight reservation is lost. Fine for one instance, wrong for two.
 
-## 19. Roadmap and deferred work
+## 20. Roadmap and deferred work
 
 **The phase roadmap (1–15) is complete.** What follows is hardening for real use rather than new
 capability. Phases 16–20 are planned, one commit each, in this order.
@@ -821,9 +857,9 @@ machine; one leaked agent compromises every host. An `agents` table with hashed 
 The shared key keeps working behind a deprecation switch during migration — the same additive
 discipline the event contract follows.
 
-**Phase 20 — Cleanup and closing gaps.** The scripted two-process outage test that Phase 10 left
-open, the one-off timestamp normalisation for rows written by pre-Phase-9 builds, and removing
-`/stress` from the shipped binary now that `loadtest/` covers it properly.
+**Phase 20 — Cleanup and closing gaps.** Done (see section 18). The scripted two-process outage
+test that Phase 10 left open; `/stress` removed now that `loadtest/` covers it properly; and the
+assumed timestamp-normalisation task, which turned out on inspection not to be needed at all.
 
 **Agreed for discussion after Phase 20 — more host samples.** The agent samples only CPU and RAM.
 Disk usage, network, process liveness, or an application pushing its own custom metric would each
@@ -864,7 +900,7 @@ than changing databases.
 
 ---
 
-## 20. Definition of done for a release
+## 21. Definition of done for a release
 
 - Events are authenticated, validated, persisted transactionally, deduplicated, and queryable.
 - A temporary Java outage loses nothing and duplicates nothing.

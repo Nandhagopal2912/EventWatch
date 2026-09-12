@@ -7,3 +7,5 @@ java-analytics/events.db-wal
 go-collector/pending-events/
 java-analytics/hs_err_pid*.log
 go-collector/gocode.exe
+loadtest/loadtest.exe
+loadtest/loadtest

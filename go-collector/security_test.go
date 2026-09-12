@@ -100,20 +100,6 @@ func TestCaptureAcceptsTheConfiguredKey(t *testing.T) {
 	}
 }
 
-func TestStressRouteIsAuthorizedToo(t *testing.T) {
-	withCollector(t, newBackendStub(t))
-	restoreIngressSecurity(t)
-	if _, err := resolveIngressSecurity("0.0.0.0", "agent-secret", false); err != nil {
-		t.Fatalf("setup failed: %v", err)
-	}
-
-	recorder := httptest.NewRecorder()
-	stressHandler(recorder, httptest.NewRequest(http.MethodGet, "/stress", nil))
-	if recorder.Code != http.StatusUnauthorized {
-		t.Errorf("the stress route must not be open when capture is keyed, got %d", recorder.Code)
-	}
-}
-
 func TestBackendTLSTrustsAConfiguredAuthority(t *testing.T) {
 	// A PEM with no certificate must be rejected rather than silently trusting nothing.
 	empty := filepath.Join(t.TempDir(), "empty.pem")

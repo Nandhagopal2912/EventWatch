@@ -10,7 +10,8 @@ It is built without web frameworks, an ORM, or a DI container on either side, so
 retries, queueing, deduplication, alert state, delivery — is visible in the code rather than hidden
 behind configuration.
 
-**Status:** Phases 1–19 complete. 303 tests pass: 241 Java, 58 Go agent, 4 load harness.
+**Status:** Phases 1–20 complete — the whole planned roadmap. 302 tests pass: 241 Java, 57 Go
+agent, 4 load harness, plus a scripted two-process outage test that runs in CI on every push.
 `CLAUDE.md` is the working guide for contributors and records what is deliberately deferred.
 
 **Scope:** built for roughly 5–50 machines. It is not an APM, a log aggregator, or a metrics
@@ -84,7 +85,13 @@ of its own.
 origin. The API key is presented once, to `POST /session`, and exchanged for an `HttpOnly`
 cookie the page itself cannot read.
 
-**Gives every agent its own key.** `POST /agents` mints a token bound to one machine; a leaked agent is revoked alone, not rotated fleet-wide, and it can only ever report as the host it was minted for.
+**Gives every agent its own key.** `POST /agents` mints a token bound to one machine; a leaked
+agent is revoked alone, not rotated fleet-wide, and it can only ever report as the host it was
+minted for.
+
+**Proves it survives an outage, on every push.** A CI job builds both real images, kills analytics
+mid-traffic, and asserts the durable queue drains to zero loss once it returns — the thing that
+used to be reverified by hand at the end of each phase.
 
 **Defends itself.** The agent binds to loopback by default and refuses to bind anywhere else without
 a key. The analytics API authenticates every data route, rate-limits ingestion per client, validates
@@ -242,7 +249,6 @@ event to `pending-events/`. A background worker retries it later.
 | GET | `/capture?level=&msg=` | none on loopback, key when exposed | Submit an event |
 | GET | `/health` | none | Availability, identity, version, queue depth |
 | GET | `/metrics` | none | Prometheus text format |
-| GET | `/stress` | same as `/capture` | 500 synthetic events, 32 concurrent |
 
 **Analytics, port 8080.** Every route below marked "key" accepts the `X-EventWatch-Key`
 header or a session cookie, except `/receive`, which never accepts a session — a browser has no
@@ -500,7 +506,7 @@ recovering — so resolve them once handled.
 
 **Agent exposure.** `COLLECTOR_BIND` defaults to `127.0.0.1`, accepting events only from processes
 on its own machine. Any other bind requires `CAPTURE_API_KEY`, sent as `X-EventWatch-Key` on
-`/capture` and `/stress`; the agent refuses to start otherwise. `CAPTURE_REQUIRE_KEY=true` demands a
+`/capture`; the agent refuses to start otherwise. `CAPTURE_REQUIRE_KEY=true` demands a
 key even on loopback.
 
 **TLS between agent and analytics.** Generate a keystore and hand the agent the certificate:
@@ -674,6 +680,15 @@ For PostgreSQL, enable its profile and point the analytics service at it with
 docker compose --profile postgres up --build
 ```
 
+**The outage test.** `scripts/outage-test.sh` builds both images, sends real events through the
+real agent, stops the analytics container while the agent keeps running, sends more events into
+the durable queue, restarts analytics, and asserts every event landed with nothing left pending.
+It runs in CI on every push; run it yourself with:
+
+```bash
+scripts/outage-test.sh
+```
+
 ---
 
 ## Tests
@@ -706,6 +721,10 @@ The Go suite covers retry classification, the capture handler, durable-queue out
 IDs, host identity and its persistence across restarts, the bind and authentication policy,
 delivery-health tracking and its alerts, and metric rendering, using an `httptest` stand-in for the analytics service.
 
+Neither suite starts a second real process, which is deliberate — it is what keeps them fast. The
+one behaviour that genuinely needs two real processes, a real outage, and a real durable queue on
+disk is `scripts/outage-test.sh`, described under Docker above.
+
 The PostgreSQL suites are skipped unless `EVENTWATCH_TEST_POSTGRES_URL` points at a reachable
 server, so a checkout without PostgreSQL still builds; CI supplies one as a service container.
 
@@ -731,10 +750,13 @@ Measured on one developer machine, 3000 events at concurrency 16, rate limit rai
 Move to PostgreSQL when several agents must share one store, or for retention longer than a single
 disk holds — not for throughput.
 
-The agent's `/stress` route sends 500 synthetic events with a bounded fan-out of 32. Ingestion is
-rate limited to `RATE_LIMIT_PER_MINUTE` per client, so most of that burst is answered with `429`,
-written to the pending queue, and drained over the following minutes. Nothing is dropped — that is
-the system working, not a failure.
+`loadtest -mode collector -events 500 -concurrency 32` reproduces the same burst against the real
+`/capture` path, with a count and concurrency you choose rather than a fixed 500/32 baked into the
+binary. Most of a burst that size is answered `429` by the rate limit, written to the pending
+queue, and drained over the following minutes. Nothing is dropped — that is the system working, not
+a failure. (An earlier phase carried this as a `/stress` route on the agent itself; it added an
+unauthenticated-unless-configured load generator to the production binary for something the load
+harness already did better, so it was removed.)
 
 ---
 
@@ -847,6 +869,7 @@ The project was built in phases; each is a single commit.
 | 17 | Internal structure | One class per route, one engine per instance, parallel tests |
 | 18 | Operator session | Same-origin dashboard, HttpOnly session cookie, no CORS |
 | 19 | Per-agent credentials | Mint, bind, and revoke per-machine ingestion tokens |
+| 20 | Cleanup and closing gaps | Scripted outage test in CI, `/stress` removed |
 
 `agent.md` is the original roadmap, kept for history. `CLAUDE.md` is the current authority on state,
 conventions, and what comes next.

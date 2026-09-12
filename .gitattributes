@@ -1,0 +1,5 @@
+# A shell script with CRLF line endings fails on Linux - the shebang and every line get a
+# trailing \r. This repo's primary dev environment is Windows, and core.autocrlf converts line
+# endings on checkout by default, so this has to be pinned rather than left to whoever's git
+# config happens to be active.
+*.sh text eol=lf
