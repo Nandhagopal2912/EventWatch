@@ -385,6 +385,10 @@ docker-compose.yml              Agent and analytics, optional PostgreSQL
 
 ## Getting started
 
+**First time here?** [`USER-GUIDE.md`](USER-GUIDE.md) walks through the same setup step by step and
+explains what the system is doing after each one, up to a deliberately triggered alert and a
+demonstration that an outage loses nothing. This section is the short version.
+
 **Requirements:** Go 1.27+, Java 17+, Apache Maven, and Docker with Compose only for the container
 workflow. Internet access is needed for the first dependency download.
 

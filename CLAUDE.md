@@ -1,7 +1,7 @@
 # CLAUDE.md — EventWatch
 
-Working guide for agents and contributors. `readme.md` is the user-facing doc; `agent.md` is the
-original phase roadmap. **This file is the authority on current state, conventions, and what to do
+Working guide for agents and contributors. `readme.md` is the user-facing doc, `USER-GUIDE.md` the
+step-by-step walkthrough for a first run, and `agent.md` the original phase roadmap. **This file is the authority on current state, conventions, and what to do
 next.** Update it whenever a phase closes or an item in the backlog is fixed.
 
 ---
@@ -992,5 +992,17 @@ than changing databases.
 - Configuration and deployment require no source changes.
 - Logs, metrics, health checks, and traces make a failure diagnosable without a debugger.
 
-EventWatch is a strong learning and portfolio system. It should not be described as a production
-replacement for Datadog, CloudWatch, or a SIEM until TLS, retention, and the Phase 9–10 work land.
+Every item above is met, with one substitution: there are no traces, because OpenTelemetry was
+refused (section 21) and the correlation ID answers the same question across the single hop that
+exists. TLS, retention, and the Phase 9–10 observability work — the three things an earlier version
+of this section named as blockers — all landed in phases 11, 13 and 9–10.
+
+What that does and does not mean: within its stated scope, EventWatch is a finished system rather
+than an unfinished one, and section 21 records what was refused rather than left undone. It is
+still not a replacement for Datadog, CloudWatch, or a SIEM, for reasons that are about scope rather
+than incompleteness — no user identity or audit trail, one instance with no failover, and no
+secrets manager or tested restore procedure. The readme states those plainly.
+
+The honest remaining gap is not constructional. This has never run continuously for weeks on real
+machines, and nobody but its author has ever installed it from the documentation. Those two things
+would teach more than another phase would.
