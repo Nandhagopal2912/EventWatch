@@ -2,7 +2,7 @@
 
 # The build context is the repository root, because the analytics image now carries the
 # dashboard: serving it from this service is what makes the session cookie same-origin.
-FROM maven:3.9-eclipse-temurin-17 AS build
+FROM maven:3-eclipse-temurin-26 AS build
 WORKDIR /build
 # Resolve dependencies first so source edits do not invalidate the download layer.
 COPY java-analytics/pom.xml ./
