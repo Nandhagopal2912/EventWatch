@@ -251,12 +251,14 @@ class RulesApiTest {
     }
 
     @Test
-    void thePreflightAllowsTheMethodsTheEditorUses() throws Exception {
-        HttpResponse<String> preflight = send("OPTIONS", "/rules", null, null, false);
-        assertEquals(204, preflight.statusCode());
-        String methods = preflight.headers().firstValue("Access-Control-Allow-Methods").orElse("");
+    void theEditorsMethodsAreAdvertisedOnARefusal() throws Exception {
+        // The dashboard is same-origin now, so there is no preflight to get wrong. What replaced
+        // it is the Allow header: a refused method still has to name the ones that work.
+        HttpResponse<String> refused = send("OPTIONS", "/rules", null, null, true);
+        assertEquals(405, refused.statusCode(), "CORS preflight handling is gone");
+        String methods = refused.headers().firstValue("Allow").orElse("");
         assertTrue(methods.contains("PUT") && methods.contains("DELETE"),
-                "the dashboard's cross-origin PUT and DELETE would be blocked, got: " + methods);
+                "the editor's methods must still be advertised, got: " + methods);
     }
 
     private void assertRejected(String body, String reasonFragment) throws Exception {

@@ -1,4 +1,6 @@
-const apiBase = `${window.location.protocol}//${window.location.hostname}:8080`;
+// The dashboard is served by the analytics service, so every request is same-origin and the
+// session cookie travels with it. There is no base url and no CORS to configure.
+const apiBase = "";
 const form = document.querySelector("#config-form");
 const keyInput = document.querySelector("#api-key");
 const notice = document.querySelector("#connection");
@@ -10,6 +12,9 @@ const ruleHost = document.querySelector("#rule-host");
 const rulesBody = document.querySelector("#rules-body");
 const ruleDefaults = document.querySelector("#rule-defaults");
 const fleetBody = document.querySelector("#fleet-body");
+const signOutButton = document.querySelector("#sign-out");
+const keyLabel = document.querySelector('label[for="api-key"]');
+const signInButton = form.querySelector('button[type="submit"]');
 const hostDetail = document.querySelector("#host-detail");
 const ruleLabels = {
   HIGH_CPU: "High CPU",
@@ -33,33 +38,33 @@ function escapeHtml(value) {
   );
 }
 
-// The key lives in a closure for the page's lifetime rather than in the DOM or storage:
-// it is not readable from the input, not restored after a reload, and not in localStorage.
-// This reduces exposure; it is not a session system. A real one needs same-origin serving
-// and an HttpOnly cookie, which is a later phase.
-let apiKey = "";
+// The key is sent once, to POST /session, and is never held by this page afterwards. The session
+// itself lives in an HttpOnly cookie the browser attaches automatically, so no script here - nor
+// any script injected into this page - can read it.
+let signedIn = false;
 
-function headers() {
-  return { "X-EventWatch-Key": apiKey };
-}
-
-async function getJson(path) {
-  const response = await fetch(`${apiBase}${path}`, { headers: headers() });
-  const body = await response.json();
-  if (!response.ok) throw new Error(body.message || "Request failed");
-  return body;
-}
-
-async function sendJson(method, path, body) {
-  const options = { method, headers: headers() };
+async function request(method, path, body) {
+  const options = { method, credentials: "same-origin" };
   if (body !== undefined) {
-    options.headers = { ...headers(), "Content-Type": "application/json" };
+    options.headers = { "Content-Type": "application/json" };
     options.body = JSON.stringify(body);
   }
   const response = await fetch(`${apiBase}${path}`, options);
+  if (response.status === 401) {
+    signOut(false);
+    throw new Error("Session expired. Sign in again.");
+  }
   const result = await response.json();
   if (!response.ok) throw new Error(result.message || "Request failed");
   return result;
+}
+
+async function getJson(path) {
+  return request("GET", path);
+}
+
+async function sendJson(method, path, body) {
+  return request(method, path, body);
 }
 
 function hostLabel(hostId) {
@@ -235,15 +240,7 @@ async function showNotifications(alertKey) {
 }
 
 async function updateAlert(alertKey, action) {
-  const response = await fetch(
-    `${apiBase}/alerts/${encodeURIComponent(alertKey)}/${action}`,
-    {
-      method: "POST",
-      headers: headers(),
-    },
-  );
-  const body = await response.json();
-  if (!response.ok) throw new Error(body.message || "Alert update failed");
+  await request("POST", `/alerts/${encodeURIComponent(alertKey)}/${action}`);
   await refresh();
 }
 
@@ -263,7 +260,7 @@ function renderHostOptions(hosts) {
 }
 
 async function refresh() {
-  if (!apiKey) return;
+  if (!signedIn) return;
   try {
     const host = hostFilter.value;
     const eventsPath = host
@@ -292,16 +289,76 @@ async function refresh() {
   }
 }
 
-form.addEventListener("submit", (event) => {
-  event.preventDefault();
-  if (keyInput.value) {
-    apiKey = keyInput.value;
-    // Clear the field so the key is not sitting in the DOM for the rest of the session.
-    keyInput.value = "";
-    keyInput.placeholder = "Connected";
+function showSignedIn(state) {
+  signedIn = state;
+  keyInput.hidden = state;
+  keyLabel.hidden = state;
+  signInButton.hidden = state;
+  signOutButton.hidden = !state;
+}
+
+// Signing out has to take the telemetry off the screen too: leaving the last view rendered on a
+// shared machine hands it to whoever sits down next.
+function clearPanels() {
+  for (const id of ["#host-count", "#total-events", "#active-alerts", "#average-cpu", "#average-ram"]) {
+    document.querySelector(id).textContent = "--";
   }
-  refresh();
+  eventsBody.innerHTML = "";
+  alertsList.innerHTML = "";
+  fleetBody.innerHTML = "";
+  rulesBody.innerHTML = "";
+  hostDetail.innerHTML = "";
+  knownHosts = [];
+}
+
+function signOut(revoke) {
+  showSignedIn(false);
+  clearPanels();
+  keyInput.placeholder = "EVENTWATCH_API_KEY";
+  if (revoke) {
+    fetch(`${apiBase}/session`, { method: "DELETE", credentials: "same-origin" }).catch(() => {});
+    notice.textContent = "Signed out.";
+    notice.style.borderColor = "var(--teal)";
+  }
+}
+
+form.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!keyInput.value) return;
+  const key = keyInput.value;
+  // Clear the field immediately: the key is needed for this one request and nothing else.
+  keyInput.value = "";
+  try {
+    const response = await fetch(`${apiBase}/session`, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ api_key: key }),
+    });
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.message || "Sign-in failed");
+    showSignedIn(true);
+    await refresh();
+  } catch (error) {
+    reportFailure(error);
+  }
 });
+
+signOutButton.addEventListener("click", () => signOut(true));
+
+// The cookie outlives the page, so a reload should not ask for the key again.
+async function restoreSession() {
+  try {
+    const response = await fetch(`${apiBase}/session`, { credentials: "same-origin" });
+    if (!response.ok) return;
+    showSignedIn(true);
+    await refresh();
+  } catch {
+    // No session, or the service is not reachable yet: the sign-in form is already showing.
+  }
+}
+
+restoreSession();
 document.querySelector("#refresh").addEventListener("click", refresh);
 
 function reportFailure(error) {

@@ -19,7 +19,9 @@ services:
 
   analytics:
     build:
-      context: ./java-analytics
+      # The root, so the image can carry the dashboard alongside the jar.
+      context: .
+      dockerfile: java-analytics/Dockerfile
     environment:
       EVENTWATCH_API_KEY: ${EVENTWATCH_API_KEY:?set EVENTWATCH_API_KEY in .env}
       HTTP_PORT: 8080
@@ -31,7 +33,8 @@ services:
       DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-10}
       RETENTION_DAYS: ${RETENTION_DAYS:-0}
       RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-100}
-      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+      SESSION_TTL_MINUTES: ${SESSION_TTL_MINUTES:-720}
+      SESSION_RATE_LIMIT_PER_MINUTE: ${SESSION_RATE_LIMIT_PER_MINUTE:-10}
       METRICS_REQUIRE_KEY: ${METRICS_REQUIRE_KEY:-false}
       TLS_ENABLED: ${TLS_ENABLED:-false}
       TLS_KEYSTORE_PATH: ${TLS_KEYSTORE_PATH:-}
@@ -76,17 +79,6 @@ services:
     depends_on:
       analytics:
         condition: service_healthy
-    restart: unless-stopped
-
-  dashboard:
-    # Port 3000 is not arbitrary: the analytics CORS policy only allows that origin.
-    image: nginx:1.27-alpine
-    volumes:
-      - ./dashboard:/usr/share/nginx/html:ro
-    ports:
-      - "3000:80"
-    depends_on:
-      - analytics
     restart: unless-stopped
 
 volumes:

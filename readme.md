@@ -10,7 +10,7 @@ It is built without web frameworks, an ORM, or a DI container on either side, so
 retries, queueing, deduplication, alert state, delivery — is visible in the code rather than hidden
 behind configuration.
 
-**Status:** Phases 1–17 complete. 248 tests pass: 191 Java, 53 Go agent, 4 load harness.
+**Status:** Phases 1–18 complete. 265 tests pass: 208 Java, 53 Go agent, 4 load harness.
 `CLAUDE.md` is the working guide for contributors and records what is deliberately deferred.
 
 **Scope:** built for roughly 5–50 machines. It is not an APM, a log aggregator, or a metrics
@@ -64,6 +64,10 @@ traceable across both services' logs, even when it arrived hours late through th
 it is healthy, so silence there means it died. The agent covers the other direction: when nothing
 has reached analytics for a while, the agent — which is still running — says so through a webhook
 of its own.
+
+**Signs operators in.** The dashboard is served by the analytics service, so the two share an
+origin. The API key is presented once, to `POST /session`, and exchanged for an `HttpOnly`
+cookie the page itself cannot read.
 
 **Defends itself.** The agent binds to loopback by default and refuses to bind anywhere else without
 a key. The analytics API authenticates every data route, rate-limits ingestion per client, validates
@@ -147,7 +151,12 @@ shutdown grace, and silence windows all come from `.env` with in-code fallbacks.
 test should never need a source change — and a hardcoded rate limit once made a whole benchmark
 meaningless.
 
-**15. One class per route, one engine per instance.** Routing used to be six hundred lines of inline
+**15. The credential the dashboard holds should not be the one that opens everything.** Serving
+the page from the analytics service makes it same-origin, and that one change is what lets the key
+be exchanged for an `HttpOnly` cookie the page cannot read, removes the CORS allowlist, and deletes
+a container. A feature that takes moving parts away is usually the right shape.
+
+**16. One class per route, one engine per instance.** Routing used to be six hundred lines of inline
 lambdas over static fields, which meant a single engine could run in a JVM. Each route is now its
 own class over a shared context, and the cross-cutting work every route repeated — the preflight,
 the method check, the API key, and turning a bad parameter into 400 and unreachable storage into 503
@@ -172,7 +181,7 @@ Client or application
         ↓                        ↓
    SQLite / PostgreSQL      webhook + Prometheus + JSON logs
         ↑
-   Dashboard :3000  (query API only, never the database)
+   Dashboard (served by the service at :8080, query API only, never the database)
 ```
 
 One event, end to end:
@@ -300,15 +309,18 @@ java-analytics/                 Maven Java analytics service
 		EngineContext.java             Everything one running engine owns
 		ApiHandler.java                What every authenticated route repeats
 		*Handler.java                  One class per route
-		HttpSupport.java               Auth, CORS policy, response envelope
+		HttpSupport.java               Key or cookie auth, the session cookie, responses
+		SessionHandler.java            Sign in, probe, and sign out
+		SessionStore.java              In-memory operator sessions
+		DashboardHandler.java          Static files at /, with the traversal check
 		Metrics.java                   Prometheus counters and gauges
 		StructuredLogger.java          One JSON object per log line
 	src/test/java/com/main/            180 tests, including a live PostgreSQL suite
 	Dockerfile
-dashboard/                      Static browser dashboard (index.html, app.js, styles.css)
+dashboard/                      Browser dashboard, served by the analytics service
 loadtest/                       Throughput and latency harness
 testdata/event-contract.json    Cross-language JSON contract fixture
-docker-compose.yml              Agent, analytics, dashboard, optional PostgreSQL
+docker-compose.yml              Agent and analytics, optional PostgreSQL
 .github/workflows/ci.yml        Build, test, scan, and image pipeline
 ```
 
@@ -340,12 +352,9 @@ cd go-collector
 go run .
 ```
 
-In a third, serve the dashboard and open `http://localhost:3000`, entering `EVENTWATCH_API_KEY` when
-it asks. Use that exact origin, or add yours to `CORS_ALLOWED_ORIGINS`.
-
-```powershell
-python -m http.server 3000 -d dashboard
-```
+Then open `http://localhost:8080` and sign in with `EVENTWATCH_API_KEY`. The analytics service
+serves the dashboard itself, from `DASHBOARD_DIR`, so there is no second server to start and no
+origin to configure.
 
 ### Send an event
 
@@ -482,17 +491,23 @@ The agent verifies the certificate against `BACKEND_CA_FILE`, so a private CA wo
 weakening anything. `BACKEND_TLS_SKIP_VERIFY=true` encrypts without authenticating — useful for a
 first run, never for a real deployment, and the agent logs a warning whenever it is set.
 
-**CORS.** `CORS_ALLOWED_ORIGINS` is a comma-separated allowlist. An origin outside it receives no
-`Access-Control-Allow-Origin` header; an empty list allows nothing.
+**Operator sessions.** The key is sent once, to `POST /session`, and comes back as an `HttpOnly`,
+`SameSite=Strict` cookie. `HttpOnly` keeps it out of reach of any script on the page, including an
+injected one; `SameSite=Strict` means a request from another site never carries it, which is what
+stands in for a CSRF token. Sign-in has its own rate limit, tighter than ingestion, because it is
+the one route that accepts an unauthenticated request and checks a secret. `DELETE /session` revokes
+the token on the server, not just in the browser.
+
+Sessions are held in memory, so restarting the service signs everyone out. Agents and scripts are
+unaffected: they have no cookie jar and keep sending `X-EventWatch-Key`.
 
 **Metrics.** `/metrics` is open by default because scrapers rarely send custom headers. Set
 `METRICS_REQUIRE_KEY=true` to close the analytics endpoint; restrict the agent's at the network
 layer.
 
-**Known gap.** The dashboard holds the API key in page memory for the session — cleared from the
-input once you connect and never written to storage, but still reachable by script running on that
-page. Closing it properly needs same-origin serving and an HttpOnly session cookie. Treat dashboard
-access as equivalent to holding the key.
+**Serving the dashboard elsewhere.** There is no CORS configuration any more. If the page has to
+live on another origin, put both behind one reverse proxy so they still share one — the cookie
+depends on it.
 
 ---
 
@@ -598,8 +613,8 @@ active alerts, silent agents, stored rows, and processing latency.
 docker compose up --build
 ```
 
-Compose starts analytics on `8080`, the agent on `8082`, and the dashboard on `3000`, reading the
-same root `.env`. Telemetry and the pending queue live on named volumes, so a container restart
+Compose starts analytics on `8080` — serving the dashboard from the same port — and the agent on
+`8082`, reading the same root `.env`. Telemetry and the pending queue live on named volumes, so a container restart
 keeps both history and undelivered events. The agent waits for the analytics health check first.
 
 Because a published container port is reachable, the agent image binds to every interface and the
@@ -631,6 +646,10 @@ local sink, the engine start/stop lifecycle, retention, TLS with a generated cer
 metric and log formats. An end-to-end pass drives the real HTTP server on an ephemeral port with a
 temporary database, covering restart recovery, two machines staying independent, per-host rules
 changing which machines alert, and a silent machine raising and then resolving its own alert.
+
+The session and the static handler have their own suites: the cookie's attributes, that signing out
+revokes the token on the server rather than only in the browser, that sign-in is rate limited, and
+that an encoded path traversal cannot read a file from outside the served directory.
 
 Test classes run in parallel, which the phase 17 refactor made possible: two engines can now run in
 one JVM without sharing a key, a database, a metrics registry or an event window, and one test
@@ -695,7 +714,9 @@ in-code fallback, so an absent key is never fatal.
 | `BACKEND_TLS_SKIP_VERIFY` | `false` | Encrypt without verifying. Never in production |
 | `TLS_ENABLED` | `false` | Serve the analytics API over HTTPS |
 | `TLS_KEYSTORE_PATH` / `_PASSWORD` / `_TYPE` | empty / empty / `PKCS12` | Keystore for TLS |
-| `CORS_ALLOWED_ORIGINS` | `http://localhost:3000,http://127.0.0.1:3000` | Dashboard origin allowlist |
+| `DASHBOARD_DIR` | `../dashboard` | Directory served at `/`; empty runs the service as an API only |
+| `SESSION_TTL_MINUTES` | `720` | How long an operator session lasts |
+| `SESSION_RATE_LIMIT_PER_MINUTE` | `10` | Sign-in attempts allowed per address |
 | `METRICS_REQUIRE_KEY` | `false` | Close the analytics `/metrics` endpoint |
 | `HOST_ID` / `HOSTNAME_OVERRIDE` / `HOST_ID_FILE` | empty | Pin agent identity, rename it, or relocate its file |
 | `PENDING_EVENTS_DIR` | `pending-events` | Durable queue location |
@@ -728,8 +749,10 @@ in-code fallback, so an absent key is never fatal.
 
 ## Limitations and what is next
 
-- **The dashboard session.** The API key lives in page memory; closing that needs same-origin
-  serving and an HttpOnly cookie.
+- **One shared key for the whole fleet.** It cannot be rotated or revoked per machine, so one
+  leaked agent means rotating everywhere. Per-agent credentials are the next phase.
+- **Sessions do not survive a restart.** They are held in memory on purpose, rather than storing a
+  second long-lived secret beside the telemetry; restarting the service signs operators out.
 - **One analytics instance.** Alert rules are cached per process and notification cooldowns are
   held in memory, so a second instance would need cache invalidation and shared reservations.
 - **The watchdog still needs somewhere to point.** Phase 16 closed the silent-death gap from
@@ -765,6 +788,7 @@ The project was built in phases; each is a single commit.
 | 15 | Fleet operations | Silence detection, per-machine drill-down, agent version and queue depth |
 | 16 | Watchdog | Analytics heartbeat and agent-side delivery-stall alerts |
 | 17 | Internal structure | One class per route, one engine per instance, parallel tests |
+| 18 | Operator session | Same-origin dashboard, HttpOnly session cookie, no CORS |
 
 `agent.md` is the original roadmap, kept for history. `CLAUDE.md` is the current authority on state,
 conventions, and what comes next.

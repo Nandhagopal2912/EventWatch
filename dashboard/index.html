@@ -17,11 +17,12 @@
       <form id="config-form" class="config" autocomplete="off">
         <label for="api-key">API key</label>
         <input id="api-key" name="api-key" type="password" placeholder="EVENTWATCH_API_KEY">
-        <button type="submit">Connect</button>
+        <button type="submit">Sign in</button>
+        <button id="sign-out" class="quiet" type="button" hidden>Sign out</button>
       </form>
     </header>
 
-    <section id="connection" class="notice" aria-live="polite">Enter the API key to load telemetry.</section>
+    <section id="connection" class="notice" aria-live="polite">Sign in with the API key to load telemetry.</section>
 
     <section class="metrics" aria-label="Telemetry summary">
       <article class="metric"><span>Machines</span><strong id="host-count">--</strong></article>

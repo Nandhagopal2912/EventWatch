@@ -19,7 +19,7 @@ downstream — per-host windows, per-host alert keys, the fleet listing — foll
 | --- | --- | --- | --- |
 | `go-collector/` | Go 1.27, stdlib + gopsutil + godotenv | 8082 | One per machine: stable identity, version, host CPU/RAM, durable retry queue |
 | `java-analytics/` | Java 17, Maven, `com.sun.net.httpserver` + Jackson + sqlite-jdbc/PostgreSQL + HikariCP | 8080 | Validates, persists, evaluates per-host rules, serves query and rules API |
-| `dashboard/` | Static HTML/CSS/JS, no build step | 3000 (any static server) | Reads the Java query API only; never touches SQLite |
+| `dashboard/` | Static HTML/CSS/JS, no build step | served by analytics on 8080 | Reads the Java query API only; never touches SQLite |
 
 Deliberate constraint: **no web frameworks, no ORM, no DI container** on either side. Spring, Gin,
 Hibernate and friends are out of scope — the point is to see the machinery. Do not introduce one
@@ -37,10 +37,6 @@ cd java-analytics && mvn compile exec:java
 
 ```bash
 cd go-collector && go run .
-```
-
-```bash
-python -m http.server 3000 -d dashboard
 ```
 
 Checks:
@@ -63,8 +59,9 @@ Notes:
 - `java-analytics/.mvn/jvm.config` pins `-Xms64m -Xmx128m`; do not remove it — it exists because the
   dev machine has a small paging file.
 - `events.db` is created on first Java start. It is gitignored and disposable; delete it to reset.
-- Open the dashboard at `http://localhost:3000`, which is what `CORS_ALLOWED_ORIGINS` allows by
-  default. Serve it from anywhere else and that origin has to be added to the list.
+- Open the dashboard at `http://localhost:8080`. The analytics service serves it from
+  `DASHBOARD_DIR` (`../dashboard` by default), which is what makes it same-origin with the API.
+  Leave that setting empty to run the service as an API only.
 
 Smoke test end to end:
 
@@ -101,7 +98,10 @@ java-analytics/src/main/java/com/main/
   HostsHandler.java             /hosts and the per-machine drill-down
   AlertsHandler.java            /alerts      AlertDetailHandler.java  one alert and its actions
   RulesHandler.java             /rules and /rules/effective
-  HttpSupport.java              Auth, CORS policy, response envelope, correlation id
+  HttpSupport.java              Key or cookie auth, the session cookie, response envelope
+  SessionHandler.java           POST/GET/DELETE /session: sign in, probe, sign out
+  SessionStore.java             In-memory operator sessions, bounded and expiring
+  DashboardHandler.java         Static files at /, with the traversal check
   RequestParameters.java        Query-string parsing, shared by every read route
   EventValidation.java          The ingestion contract in one place
   LogEntry.java                 One telemetry event, as the repositories and rules see it
@@ -144,19 +144,21 @@ java-analytics/src/test/java/com/main/
   PostgresBackendTest.java      The storage layer against a real PostgreSQL; skipped without one
   RetentionServiceTest.java     Prune boundaries and failure handling
   EngineLifecycleTest.java      Pool released on stop and on every failed start
-  SecurityTest.java             CORS, metrics auth, and a real TLS handshake (TestKeystore)
+  SecurityTest.java             Metrics auth and a real TLS handshake (TestKeystore)
   AlertRulesTest.java           Rule precedence, validation, persistence
   RulesApiTest.java             The rules API changing which machines alert, end to end
   AlertRulesPostgresTest.java   Rule storage on a real PostgreSQL; skipped without one
   AgentSilenceMonitorTest.java  Silence thresholds, the forget window, the gauge
   FleetApiTest.java             Fleet listing, drill-down, silence raised and resolved
   MultipleEnginesTest.java      Two engines in one JVM: separate keys, metrics, windows
+  SessionApiTest.java           Cookie attributes, revocation, rate limit, expiry
+  DashboardServingTest.java     Static serving, content types, and the traversal attempts
   WatchdogHeartbeatTest.java    Heartbeat payload, failures, and the deliberate silence
 java-analytics/Dockerfile       Shaded jar on a JRE, database on a volume
 
 loadtest/main.go                Throughput and latency harness (its own module, stdlib only)
 testdata/event-contract.json    One canonical event, read by both test suites
-docker-compose.yml              Collector, analytics, dashboard
+docker-compose.yml              Collector and analytics; the dashboard ships in the analytics image
 .github/workflows/ci.yml        Go job, Java job, image build job
 
 dashboard/{index.html,app.js,styles.css}
@@ -188,8 +190,14 @@ Changes to this schema must stay backward compatible — additive fields only, n
 | Method | Path | Auth | Notes |
 | --- | --- | --- | --- |
 | POST | `/receive` (8080) | key | Ingest; rate limited per IP by `RATE_LIMIT_PER_MINUTE` (default 100) |
+| GET | `/` and dashboard assets (8080) | none | Served from `DASHBOARD_DIR`; the sign-in page |
+| POST | `/session` (8080) | key in body | Mints the session cookie; rate limited per IP |
+| GET | `/session` (8080) | key or cookie | 200 when signed in, 401 otherwise; used on reload |
+| DELETE | `/session` (8080) | none | Revokes the presented cookie and clears it |
 | GET | `/health` (8080, 8082) | none | 8080 also probes SQLite |
 | GET | `/metrics` (8080, 8082) | none, or key when `METRICS_REQUIRE_KEY` | Prometheus text format |
+
+Every route marked "key" accepts either the `X-EventWatch-Key` header or a session cookie.
 | GET | `/capture?level=&msg=` (8082) | none on loopback, key when exposed | Agent ingress |
 | GET | `/stress` (8082) | same as `/capture` | 500 events, 32 concurrent |
 | GET | `/events?level=&host_id=&from=&to=&limit=&offset=` | key | limit ≤ 200, default 50 |
@@ -250,25 +258,23 @@ Changes to this schema must stay backward compatible — additive fields only, n
 
 ## 5. Current state — read before starting work
 
-**Phases 1–17 are complete.** Everything is green:
+**Phases 1–18 are complete.** Everything is green:
 
-- `cd java-analytics && mvn verify` → 191 tests, BUILD SUCCESS (12 of them need
-  `EVENTWATCH_TEST_POSTGRES_URL`; CI supplies a server, locally they skip). Verified against a real
-  PostgreSQL 16 container with all 191 running.
+- `cd java-analytics && mvn verify` → 208 tests, BUILD SUCCESS (12 of them need
+  `EVENTWATCH_TEST_POSTGRES_URL`; CI supplies a server, locally they skip)
 - `cd go-collector && go vet ./... && go test ./...` → 53 tests, pass
 - `cd loadtest && go vet ./... && go test ./...` → 4 tests, pass
-- `docker compose up --build` → all services healthy
+- `docker compose up --build` → both services healthy, dashboard served on 8080
 
 The phase roadmap (1–15) delivered the system; 16 onward is hardening for real use, planned in
-section 17. Phase 17 rewrote the internals with no change to the HTTP surface: the routes are nine
-handler classes over an `EngineContext`, and `AnalyticsEngine` is an instance rather than a page of
-static fields, so several engines can run in one JVM. Test classes now run in parallel.
+section 18. Phase 18 moved the dashboard behind the analytics service so the two share an origin,
+exchanged the API key for an HttpOnly session cookie, and deleted the CORS configuration and the
+separate dashboard container along with it.
 
-**Next is Phase 18, the operator session.** Serving the dashboard from the analytics service makes
-it same-origin, which lets the API key move into an HttpOnly cookie and deletes the CORS
-configuration and the separate static container along with it.
+**Next is Phase 19, per-agent credentials.** One shared key cannot be rotated or revoked per
+machine, so one leaked agent compromises every host.
 
-B1–B17 in section 16 are all fixed.
+B1–B17 in section 17 are all fixed.
 
 ## 6. Phase 8 as built — notifications
 
@@ -383,7 +389,7 @@ filters meaning exactly the same thing everywhere.
 sweeps rate windows. The cutoff is exclusive, delivery history is pruned alongside the events that
 produced it, and a failed sweep is logged rather than thrown so the timer thread survives.
 
-**What is deliberately NOT done, and when to revisit** — see section 17. Short version: the file
+**What is deliberately NOT done, and when to revisit** — see section 18. Short version: the file
 queue and the two-service shape are both still comfortably inside what the measurements justify.
 
 ## 10. Phase 12 as built — host identity
@@ -458,7 +464,7 @@ logs a startup warning.
 
 **Rules are read on every event, so they are cached** in `AlertRules` and replaced wholesale on
 each write. That is correct for one analytics instance; a second instance would need a refresh
-interval or change notification — the same limitation as notification reminders in section 16.
+interval or change notification — the same limitation as notification reminders in section 17.
 
 **A wiring bug the tests caught before commit:** the CORS preflight still advertised
 `GET, POST, OPTIONS`, because the edit replaced the first of two identical strings — in the
@@ -562,7 +568,58 @@ parallelism keeps the grouping exact but only reached 25s, so it was not worth t
 rather than of one engine, so they stay global — and that is precisely why `ObservabilityTest` needs
 its lock.
 
-## 16. Fixed defects and remaining quality work
+## 16. Phase 18 as built — operator session
+
+**Same-origin came first; everything else follows from it.** `DashboardHandler` serves the
+dashboard from the analytics service at `/`, registered last so every API path claims its longer
+prefix first. Once the page and the API share an origin, a `SameSite=Strict` cookie works, there is
+no preflight to configure, and the separate nginx container and its port have nothing left to do.
+
+**The key is presented once and then never again.** `POST /session` takes it in the body and
+returns an `HttpOnly; SameSite=Strict` cookie. The token is 256 random bits and is not derived from
+the key, so a stolen session cannot be turned back into the credential that minted it. `HttpOnly`
+is the substantive part: verified live, `document.cookie` is empty while signed in, so an XSS hole
+in the dashboard can no longer read the operator's credential — which is exactly what B2 could have
+reached under the old scheme.
+
+**Both ways in are kept, because there are two kinds of caller.** An agent or a curl script has no
+cookie jar and still sends `X-EventWatch-Key`; a browser sends the cookie. One `isAuthorized`
+accepts either, so no route needed to know the difference.
+
+**`SameSite=Strict` is the CSRF defence.** A request originating from another site never carries
+the cookie, which is what a token would otherwise be for. That only holds because the dashboard is
+same-origin — the two decisions are the same decision.
+
+**Sign-in is rate limited separately and more tightly.** It is the one route that must accept an
+unauthenticated request *and* checks a secret, which makes it the only brute-force target in the
+service. `SESSION_RATE_LIMIT_PER_MINUTE` defaults to 10 against ingestion's 100, and a refusal says
+nothing beyond `Unauthorized`.
+
+**`GET /session` exists because a reload should not ask for the key again.** The first cut had no
+probe: the cookie survived the reload and the API accepted it, but the page still showed the
+sign-in form and signing in again minted a second token — a session the page could not see is half
+a session. Found by reloading the browser, not by a test.
+
+**Signing out clears the page as well as the token.** The rendered fleet and event table would
+otherwise stay on screen for whoever sits down next, which is a strange thing for a sign-out to
+leave behind. One `showSignedIn` decides the header state too, after the first cut hid the key
+field and left its label floating above the buttons.
+
+**Sessions live in memory and a restart ends them.** That is the honest behaviour for one instance
+and avoids storing a second long-lived secret next to the telemetry. The store is bounded like
+every other map here, and the maintenance timer sweeps expired tokens rather than waiting for
+someone to present one.
+
+**The traversal check is the load-bearing line in the static handler.** The path is decoded before
+it is resolved and normalised, so an encoded `%2e%2e%2f` is caught by the same containment check as
+a plain `../`. Removing that one check was verified to leak a file from outside the served
+directory, which is why the test asserts on the *content* rather than only the status.
+
+**CORS is gone, not disabled.** `CORS_ALLOWED_ORIGINS` no longer exists. Hosting the dashboard on a
+different origin is now a reverse-proxy question, which is the correct answer anyway; the header
+path still works for anything that is not a browser.
+
+## 17. Fixed defects and remaining quality work
 
 ### Fixed (keep these fixed — each has a way to regress)
 
@@ -663,7 +720,7 @@ by reading `docker compose ps` rather than trusting that the stack was up.
   in memory alongside the SQL `lastDeliveredAt` lookup; a restart falls back to the SQL value, which
   is correct but means an in-flight reservation is lost. Fine for one instance, wrong for two.
 
-## 17. Roadmap and deferred work
+## 18. Roadmap and deferred work
 
 **The phase roadmap (1–15) is complete.** What follows is hardening for real use rather than new
 capability. Phases 16–20 are planned, one commit each, in this order.
@@ -689,7 +746,7 @@ out of `start()` into classes with an injected context and drop the static colla
 Unlocks parallel test execution and stops phases 18 and 19 from adding several hundred lines to a
 class that is already a thousand. Doing it before those two, rather than after, is the whole point.
 
-**Phase 18 — Operator session.** Serve the dashboard from the analytics service so it is
+**Phase 18 — Operator session.** Done (see section 16). Serve the dashboard from the analytics service so it is
 same-origin, then exchange the API key for an HttpOnly `SameSite=Strict` cookie at `POST /session`,
 accepting cookie or header. The key leaves page memory, the CORS configuration becomes unnecessary,
 and the separate static server and its Compose container disappear. A feature that deletes moving
@@ -744,7 +801,7 @@ than changing databases.
 
 ---
 
-## 18. Definition of done for a release
+## 19. Definition of done for a release
 
 - Events are authenticated, validated, persisted transactionally, deduplicated, and queryable.
 - A temporary Java outage loses nothing and duplicates nothing.

@@ -135,7 +135,8 @@ jobs:
       - name: Build the analytics image
         uses: docker/build-push-action@v6
         with:
-          context: ./java-analytics
+          context: .
+          file: java-analytics/Dockerfile
           push: false
           cache-from: type=gha
           cache-to: type=gha,mode=max

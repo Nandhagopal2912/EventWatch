@@ -130,6 +130,19 @@ public class AnalyticsEngine {
         server.createContext("/alerts", new AlertsHandler(context));
         // Registered after /alerts so the longer prefix wins for keyed routes.
         server.createContext("/alerts/", new AlertDetailHandler(context));
+        server.createContext("/session", new SessionHandler(context));
+
+        // The dashboard is served last and at the root, so every API path above claims its own
+        // longer prefix first. Serving it here is what makes the session cookie same-origin.
+        java.nio.file.Path dashboard = context.dashboardDirectory();
+        if (dashboard != null) {
+            server.createContext("/", new DashboardHandler(context, dashboard));
+            StructuredLogger.info("serving the dashboard",
+                    StructuredLogger.fields("directory", dashboard.toAbsolutePath().toString()));
+        } else {
+            StructuredLogger.info("dashboard not served; DASHBOARD_DIR is unset or missing",
+                    StructuredLogger.fields());
+        }
     }
 
     private static ScheduledExecutorService scheduleMaintenance(EngineContext context,
@@ -140,9 +153,13 @@ public class AnalyticsEngine {
             return thread;
         });
 
-        // Without eviction the rate-limit map grows with every distinct client address.
-        maintenance.scheduleWithFixedDelay(context.rateLimiter()::sweepExpired,
-                RATE_WINDOW_SWEEP_SECONDS, RATE_WINDOW_SWEEP_SECONDS, TimeUnit.SECONDS);
+        // Without eviction the rate-limit map grows with every distinct client address, and
+        // expired sessions would sit in memory until someone happened to present one.
+        maintenance.scheduleWithFixedDelay(() -> {
+            context.rateLimiter().sweepExpired();
+            context.sessionRateLimiter().sweepExpired();
+            context.sessions().sweepExpired(java.time.Instant.now());
+        }, RATE_WINDOW_SWEEP_SECONDS, RATE_WINDOW_SWEEP_SECONDS, TimeUnit.SECONDS);
 
         if (context.retention().enabled()) {
             long sweepMinutes = configuration.retentionSweepMinutes();

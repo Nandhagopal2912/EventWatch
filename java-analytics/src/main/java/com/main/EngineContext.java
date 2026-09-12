@@ -2,6 +2,7 @@ package com.main;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.sql.SQLException;
+import java.nio.file.Path;
 import java.time.Duration;
 
 /**
@@ -31,6 +32,8 @@ class EngineContext {
     private final WatchdogHeartbeat watchdogHeartbeat;
     private final RecentEvents recentEvents;
     private final RateLimiter rateLimiter;
+    private final RateLimiter sessionRateLimiter;
+    private final SessionStore sessions;
     private final TelemetryReport telemetryReport;
 
     EngineContext(EngineConfiguration configuration, Database database) throws SQLException {
@@ -38,9 +41,13 @@ class EngineContext {
         this.database = database;
         this.objectMapper = new ObjectMapper();
         this.metrics = new Metrics();
-        this.http = new HttpSupport(objectMapper, metrics,
-                configuration.apiKey(), configuration.corsAllowedOrigins());
+        this.sessions = new SessionStore(
+                Duration.ofMinutes(configuration.sessionTimeToLiveMinutes()), metrics);
+        this.http = new HttpSupport(objectMapper, metrics, configuration.apiKey(), sessions,
+                configuration.tlsEnabled());
         this.rateLimiter = new RateLimiter(configuration.rateLimitPerMinute());
+        // Sign-in is the one open endpoint that checks a secret, so it gets its own tighter limit.
+        this.sessionRateLimiter = new RateLimiter(configuration.sessionRateLimitPerMinute());
 
         this.eventRepository = new EventRepository(database.connections(), database.dialect());
         this.recentEvents = new RecentEvents(eventRepository, MOVING_AVERAGE_WINDOW);
@@ -148,6 +155,24 @@ class EngineContext {
 
     RateLimiter rateLimiter() {
         return rateLimiter;
+    }
+
+    RateLimiter sessionRateLimiter() {
+        return sessionRateLimiter;
+    }
+
+    SessionStore sessions() {
+        return sessions;
+    }
+
+    /** The dashboard directory to serve, or null when none is configured or it is absent. */
+    Path dashboardDirectory() {
+        String configured = configuration.dashboardDirectory();
+        if (configured == null || configured.isBlank()) {
+            return null;
+        }
+        Path directory = Path.of(configured);
+        return java.nio.file.Files.isDirectory(directory) ? directory : null;
     }
 
     TelemetryReport telemetryReport() {

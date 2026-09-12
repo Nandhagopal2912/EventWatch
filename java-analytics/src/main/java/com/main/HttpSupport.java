@@ -7,20 +7,18 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
-import java.util.List;
+import java.time.Instant;
 
 /**
- * Everything the route handlers share about speaking HTTP: authentication, the CORS policy, the
- * response envelope, and the correlation id that ties a response back to its request.
+ * Everything the route handlers share about speaking HTTP: authentication, the response
+ * envelope, the session cookie, and the correlation id that ties a response back to its request.
  *
- * <p>One instance per engine, because the key and the origin allowlist are configuration.
+ * <p>One instance per engine, because the key and the session store belong to that engine.
  */
 class HttpSupport {
     static final int MAX_REQUEST_BYTES = 64 * 1024;
     static final String API_KEY_HEADER = "X-EventWatch-Key";
-    // One API-wide policy. Two copies of this string is exactly how the phase 14 preflight bug
-    // happened: an edit fixed the first occurrence and left the second advertising less.
-    private static final String ALLOWED_METHODS = "GET, POST, PUT, DELETE, OPTIONS";
+    static final String SESSION_COOKIE = "eventwatch_session";
 
     // Correlation ids are per-request state, so the response helpers read them from here.
     private static final ThreadLocal<String> CORRELATION_ID = new ThreadLocal<>();
@@ -28,13 +26,16 @@ class HttpSupport {
     private final ObjectMapper objectMapper;
     private final Metrics metrics;
     private final String apiKey;
-    private final List<String> allowedOrigins;
+    private final SessionStore sessions;
+    private final boolean secureCookies;
 
-    HttpSupport(ObjectMapper objectMapper, Metrics metrics, String apiKey, List<String> allowedOrigins) {
+    HttpSupport(ObjectMapper objectMapper, Metrics metrics, String apiKey, SessionStore sessions,
+            boolean secureCookies) {
         this.objectMapper = objectMapper;
         this.metrics = metrics;
         this.apiKey = apiKey;
-        this.allowedOrigins = allowedOrigins;
+        this.sessions = sessions;
+        this.secureCookies = secureCookies;
     }
 
     static void setCorrelationId(String correlationId) {
@@ -49,8 +50,15 @@ class HttpSupport {
         CORRELATION_ID.remove();
     }
 
+    /**
+     * Two ways in, for two kinds of caller. An agent or a script presents the shared key on every
+     * request; a browser presents a session cookie, so the key never has to live in page memory.
+     */
     boolean isAuthorized(HttpExchange exchange) {
-        return isValidApiKey(exchange.getRequestHeaders().getFirst(API_KEY_HEADER));
+        if (isValidApiKey(exchange.getRequestHeaders().getFirst(API_KEY_HEADER))) {
+            return true;
+        }
+        return sessions.isValid(cookie(exchange, SESSION_COOKIE), Instant.now());
     }
 
     boolean isValidApiKey(String receivedKey) {
@@ -65,6 +73,35 @@ class HttpSupport {
         return bodyBytes.length > MAX_REQUEST_BYTES ? null : bodyBytes;
     }
 
+    static String cookie(HttpExchange exchange, String name) {
+        for (String header : exchange.getRequestHeaders().getOrDefault("Cookie", java.util.List.of())) {
+            for (String pair : header.split(";")) {
+                int equals = pair.indexOf('=');
+                if (equals > 0 && pair.substring(0, equals).trim().equals(name)) {
+                    return pair.substring(equals + 1).trim();
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * HttpOnly keeps the token out of reach of any script on the page, so an XSS hole cannot read
+     * it. SameSite=Strict means a request from another site never carries it, which is what stands
+     * in for a CSRF token here. Secure is set whenever the listener is TLS.
+     */
+    void setSessionCookie(HttpExchange exchange, String token) {
+        exchange.getResponseHeaders().add("Set-Cookie", SESSION_COOKIE + "=" + token
+                + "; Path=/; HttpOnly; SameSite=Strict; Max-Age=" + sessions.secondsToLive()
+                + (secureCookies ? "; Secure" : ""));
+    }
+
+    void clearSessionCookie(HttpExchange exchange) {
+        exchange.getResponseHeaders().add("Set-Cookie", SESSION_COOKIE
+                + "=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"
+                + (secureCookies ? "; Secure" : ""));
+    }
+
     void sendResponse(HttpExchange exchange, int status, String message) throws IOException {
         ObjectNode body = objectMapper.createObjectNode();
         body.put("status", status >= 400 ? "error" : "ok");
@@ -73,17 +110,21 @@ class HttpSupport {
         if (correlationId != null && !correlationId.isBlank()) {
             body.put("correlation_id", correlationId);
         }
-        write(exchange, status, objectMapper.writeValueAsBytes(body));
+        write(exchange, status, objectMapper.writeValueAsBytes(body), "application/json; charset=UTF-8");
     }
 
     void sendJsonResponse(HttpExchange exchange, int status, String response) throws IOException {
-        write(exchange, status, response.getBytes(StandardCharsets.UTF_8));
+        write(exchange, status, response.getBytes(StandardCharsets.UTF_8), "application/json; charset=UTF-8");
     }
 
-    private void write(HttpExchange exchange, int status, byte[] responseBytes) throws IOException {
+    void sendBytes(HttpExchange exchange, int status, byte[] body, String contentType) throws IOException {
+        write(exchange, status, body, contentType);
+    }
+
+    private void write(HttpExchange exchange, int status, byte[] responseBytes, String contentType)
+            throws IOException {
         recordResponse(exchange, status);
-        addCorsHeaders(exchange);
-        exchange.getResponseHeaders().set("Content-Type", "application/json; charset=UTF-8");
+        exchange.getResponseHeaders().set("Content-Type", contentType);
         exchange.sendResponseHeaders(status, responseBytes.length);
         try (OutputStream output = exchange.getResponseBody()) {
             output.write(responseBytes);
@@ -97,24 +138,5 @@ class HttpSupport {
         if (correlationId != null && !correlationId.isBlank()) {
             exchange.getResponseHeaders().set("X-Correlation-ID", correlationId);
         }
-    }
-
-    void addCorsHeaders(HttpExchange exchange) {
-        String origin = exchange.getRequestHeaders().getFirst("Origin");
-        // The allowlist is configuration; a hardcoded origin made the dashboard undeployable.
-        if (origin != null && allowedOrigins.contains(origin)) {
-            exchange.getResponseHeaders().set("Access-Control-Allow-Origin", origin);
-        }
-        exchange.getResponseHeaders().set("Access-Control-Allow-Headers", "Content-Type, " + API_KEY_HEADER);
-    }
-
-    boolean handleCorsPreflight(HttpExchange exchange) throws IOException {
-        if (!"OPTIONS".equalsIgnoreCase(exchange.getRequestMethod())) {
-            return false;
-        }
-        addCorsHeaders(exchange);
-        exchange.getResponseHeaders().set("Access-Control-Allow-Methods", ALLOWED_METHODS);
-        exchange.sendResponseHeaders(204, -1);
-        return true;
     }
 }

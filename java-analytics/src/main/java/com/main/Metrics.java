@@ -20,6 +20,8 @@ public final class Metrics {
     private final Map<String, AtomicLong> notifications = new ConcurrentHashMap<>();
     private final Map<String, AtomicLong> watchdogPings = new ConcurrentHashMap<>();
     private final Map<String, AtomicLong> httpRequests = new ConcurrentHashMap<>();
+    private final Map<String, AtomicLong> sessions = new ConcurrentHashMap<>();
+    private final AtomicLong sessionsActive = new AtomicLong();
 
     public void recordEventReceived() {
         eventsReceived.incrementAndGet();
@@ -58,6 +60,16 @@ public final class Metrics {
         notifications.computeIfAbsent(status, key -> new AtomicLong()).incrementAndGet();
     }
 
+    /** outcome is created, rejected, ended, or rate_limited. */
+    public void recordSession(String outcome) {
+        sessions.computeIfAbsent(outcome, key -> new AtomicLong()).incrementAndGet();
+    }
+
+    /** Sessions currently valid, refreshed whenever the store changes. */
+    public void recordActiveSessions(long count) {
+        sessionsActive.set(count);
+    }
+
     public void recordHttpRequest(String path, int status) {
         httpRequests.computeIfAbsent(path + " " + status, key -> new AtomicLong()).incrementAndGet();
     }
@@ -77,6 +89,8 @@ public final class Metrics {
                 "Webhook delivery attempts by outcome.", "status", notifications);
         labelledCounter(builder, "eventwatch_watchdog_pings_total",
                 "Dead-man switch heartbeats by outcome.", "outcome", watchdogPings);
+        labelledCounter(builder, "eventwatch_sessions_total",
+                "Operator sign-in attempts by outcome.", "outcome", sessions);
         httpCounter(builder);
 
         gauge(builder, "eventwatch_alerts_active",
@@ -85,6 +99,8 @@ public final class Metrics {
                 "Machines that have stopped reporting within the forget window.", silentAgents.get());
         gauge(builder, "eventwatch_events_stored",
                 "Telemetry rows currently held in SQLite.", storedEvents);
+        gauge(builder, "eventwatch_sessions_active",
+                "Operator sessions currently valid.", sessionsActive.get());
 
         builder.append("# HELP eventwatch_processing_duration_seconds Time spent handling one ingestion request.\n");
         builder.append("# TYPE eventwatch_processing_duration_seconds summary\n");

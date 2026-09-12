@@ -1,17 +1,20 @@
 # syntax=docker/dockerfile:1
 
+# The build context is the repository root, because the analytics image now carries the
+# dashboard: serving it from this service is what makes the session cookie same-origin.
 FROM maven:3.9-eclipse-temurin-17 AS build
 WORKDIR /build
 # Resolve dependencies first so source edits do not invalidate the download layer.
-COPY pom.xml ./
+COPY java-analytics/pom.xml ./
 RUN mvn -B -q dependency:go-offline
-COPY src ./src
+COPY java-analytics/src ./src
 RUN mvn -B -q package -DskipTests
 
 FROM eclipse-temurin:17-jre-alpine
 RUN addgroup -S eventwatch && adduser -S eventwatch -G eventwatch
 WORKDIR /app
 COPY --from=build /build/target/eventwatch-analytics.jar ./analytics.jar
+COPY dashboard ./dashboard
 
 # Telemetry lives on a volume so a container restart keeps its history.
 RUN mkdir -p /data && chown -R eventwatch:eventwatch /app /data
@@ -20,6 +23,7 @@ USER eventwatch
 
 ENV HTTP_PORT=8080 \
     DATABASE_PATH=/data/events.db \
+    DASHBOARD_DIR=/app/dashboard \
     LOG_FORMAT=json \
     JAVA_TOOL_OPTIONS="-Xms64m -Xmx256m"
 

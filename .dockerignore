@@ -1,0 +1,17 @@
+# The analytics image builds from the repository root so it can carry the dashboard, which means
+# this file - not java-analytics/.dockerignore - decides what that build sees.
+.git/
+.github/
+**/target/
+**/*.db
+**/*.db-shm
+**/*.db-wal
+**/hs_err_pid*.log
+
+# Never let a real key into a build context.
+.env
+
+go-collector/pending-events/
+go-collector/identity.json
+loadtest/
+*.md

@@ -7,8 +7,8 @@ import java.sql.SQLException;
 import java.util.Locale;
 
 /**
- * The cross-cutting half of every authenticated read/write route: the CORS preflight, the method
- * check, the API key, and the two failures that every route turns into the same status — a bad
+ * The cross-cutting half of every authenticated read/write route: the method check, the API key
+ * or session cookie, and the two failures that every route turns into the same status — a bad
  * parameter into 400 and unreachable storage into 503.
  *
  * <p>Subclasses implement only what their route actually does.
@@ -35,9 +35,6 @@ abstract class ApiHandler implements HttpHandler {
 
     @Override
     public final void handle(HttpExchange exchange) throws IOException {
-        if (http.handleCorsPreflight(exchange)) {
-            return;
-        }
         String method = exchange.getRequestMethod().toUpperCase(Locale.ROOT);
         if (!isAllowed(method)) {
             exchange.getResponseHeaders().set("Allow", allowedMethods);
