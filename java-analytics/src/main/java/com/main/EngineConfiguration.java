@@ -37,7 +37,10 @@ public record EngineConfiguration(
         boolean metricsRequireKey,
         int agentSilenceMinutes,
         int agentSilenceForgetHours,
-        int agentSilenceSweepSeconds) {
+        int agentSilenceSweepSeconds,
+        String watchdogUrl,
+        int watchdogIntervalSeconds,
+        int watchdogTimeoutSeconds) {
 
     /**
      * Settings where zero or negative is not a weaker setting but a crash: the pool rejects a
@@ -52,6 +55,8 @@ public record EngineConfiguration(
         agentSilenceMinutes = agentSilenceMinutes > 0 ? agentSilenceMinutes : 10;
         agentSilenceForgetHours = agentSilenceForgetHours > 0 ? agentSilenceForgetHours : 168;
         agentSilenceSweepSeconds = agentSilenceSweepSeconds > 0 ? agentSilenceSweepSeconds : 60;
+        watchdogIntervalSeconds = watchdogIntervalSeconds > 0 ? watchdogIntervalSeconds : 60;
+        watchdogTimeoutSeconds = watchdogTimeoutSeconds > 0 ? watchdogTimeoutSeconds : 5;
     }
 
     public static EngineConfiguration fromDotenv(Dotenv dotenv) {
@@ -91,7 +96,10 @@ public record EngineConfiguration(
                 Boolean.parseBoolean(value(dotenv, "METRICS_REQUIRE_KEY", "false")),
                 intValue(dotenv, "AGENT_SILENCE_MINUTES", 10),
                 intValue(dotenv, "AGENT_SILENCE_FORGET_HOURS", 168),
-                intValue(dotenv, "AGENT_SILENCE_SWEEP_SECONDS", 60));
+                intValue(dotenv, "AGENT_SILENCE_SWEEP_SECONDS", 60),
+                value(dotenv, "WATCHDOG_URL", ""),
+                intValue(dotenv, "WATCHDOG_INTERVAL_SECONDS", 60),
+                intValue(dotenv, "WATCHDOG_TIMEOUT_SECONDS", 5));
     }
 
     /**
@@ -101,7 +109,7 @@ public record EngineConfiguration(
     public static EngineConfiguration forTesting(String databaseUrl, String apiKey) {
         return new EngineConfiguration(0, databaseUrl, apiKey, "text",
                 85.0, 80.0, 5, false, "", 1, 1, 1, 0, 0, "", "", 2, 0, 60, 100,
-                false, "", "", "PKCS12", List.of("http://localhost:3000"), false, 10, 168, 60);
+                false, "", "", "PKCS12", List.of("http://localhost:3000"), false, 10, 168, 60, "", 60, 5);
     }
 
     /** A comma-separated origin list, so a deployment is not stuck on localhost:3000. */

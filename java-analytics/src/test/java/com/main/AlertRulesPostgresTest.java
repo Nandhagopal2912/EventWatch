@@ -30,7 +30,7 @@ class AlertRulesPostgresTest {
                 85.0, 80.0, 5, false, "", 1, 1, 1, 0, 0,
                 System.getenv("EVENTWATCH_TEST_POSTGRES_USER"),
                 System.getenv("EVENTWATCH_TEST_POSTGRES_PASSWORD"),
-                2, 0, 60, 100, false, "", "", "PKCS12", List.of(), false, 10, 168, 60));
+                2, 0, 60, 100, false, "", "", "PKCS12", List.of(), false, 10, 168, 60, "", 60, 5));
         database.initializeSchema();
         try (Connection connection = database.connections().getConnection();
                 Statement statement = connection.createStatement()) {

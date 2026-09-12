@@ -53,6 +53,7 @@ public class AnalyticsEngine {
     private static int shutdownGraceSeconds = 5;
     private static RetentionService retentionService;
     private static AgentSilenceMonitor agentSilenceMonitor;
+    private static WatchdogHeartbeat watchdogHeartbeat;
     private static ThreadPoolExecutor runningExecutor;
     private static ScheduledExecutorService runningMaintenance;
     private static AlertRepository alertRepository;
@@ -214,6 +215,9 @@ public class AnalyticsEngine {
             agentSilenceMonitor = new AgentSilenceMonitor(
                     eventRepository, alertRepository, alertRules, notificationService, METRICS,
                     MAX_HOSTS_LISTED, java.time.Duration.ofHours(configuration.agentSilenceForgetHours()));
+            watchdogHeartbeat = new WatchdogHeartbeat(database, eventRepository, alertRepository,
+                    METRICS, OBJECT_MAPPER, configuration.watchdogUrl(),
+                    configuration.watchdogTimeoutSeconds());
         } catch (SQLException | RuntimeException exception) {
             String backend = database.dialect().name();
             releaseDatabase();
@@ -743,6 +747,15 @@ public class AnalyticsEngine {
         maintenance.scheduleWithFixedDelay(agentSilenceMonitor::sweep,
                 silenceSweepSeconds, silenceSweepSeconds, TimeUnit.SECONDS);
 
+        // The service cannot report its own death, so it tells an outside endpoint it is alive.
+        if (watchdogHeartbeat.enabled()) {
+            long watchdogSeconds = configuration.watchdogIntervalSeconds();
+            maintenance.scheduleWithFixedDelay(watchdogHeartbeat::ping,
+                    watchdogSeconds, watchdogSeconds, TimeUnit.SECONDS);
+            StructuredLogger.info("watchdog heartbeat enabled",
+                    StructuredLogger.fields("interval_seconds", watchdogSeconds));
+        }
+
         runningExecutor = requestExecutor;
         runningMaintenance = maintenance;
 
@@ -790,6 +803,11 @@ public class AnalyticsEngine {
     /** Visible for tests that assert the pool is released rather than leaked. */
     static Database database() {
         return database;
+    }
+
+    /** Visible for tests that drive a heartbeat without waiting for the timer. */
+    static WatchdogHeartbeat watchdogHeartbeat() {
+        return watchdogHeartbeat;
     }
 
     /** Visible for tests that drive a silence sweep without waiting for the timer. */

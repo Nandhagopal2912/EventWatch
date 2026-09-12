@@ -22,6 +22,11 @@ type collectorMetrics struct {
 	forwardSeconds    float64
 	forwardObserved   uint64
 	hostMetricFailure uint64
+	// Delivery health, for the watchdog. The zero value is healthy, which is correct at startup.
+	deliveryStalled        bool
+	deliveryStallAlerts    uint64
+	deliveryRecoveryAlerts uint64
+	agentAlertFailures     uint64
 }
 
 var metrics = &collectorMetrics{
@@ -38,8 +43,30 @@ func (m *collectorMetrics) recordCapture(level string) {
 // outcome is one of delivered, rejected, queued, or failed.
 func (m *collectorMetrics) recordForward(outcome string) {
 	m.mutex.Lock()
-	defer m.mutex.Unlock()
 	m.forwardByOutcome[outcome]++
+	m.mutex.Unlock()
+	// The watchdog needs exactly this signal, already classified. Reading it here rather than
+	// at every call site keeps the two from drifting apart.
+	recordDeliveryOutcome(outcome)
+}
+
+func (m *collectorMetrics) recordDeliveryHealthy(healthy bool) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	m.deliveryStalled = !healthy
+}
+
+func (m *collectorMetrics) recordAgentAlert(event string, delivered bool) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	if event == "delivery_stalled" {
+		m.deliveryStallAlerts++
+	} else {
+		m.deliveryRecoveryAlerts++
+	}
+	if !delivered {
+		m.agentAlertFailures++
+	}
 }
 
 func (m *collectorMetrics) observeForwardDuration(seconds float64) {
@@ -93,6 +120,20 @@ func (m *collectorMetrics) render() string {
 		"Queued events moved aside after a permanent client error.", m.queueRejected)
 	singleCounter(&builder, "eventwatch_host_metric_failures_total",
 		"Failed host CPU or RAM samples.", m.hostMetricFailure)
+	singleCounter(&builder, "eventwatch_delivery_stall_alerts_total",
+		"Times this agent reported that delivery had stalled.", m.deliveryStallAlerts)
+	singleCounter(&builder, "eventwatch_delivery_recovery_alerts_total",
+		"Times this agent reported that delivery had recovered.", m.deliveryRecoveryAlerts)
+	singleCounter(&builder, "eventwatch_agent_alert_failures_total",
+		"Agent alerts that could not be delivered to their webhook.", m.agentAlertFailures)
+
+	fmt.Fprintf(&builder, "# HELP eventwatch_delivery_healthy Whether events are currently reaching analytics.\n")
+	fmt.Fprintf(&builder, "# TYPE eventwatch_delivery_healthy gauge\n")
+	healthy := 1
+	if m.deliveryStalled {
+		healthy = 0
+	}
+	fmt.Fprintf(&builder, "eventwatch_delivery_healthy %d\n", healthy)
 
 	fmt.Fprintf(&builder, "# HELP eventwatch_queue_depth Events currently waiting in the pending queue.\n")
 	fmt.Fprintf(&builder, "# TYPE eventwatch_queue_depth gauge\n")

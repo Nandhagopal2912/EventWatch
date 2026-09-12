@@ -44,7 +44,7 @@ class EngineLifecycleTest {
                 TestSupport.databaseUrl(temporaryDirectory, fileName), API_KEY, "text",
                 85.0, 80.0, 5, false, "", 1, 1, 1, 0,
                 shutdownGraceSeconds, "", "", poolSize, 0, 60, rateLimit,
-                false, "", "", "PKCS12", List.of("http://localhost:3000"), false, 10, 168, 60);
+                false, "", "", "PKCS12", List.of("http://localhost:3000"), false, 10, 168, 60, "", 60, 5);
     }
 
     @Test
@@ -62,7 +62,7 @@ class EngineLifecycleTest {
         EngineConfiguration withoutKey = new EngineConfiguration(0,
                 TestSupport.databaseUrl(temporaryDirectory, "nokey.db"), "  ", "text",
                 85.0, 80.0, 5, false, "", 1, 1, 1, 0, 0, "", "", 4, 0, 60, 100,
-                false, "", "", "PKCS12", List.of("http://localhost:3000"), false, 10, 168, 60);
+                false, "", "", "PKCS12", List.of("http://localhost:3000"), false, 10, 168, 60, "", 60, 5);
 
         IOException failure = assertThrows(IOException.class, () -> AnalyticsEngine.start(withoutKey));
         assertTrue(failure.getMessage().contains("EVENTWATCH_API_KEY"), failure.getMessage());
@@ -74,7 +74,7 @@ class EngineLifecycleTest {
         EngineConfiguration unusable = new EngineConfiguration(0,
                 "jdbc:mysql://localhost/eventwatch", API_KEY, "text",
                 85.0, 80.0, 5, false, "", 1, 1, 1, 0, 0, "", "", 4, 0, 60, 100,
-                false, "", "", "PKCS12", List.of("http://localhost:3000"), false, 10, 168, 60);
+                false, "", "", "PKCS12", List.of("http://localhost:3000"), false, 10, 168, 60, "", 60, 5);
 
         assertThrows(IOException.class, () -> AnalyticsEngine.start(unusable));
         assertNull(AnalyticsEngine.database(), "a failed start must not leave a pool open");
@@ -87,7 +87,7 @@ class EngineLifecycleTest {
         EngineConfiguration zeroSweep = new EngineConfiguration(0,
                 TestSupport.databaseUrl(temporaryDirectory, "sweep.db"), API_KEY, "text",
                 85.0, 80.0, 5, false, "", 1, 1, 1, 0, 0, "", "", 0, 7, 0, 0,
-                false, "", "", "PKCS12", List.of("http://localhost:3000"), false, 10, 168, 60);
+                false, "", "", "PKCS12", List.of("http://localhost:3000"), false, 10, 168, 60, "", 60, 5);
 
         assertEquals(60, zeroSweep.retentionSweepMinutes(), "a non-positive period falls back");
         assertEquals(10, zeroSweep.databasePoolSize(), "a non-positive pool size falls back");

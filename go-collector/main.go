@@ -337,6 +337,11 @@ func main() {
 		backendClient.Transport = &http.Transport{TLSClientConfig: tlsConfig}
 	}
 
+	configureDeliveryWatchdog(
+		getEnv("AGENT_ALERT_WEBHOOK_URL", ""),
+		time.Duration(getIntEnv("DELIVERY_STALL_MINUTES", 5))*time.Minute,
+		time.Duration(getIntEnv("AGENT_ALERT_TIMEOUT_SECONDS", 5))*time.Second)
+
 	go retryPendingEvents()
 
 	http.HandleFunc("/capture", logHandler)
@@ -497,6 +502,8 @@ func retryPendingEvents() {
 	defer ticker.Stop()
 	for {
 		processPendingEvents()
+		// The retry loop already runs on a timer, so it is where delivery health is judged.
+		checkDeliveryHealth(time.Now())
 		select {
 		case <-ticker.C:
 		case <-queueWake:

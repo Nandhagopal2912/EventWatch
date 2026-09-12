@@ -10,7 +10,7 @@ It is built without web frameworks, an ORM, or a DI container on either side, so
 retries, queueing, deduplication, alert state, delivery — is visible in the code rather than hidden
 behind configuration.
 
-**Status:** Phases 1–15 complete. 228 tests pass: 180 Java, 44 Go agent, 4 load harness.
+**Status:** Phases 1–16 complete. 243 tests pass: 186 Java, 53 Go agent, 4 load harness.
 `CLAUDE.md` is the working guide for contributors and records what is deliberately deferred.
 
 **Scope:** built for roughly 5–50 machines. It is not an APM, a log aggregator, or a metrics
@@ -59,6 +59,11 @@ alerts, and the rules it is judged by. The dashboard renders all of it, plus a r
 **Explains itself.** Both services emit one JSON object per log line, expose Prometheus metrics, and
 carry a correlation ID from agent capture through to the analytics response — so one event is
 traceable across both services' logs, even when it arrived hours late through the queue.
+
+**Reports its own failure.** The analytics service sends a heartbeat to an outside endpoint while
+it is healthy, so silence there means it died. The agent covers the other direction: when nothing
+has reached analytics for a while, the agent — which is still running — says so through a webhook
+of its own.
 
 **Defends itself.** The agent binds to loopback by default and refuses to bind anywhere else without
 a key. The analytics API authenticates every data route, rate-limits ingestion per client, validates
@@ -131,7 +136,13 @@ memory; the tracked-host map is an LRU; rate-limit windows are swept on a timer;
 maximum limit; the terminal report shows the top five errors from SQL rather than every distinct
 message. Each of these replaced something that grew without limit.
 
-**13. Configuration over constants.** Ports, database location, thresholds, rate limit, pool size,
+**13. A monitor needs two ways to report its own death.** The analytics heartbeat and the agent's
+stall alert are deliberately independent: a single mechanism covering both would share the failure
+it exists to detect. In both cases silence is the signal — the heartbeat stops when the service
+dies, and is withheld on purpose when the database is unreachable, because a ping asserting health
+from a service that cannot store anything is worse than none.
+
+**14. Configuration over constants.** Ports, database location, thresholds, rate limit, pool size,
 shutdown grace, and silence windows all come from `.env` with in-code fallbacks. A deployment or a
 test should never need a source change — and a hardcoded rate limit once made a whole benchmark
 meaningless.
@@ -254,6 +265,7 @@ go-collector/                   Go agent, one per machine
 	main.go                        Handlers, forwarding, durable queue
 	identity.go                    Stable host_id, persisted beside the queue
 	security.go                    Bind policy, capture auth, backend TLS trust
+	watchdog.go                    Delivery-health tracking and agent alerts
 	logging.go                     Structured JSON log lines
 	metrics.go                     Prometheus counters and /metrics
 	Dockerfile
@@ -278,6 +290,7 @@ java-analytics/                 Maven Java analytics service
 		NotificationRecord.java / NotificationRepository.java
 		RetentionService.java          Prunes history past the window
 		TlsSupport.java                HTTPS listener from a keystore
+		WatchdogHeartbeat.java         Dead-man switch: a heartbeat while healthy
 		Metrics.java                   Prometheus counters and gauges
 		StructuredLogger.java          One JSON object per log line
 	src/test/java/com/main/            180 tests, including a live PostgreSQL suite
@@ -473,6 +486,44 @@ access as equivalent to holding the key.
 
 ---
 
+## Watchdog
+
+A monitor that cannot report its own death is only half a monitor. Two independent halves cover the
+two ways that happens, and neither needs another service running.
+
+**The analytics service sends a heartbeat.** Point `WATCHDOG_URL` at any endpoint that accepts a
+POST — healthchecks.io, Uptime Kuma, a cron ping — and it receives a small JSON body every
+`WATCHDOG_INTERVAL_SECONDS`:
+
+```json
+{"schema_version":"eventwatch.heartbeat.v1","service":"java-analytics",
+ "timestamp":"2026-09-11T23:53:44Z","hosts":4,"active_alerts":1}
+```
+
+When the host dies the heartbeat stops and that endpoint alerts. The ping is **deliberately skipped
+while the database is unreachable**: a heartbeat still arriving from a service that cannot store
+anything would be worse than none, so silence is the signal there too.
+
+**The agent reports a stalled delivery.** The agent is the part still running when analytics is
+unreachable, so it is the only part that can say so — and it already knows, because its queue is
+growing. Set `AGENT_ALERT_WEBHOOK_URL` and it posts when nothing has been delivered for
+`DELIVERY_STALL_MINUTES` and the most recent attempt failed:
+
+```json
+{"schema_version":"eventwatch.agent_alert.v1","event":"delivery_stalled","host_id":"...",
+ "hostname":"web-01","agent_version":"0.15.0","queue_depth":1,"stalled_seconds":62,
+ "backend_url":"http://analytics:8080/receive","timestamp":"2026-09-11T23:55:12Z"}
+```
+
+A matching `delivery_recovered` follows when events flow again. Both conditions are required on
+purpose: an agent with no traffic sends nothing and fails nothing, so silence alone must never look
+like an outage. A permanent `4xx` is excluded too — the service answered and refused that one event,
+which says nothing about whether it is reachable.
+
+Each side is also visible in the agent's metrics as `eventwatch_delivery_healthy`,
+`eventwatch_delivery_stall_alerts_total`, and `eventwatch_delivery_recovery_alerts_total`, and in
+the analytics metrics as `eventwatch_watchdog_pings_total` by outcome.
+
 ## Storage backends
 
 SQLite is the default and needs no external service. Setting `DATABASE_URL` to a PostgreSQL JDBC URL
@@ -572,8 +623,8 @@ temporary database, covering restart recovery, two machines staying independent,
 changing which machines alert, and a silent machine raising and then resolving its own alert.
 
 The Go suite covers retry classification, the capture handler, durable-queue outcomes, correlation
-IDs, host identity and its persistence across restarts, the bind and authentication policy, and
-metric rendering, using an `httptest` stand-in for the analytics service.
+IDs, host identity and its persistence across restarts, the bind and authentication policy,
+delivery-health tracking and its alerts, and metric rendering, using an `httptest` stand-in for the analytics service.
 
 The PostgreSQL suites are skipped unless `EVENTWATCH_TEST_POSTGRES_URL` points at a reachable
 server, so a checkout without PostgreSQL still builds; CI supplies one as a service container.
@@ -644,6 +695,12 @@ in-code fallback, so an absent key is never fatal.
 | `AGENT_SILENCE_FORGET_HOURS` | `168` | Beyond this a machine counts as decommissioned |
 | `AGENT_SILENCE_SWEEP_SECONDS` | `60` | How often silence is checked |
 | `LOG_FORMAT` | `json` | `json` or `text` for both services |
+| `WATCHDOG_URL` | empty | Endpoint receiving the analytics heartbeat |
+| `WATCHDOG_INTERVAL_SECONDS` | `60` | How often the heartbeat is sent |
+| `WATCHDOG_TIMEOUT_SECONDS` | `5` | Heartbeat request timeout |
+| `AGENT_ALERT_WEBHOOK_URL` | empty | Endpoint receiving the agent's own alerts |
+| `DELIVERY_STALL_MINUTES` | `5` | Silence before the agent reports a stalled delivery |
+| `AGENT_ALERT_TIMEOUT_SECONDS` | `5` | Agent alert request timeout |
 | `NOTIFICATIONS_ENABLED` | `false` | Turn webhook delivery on |
 | `NOTIFICATION_WEBHOOK_URL` | empty | Where lifecycle changes are POSTed |
 | `NOTIFICATION_TIMEOUT_SECONDS` | `5` | Per-attempt timeout |
@@ -660,8 +717,10 @@ in-code fallback, so an absent key is never fatal.
   serving and an HttpOnly cookie.
 - **One analytics instance.** Alert rules are cached per process and notification cooldowns are
   held in memory, so a second instance would need cache invalidation and shared reservations.
-- **Nothing watches the watcher.** If the host running the analytics service dies, nothing reports
-  it. The honest answer is an external uptime check rather than more code here.
+- **The watchdog still needs somewhere to point.** Phase 16 closed the silent-death gap from
+  both directions, but the heartbeat has to reach an endpoint you run or subscribe to. That is
+  the correct boundary — a monitor cannot be its own last line of defence — but it does mean
+  the watchdog is only as good as the endpoint behind it.
 - **Deferred on evidence, not forgotten:** a message broker in place of the file queue, and
   splitting into separate services. Neither has a measured problem to solve yet; `CLAUDE.md` records
   the trigger conditions for revisiting both, along with OpenTelemetry tracing.
@@ -689,6 +748,7 @@ The project was built in phases; each is a single commit.
 | 13 | Agent security | Loopback binding, mandatory auth when exposed, TLS, configurable CORS |
 | 14 | Per-host alert rules | Rules table, host → fleet → default precedence, rules API and editor |
 | 15 | Fleet operations | Silence detection, per-machine drill-down, agent version and queue depth |
+| 16 | Watchdog | Analytics heartbeat and agent-side delivery-stall alerts |
 
 `agent.md` is the original roadmap, kept for history. `CLAUDE.md` is the current authority on state,
 conventions, and what comes next.

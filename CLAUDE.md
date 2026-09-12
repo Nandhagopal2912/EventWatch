@@ -80,6 +80,7 @@ curl.exe "http://localhost:8082/capture?level=ERROR&msg=Database%20transaction%2
 go-collector/main.go            Handlers, forwardToJava retries, durable file queue
 go-collector/identity.go        Stable per-agent host_id, persisted beside the queue
 go-collector/security.go        Bind policy, capture auth, backend TLS trust
+go-collector/watchdog.go        Delivery-health tracking, agent alerts
 go-collector/logging.go         Structured JSON log lines, LOG_FORMAT switch
 go-collector/metrics.go         Prometheus counters, queue-depth gauge, /metrics handler
 go-collector/main_test.go       Event-ID uniqueness + queue capacity
@@ -87,6 +88,7 @@ go-collector/collector_test.go  Retries, capture handler, queue outcomes, metric
 go-collector/contract_test.go   Shared JSON contract, against testdata/
 go-collector/identity_test.go   Identity generation, persistence, overrides
 go-collector/security_test.go   Bind policy, capture auth, backend TLS trust
+go-collector/watchdog_test.go   Stall detection, recovery, payload, metrics
 go-collector/Dockerfile         Static binary on alpine, queue on a volume
 
 java-analytics/src/main/java/com/main/
@@ -109,6 +111,7 @@ java-analytics/src/main/java/com/main/
   SqliteDialect.java / PostgresDialect.java
   RetentionService.java         Prunes telemetry and delivery history past the window
   TlsSupport.java               HTTPS listener from a keystore, TLS 1.2+
+  WatchdogHeartbeat.java        Dead-man switch; silent when storage is broken
   AlertRule.java                One stored rule; scope '*' means fleet-wide
   AlertRuleRepository.java      alert_rules table, portable upsert on (rule_type, scope)
   AlertRules.java               Host → fleet → default precedence, validation, cache
@@ -131,6 +134,7 @@ java-analytics/src/test/java/com/main/
   AlertRulesPostgresTest.java   Rule storage on a real PostgreSQL; skipped without one
   AgentSilenceMonitorTest.java  Silence thresholds, the forget window, the gauge
   FleetApiTest.java             Fleet listing, drill-down, silence raised and resolved
+  WatchdogHeartbeatTest.java    Heartbeat payload, failures, and the deliberate silence
 java-analytics/Dockerfile       Shaded jar on a JRE, database on a volume
 
 loadtest/main.go                Throughput and latency harness (its own module, stdlib only)
@@ -225,23 +229,25 @@ Changes to this schema must stay backward compatible — additive fields only, n
 
 ## 5. Current state — read before starting work
 
-**Phases 1–15 are complete.** Everything is green:
+**Phases 1–16 are complete.** Everything is green:
 
-- `cd java-analytics && mvn verify` → 180 tests, BUILD SUCCESS (12 of them need
+- `cd java-analytics && mvn verify` → 186 tests, BUILD SUCCESS (12 of them need
   `EVENTWATCH_TEST_POSTGRES_URL`; CI supplies a server, locally they skip)
-- `cd go-collector && go vet ./... && go test ./...` → 44 tests, pass
+- `cd go-collector && go vet ./... && go test ./...` → 53 tests, pass
 - `cd loadtest && go vet ./... && go test ./...` → 4 tests, pass
 - `docker compose up --build` → all services healthy
 
-Phase 15 closed the last gap in the fleet story: a machine that stops reporting now raises
-`agent-silent@{host}`, and its next event resolves it. Agents report their version and pending-queue
-depth, and `GET /hosts/{host_id}` is the per-machine view.
+The phase roadmap (1–15) delivered the system; 16 onward is hardening for real use, planned in
+section 16. Phase 16 closed the silent-death gap from both directions: analytics sends a heartbeat
+while healthy, and the agent reports when nothing has reached analytics. Verified live — the
+heartbeat stopped when analytics was killed, the agent alerted with `stalled_seconds: 62` and
+`queue_depth: 1`, and a `delivery_recovered` alert followed once the queue drained.
 
-**The roadmap through Phase 15 is finished.** What remains is in section 15: the dashboard session,
-the deferred Phase 11 items, OpenTelemetry, and the scripted two-process outage test. None is
-blocking; pick by what the project is for next.
+**Next is Phase 17, the internal structure refactor.** It comes before the two auth phases on
+purpose: both add routes and state, and `AnalyticsEngine` is already a thousand lines of inline
+lambdas over static fields.
 
-B1–B15 in section 14 are all fixed.
+B1–B15 in section 15 are all fixed.
 
 ## 6. Phase 8 as built — notifications
 
@@ -356,7 +362,7 @@ filters meaning exactly the same thing everywhere.
 sweeps rate windows. The cutoff is exclusive, delivery history is pruned alongside the events that
 produced it, and a failed sweep is logged rather than thrown so the timer thread survives.
 
-**What is deliberately NOT done, and when to revisit** — see section 15. Short version: the file
+**What is deliberately NOT done, and when to revisit** — see section 16. Short version: the file
 queue and the two-service shape are both still comfortably inside what the measurements justify.
 
 ## 10. Phase 12 as built — host identity
@@ -431,7 +437,7 @@ logs a startup warning.
 
 **Rules are read on every event, so they are cached** in `AlertRules` and replaced wholesale on
 each write. That is correct for one analytics instance; a second instance would need a refresh
-interval or change notification — the same limitation as notification reminders in section 14.
+interval or change notification — the same limitation as notification reminders in section 15.
 
 **A wiring bug the tests caught before commit:** the CORS preflight still advertised
 `GET, POST, OPTIONS`, because the edit replaced the first of two identical strings — in the
@@ -469,7 +475,35 @@ string rather than the current one — "0.9.0" sorts above "0.15.0". The listing
 is holding events the analytics service has not accepted — the early warning that the pipeline is
 degrading before events are actually lost.
 
-## 14. Fixed defects and remaining quality work
+## 14. Phase 16 as built — watchdog
+
+**Two halves, because there are two ways to go dark.** The analytics service cannot report its own
+death, so it tells an outside endpoint it is alive and the absence of that is the alarm. The agent
+cannot be told by analytics that analytics is down, so it judges for itself. Neither half depends on
+the other, which is the point: a single mechanism covering both would share the failure it is meant
+to detect.
+
+**The heartbeat is skipped when the database is unreachable.** A ping that keeps arriving from a
+service that cannot store anything is worse than no ping, because it actively asserts health. The
+check runs first and a failure records `skipped` and sends nothing, so the dead-man switch fires.
+
+**A stall needs a failure, not merely silence.** An agent with no traffic sends nothing and fails
+nothing; treating that as an outage would alert on every idle machine. The condition is "the most
+recent attempt failed *and* nothing has been delivered for `DELIVERY_STALL_MINUTES`".
+
+**Tracking the last attempt is a boolean, not a timestamp comparison.** The first implementation
+compared `lastDeliveryFail.After(lastDeliveryOK)`, which the tests caught immediately on Windows:
+the two calls land on the same clock tick, `After` is false, and no stall is ever detected. Asking
+"did the last attempt fail?" is both clock-independent and a plainer statement of the intent.
+
+**A permanent 4xx is excluded deliberately.** The service answered and refused that one event, which
+says nothing about reachability — counting it would turn a storm of malformed events into a fake
+outage. The three outcomes the watchdog reads are `delivered`, `queued`, and `failed`.
+
+**The signal is read where it is already classified.** `recordForward` knows the outcome, so the
+watchdog hooks in there rather than at six call sites that could drift apart.
+
+## 15. Fixed defects and remaining quality work
 
 ### Fixed (keep these fixed — each has a way to regress)
 
@@ -555,62 +589,88 @@ unaffected: at 3000 samples both percentile formulas select the same index.)
   in memory alongside the SQL `lastDeliveredAt` lookup; a restart falls back to the SQL value, which
   is correct but means an in-flight reservation is lost. Fine for one instance, wrong for two.
 
-## 15. Roadmap and deferred work
+## 16. Roadmap and deferred work
 
-**Phase 9 — Observability.** Done except tracing (see section 7).
+**The phase roadmap (1–15) is complete.** What follows is hardening for real use rather than new
+capability. Phases 16–20 are planned, one commit each, in this order.
 
-**OpenTelemetry tracing — an open decision, not an oversight.** It is the only remaining Phase 9
-item, and it is the one that conflicts with the project's stated constraints: the Java SDK plus
-exporters is roughly a dozen jars against a 128 MB heap, and it needs a collector process to receive
-spans. The correlation ID already answers the question tracing was listed for here — "which log
-lines belong to this event?" — across the Go→Java hop. Recommendation: add it only alongside Phase
-11, when there are genuinely multiple services and hops worth measuring; adopt the W3C
-`traceparent` header at that point rather than inventing a second ID. If it is wanted sooner, the
-cheapest honest version is span timings emitted as structured log fields, with no SDK at all.
+**Phase 16 — Watchdog.** Done (see section 14). The monitor cannot be the only thing that knows it is alive. Two
+independent halves, neither needing another service:
 
-**Phase 10 — Testing and delivery.** Done (see section 8). One gap remains from the original
-plan: there is no test that runs *both* services as processes and kills one mid-flight. Each side is
-covered against a stand-in for the other, and the compose stack was exercised by hand — a scripted
-version of that outage run would close it.
+- **A dead-man's switch on the analytics side:** a heartbeat POSTed to `WATCHDOG_URL` on a timer.
+  When the host dies the heartbeat stops and the external endpoint alerts. The ping is skipped while
+  the database is unreachable — a heartbeat that keeps arriving from a service that cannot store
+  anything would be worse than none.
+- **A delivery-stall alert on the agent side:** the agent is the part still running when analytics
+  is unreachable, so it is the only part that can report it. It already knows — its queue is
+  growing. An optional webhook fires when nothing has been delivered for `DELIVERY_STALL_MINUTES`
+  *and* the most recent attempt failed; the second condition matters, or an idle agent with no
+  traffic would look broken.
 
-**Phase 11 — Scale beyond SQLite.** The storage half is done (section 9). Two items remain, both
-deferred on purpose rather than forgotten:
+Goes first because it is the only item where the current state can fail silently, and because it
+barely touches the routing the next phase rewrites.
 
-- **A message broker in place of the file queue.** The durable file queue has no measured problem:
-  it loses nothing across an outage (verified in containers in Phase 10), and ingestion sustains
-  522 events/s before it is even involved. Kafka or NATS would add an operational dependency heavier
-  than both services combined. Revisit when a single collector host cannot hold the backlog of a
-  realistic outage, or when more than one analytics instance must consume the same stream — that is
-  the real trigger, because the file queue is point-to-point.
-- **Splitting ingestion, analytics, storage, and notification into separate services.** There is no
-  component whose scaling needs differ enough to justify it yet; notification already runs on its
-  own dispatcher thread and never blocks ingestion. Revisit when one part genuinely needs to scale
-  independently, and expect to need the broker first.
+**Phase 17 — Internal structure.** No user-visible change; enabling work. Extract the route handlers
+out of `start()` into classes with an injected context and drop the static collaborator fields.
+Unlocks parallel test execution and stops phases 18 and 19 from adding several hundred lines to a
+class that is already a thousand. Doing it before those two, rather than after, is the whole point.
 
-The honest next step for scale is neither: it is the rate limit and the per-event work in the
-ingestion path. Every event currently triggers alert evaluation plus a grouped error query. Batching
-that, or evaluating alerts on a timer instead of per event, is a larger win than changing databases.
+**Phase 18 — Operator session.** Serve the dashboard from the analytics service so it is
+same-origin, then exchange the API key for an HttpOnly `SameSite=Strict` cookie at `POST /session`,
+accepting cookie or header. The key leaves page memory, the CORS configuration becomes unnecessary,
+and the separate static server and its Compose container disappear. A feature that deletes moving
+parts is usually the right shape.
 
-**Phase 13 — Agent security.** Done (see section 11), except the dashboard session. The key is no
-longer in the DOM or in storage, but it is still in page memory for the session. A real fix means
-serving the dashboard from the analytics service itself so it is same-origin, then issuing an
-HttpOnly `SameSite=Strict` cookie from a `POST /session` endpoint. That also deletes the CORS
-configuration entirely, which is a good sign it is the right shape. Worth doing alongside Phase 15.
+**Phase 19 — Per-agent credentials.** One shared key for a fleet cannot be rotated or revoked per
+machine; one leaked agent compromises every host. An `agents` table with hashed tokens, `POST
+/agents` to mint and `DELETE /agents/{id}` to revoke, and `last_used` for spotting dead credentials.
+The shared key keeps working behind a deprecation switch during migration — the same additive
+discipline the event contract follows.
 
-**Phase 14 — Per-host alert rules.** Done (see section 12). Not done: rule types beyond the
-original three (disk, a metric the agent does not yet sample), and alerts that fire on a time window
-rather than an event count. Both need the agent to report more than CPU and RAM first.
+**Phase 20 — Cleanup and closing gaps.** The scripted two-process outage test that Phase 10 left
+open, the one-off timestamp normalisation for rows written by pre-Phase-9 builds, and removing
+`/stress` from the shipped binary now that `loadtest/` covers it properly.
 
-**Phase 15 — Fleet operations.** Done (see section 13). Not done: notifying on silence through a
-channel that does not depend on the analytics service itself. If the whole host running analytics
-dies, nothing reports that — the classic "who watches the watcher" gap, and the honest answer is an
-external uptime check rather than more code here.
+**Agreed for discussion after Phase 20 — more host samples.** The agent samples only CPU and RAM.
+Disk usage, network, process liveness, or an application pushing its own custom metric would each
+widen what the system can alert on, and Phase 14's rule machinery already accepts new rule types
+without structural change. This is feature growth rather than hardening, so it is a separate
+conversation once the five phases above are done.
 
-**Still unowned:** OpenTelemetry (see above), and a scripted two-process outage test.
+### Deferred on evidence, not forgotten
+
+**A message broker in place of the file queue.** The durable file queue has no measured problem: it
+loses nothing across an outage (verified in containers in Phase 10), and ingestion sustains
+522 events/s before it is even involved. Kafka or NATS would add an operational dependency heavier
+than both services combined. Revisit when a single agent host cannot hold the backlog of a realistic
+outage, or when more than one analytics instance must consume the same stream — that is the real
+trigger, because the file queue is point-to-point.
+
+**Splitting ingestion, analytics, storage, and notification into separate services.** No component
+has scaling needs different enough to justify it; notification already runs on its own dispatcher
+thread and never blocks ingestion. Revisit when one part genuinely needs to scale independently, and
+expect to need the broker first.
+
+**Running more than one analytics instance.** Alert rules are cached per process and notification
+cooldown reservations are held in memory, so a second instance would need cache invalidation and
+shared reservations. This is coupled to the two items above rather than separate from them: there is
+no reason to run two instances until there is a broker in front of them.
+
+**OpenTelemetry tracing.** The Java SDK plus exporters is roughly a dozen jars against a 128 MB
+heap, and it needs a collector process to receive spans. The correlation ID already answers the
+question tracing was listed for — "which log lines belong to this event?" — across the one hop that
+exists. Adopt the W3C `traceparent` header if and when there are genuinely multiple hops worth
+measuring. The cheapest honest version in the meantime is span timings emitted as structured log
+fields, with no SDK at all.
+
+**The honest next step for throughput,** if it is ever needed, is neither storage nor messaging: it
+is the per-event work in the ingestion path. Every event triggers alert evaluation plus a grouped
+error query. Batching that, or evaluating alerts on a timer rather than per event, is a larger win
+than changing databases.
 
 ---
 
-## 16. Definition of done for a release
+## 17. Definition of done for a release
 
 - Events are authenticated, validated, persisted transactionally, deduplicated, and queryable.
 - A temporary Java outage loses nothing and duplicates nothing.

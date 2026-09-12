@@ -18,6 +18,7 @@ public final class Metrics {
     private final DoubleAdder processingSeconds = new DoubleAdder();
     private final Map<String, AtomicLong> eventsRejected = new ConcurrentHashMap<>();
     private final Map<String, AtomicLong> notifications = new ConcurrentHashMap<>();
+    private final Map<String, AtomicLong> watchdogPings = new ConcurrentHashMap<>();
     private final Map<String, AtomicLong> httpRequests = new ConcurrentHashMap<>();
 
     public void recordEventReceived() {
@@ -47,6 +48,11 @@ public final class Metrics {
         processingObserved.incrementAndGet();
     }
 
+    /** outcome is delivered, failed, or skipped when the database was unreachable. */
+    public void recordWatchdogPing(String outcome) {
+        watchdogPings.computeIfAbsent(outcome, key -> new AtomicLong()).incrementAndGet();
+    }
+
     /** status is DELIVERED, FAILED, or SUPPRESSED. */
     public void recordNotification(String status) {
         notifications.computeIfAbsent(status, key -> new AtomicLong()).incrementAndGet();
@@ -69,6 +75,8 @@ public final class Metrics {
                 "Events refused before storage, by reason.", "reason", eventsRejected);
         labelledCounter(builder, "eventwatch_notifications_total",
                 "Webhook delivery attempts by outcome.", "status", notifications);
+        labelledCounter(builder, "eventwatch_watchdog_pings_total",
+                "Dead-man switch heartbeats by outcome.", "outcome", watchdogPings);
         httpCounter(builder);
 
         gauge(builder, "eventwatch_alerts_active",
