@@ -34,6 +34,7 @@ class EngineContext {
     private final RateLimiter rateLimiter;
     private final RateLimiter sessionRateLimiter;
     private final SessionStore sessions;
+    private final AgentRepository agentRepository;
     private final TelemetryReport telemetryReport;
 
     EngineContext(EngineConfiguration configuration, Database database) throws SQLException {
@@ -54,6 +55,7 @@ class EngineContext {
         this.recentEvents.restore();
         this.alertRepository = new AlertRepository(database.connections());
         this.notificationRepository = new NotificationRepository(database.connections());
+        this.agentRepository = new AgentRepository(database.connections());
         this.notificationService = new NotificationService(
                 notificationRepository,
                 objectMapper,
@@ -163,6 +165,10 @@ class EngineContext {
 
     SessionStore sessions() {
         return sessions;
+    }
+
+    AgentRepository agents() {
+        return agentRepository;
     }
 
     /** The dashboard directory to serve, or null when none is configured or it is absent. */

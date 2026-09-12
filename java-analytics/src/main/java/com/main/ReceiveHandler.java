@@ -7,19 +7,33 @@ import com.sun.net.httpserver.HttpHandler;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.sql.SQLException;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.Locale;
 
 /**
  * POST /receive — the ingestion route. Every rejection is counted by reason, and the checks run
  * cheapest first: an unauthenticated or rate-limited caller never reaches the parser.
+ *
+ * <p>Unlike every other authenticated route, this one does not accept a session cookie — a
+ * browser signed in to the dashboard has no reason to submit synthetic telemetry, and narrowing
+ * what a stolen session can do costs nothing here.
  */
 class ReceiveHandler implements HttpHandler {
+    /** last_used_at is accurate to this window, not to the request: a write per event would not
+     *  tell an operator anything a five-minute resolution does not, and it would not be free. */
+    private static final Duration LAST_USED_THROTTLE = Duration.ofMinutes(5);
+
     private final EngineContext context;
     private final HttpSupport http;
 
     ReceiveHandler(EngineContext context) {
         this.context = context;
         this.http = context.http();
+    }
+
+    /** Which credential authorized the request, and the host it may report as, if bound. */
+    private record Authorization(String method, String boundHostId, String agentId) {
     }
 
     @Override
@@ -38,11 +52,21 @@ class ReceiveHandler implements HttpHandler {
             }
 
             // Authenticate and reject abusive requests before parsing or storing data.
-            if (!http.isAuthorized(exchange)) {
+            Authorization authorization;
+            try {
+                authorization = authorize(exchange);
+            } catch (SQLException exception) {
+                metrics.recordDatabaseFailure();
+                http.sendResponse(exchange, 503, "Database unavailable");
+                return;
+            }
+            if (authorization == null) {
                 metrics.recordEventRejected("unauthorized");
                 http.sendResponse(exchange, 401, "Unauthorized");
                 return;
             }
+            metrics.recordReceiveAuth(authorization.method());
+
             String clientAddress = exchange.getRemoteAddress().getAddress().getHostAddress();
             if (!context.rateLimiter().allow(clientAddress)) {
                 metrics.recordEventRejected("rate_limited");
@@ -94,6 +118,27 @@ class ReceiveHandler implements HttpHandler {
             }
 
             LogEntry event = EventValidation.toLogEntry(json);
+            if (authorization.boundHostId() != null) {
+                // The token, not the payload, is the source of truth for identity: a per-agent
+                // credential can only ever report as the host it was minted for. This is what
+                // actually stops one agent from spoofing another's host_id, which the shared key
+                // never prevented.
+                String claimedHostId = EventValidation.textOrNull(json, "host_id");
+                if (claimedHostId != null && !claimedHostId.equals(authorization.boundHostId())) {
+                    StructuredLogger.warn("agent token host mismatch, using the bound host",
+                            StructuredLogger.fields("correlation_id", correlationId,
+                                    "claimed_host_id", claimedHostId, "bound_host_id", authorization.boundHostId(),
+                                    "agent_id", authorization.agentId()));
+                }
+                event.hostId = authorization.boundHostId();
+                try {
+                    context.agents().touch(authorization.agentId(), Instant.now(), LAST_USED_THROTTLE);
+                } catch (SQLException exception) {
+                    // Bookkeeping, not the ingestion path itself: never fail an event over this.
+                    StructuredLogger.warn("could not record agent token use", StructuredLogger.fields(
+                            "agent_id", authorization.agentId(), "error", exception.getMessage()));
+                }
+            }
             boolean stored;
             try {
                 stored = context.recentEvents().store(event);
@@ -126,5 +171,25 @@ class ReceiveHandler implements HttpHandler {
             metrics.observeProcessingDuration((System.nanoTime() - startedAt) / 1_000_000_000.0);
             HttpSupport.clearCorrelationId();
         }
+    }
+
+    /**
+     * Resolves the presented {@code X-EventWatch-Key} as either the fleet-wide shared key or a
+     * per-agent token, or returns null when it is neither. The two are tried in the same
+     * comparison shape on purpose: a revoked or unknown token must fail exactly as a wrong shared
+     * key does, so a caller cannot tell which kind of credential it guessed wrong.
+     */
+    private Authorization authorize(HttpExchange exchange) throws SQLException {
+        String presented = exchange.getRequestHeaders().getFirst(HttpSupport.API_KEY_HEADER);
+        if (presented == null || presented.isBlank()) {
+            return null;
+        }
+        if (context.configuration().sharedKeyIngestionEnabled() && http.isValidApiKey(presented)) {
+            return new Authorization("shared_key", null, null);
+        }
+        return context.agents().findByTokenHash(AgentTokens.hash(presented))
+                .filter(credential -> !credential.revoked())
+                .map(credential -> new Authorization("agent_token", credential.hostId(), credential.id()))
+                .orElse(null);
     }
 }

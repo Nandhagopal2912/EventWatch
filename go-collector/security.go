@@ -61,6 +61,29 @@ func authorizeCapture(r *http.Request) bool {
 		subtle.ConstantTimeCompare([]byte(presented), []byte(configuredCaptureKey)) == 1
 }
 
+// resolveIngestionCredential decides what this agent presents to Java as X-EventWatch-Key.
+//
+// An AGENT_TOKEN, once minted per host, takes over from the fleet-wide key. The key stays
+// required regardless, so a deployment that has not adopted tokens yet — or has the shared path
+// deliberately kept on as a fallback — starts exactly as it always has. warning is non-empty when
+// a token is set without a pinned host id, which the caller should log rather than fail on: an
+// unbound self-generated identity might still be exactly what the token was minted for.
+func resolveIngestionCredential(apiKey, agentToken, hostID string) (credential string, warning string, err error) {
+	apiKey = strings.TrimSpace(apiKey)
+	agentToken = strings.TrimSpace(agentToken)
+	if apiKey == "" && agentToken == "" {
+		return "", "", fmt.Errorf("EVENTWATCH_API_KEY or AGENT_TOKEN is required")
+	}
+	if agentToken == "" {
+		return apiKey, "", nil
+	}
+	if strings.TrimSpace(hostID) == "" {
+		warning = "AGENT_TOKEN is set without a pinned HOST_ID; if the token is bound to a host, " +
+			"a self-generated identity will not match it"
+	}
+	return agentToken, warning, nil
+}
+
 // backendTLSConfig trusts a private certificate authority when one is configured, so an
 // agent can verify a self-signed analytics service instead of skipping verification.
 func backendTLSConfig(caFile string, skipVerify bool) (*tls.Config, error) {

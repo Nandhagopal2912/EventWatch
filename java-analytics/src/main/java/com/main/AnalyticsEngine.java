@@ -131,6 +131,8 @@ public class AnalyticsEngine {
         // Registered after /alerts so the longer prefix wins for keyed routes.
         server.createContext("/alerts/", new AlertDetailHandler(context));
         server.createContext("/session", new SessionHandler(context));
+        server.createContext("/agents", new AgentsHandler(context));
+        server.createContext("/agents/", new AgentDetailHandler(context));
 
         // The dashboard is served last and at the root, so every API path above claims its own
         // longer prefix first. Serving it here is what makes the session cookie same-origin.

@@ -45,7 +45,7 @@ class SecurityTest {
                 TestSupport.databaseUrl(temporaryDirectory, "security.db"), API_KEY, "text",
                 85.0, 80.0, 5, false, "", 1, 1, 1, 0, 0, "", "", 2, 0, 60, 100,
                 tls, keystorePath, keystorePassword, "PKCS12", "", metricsRequireKey,
-                10, 168, 60, "", 60, 5, 720, 10);
+                10, 168, 60, "", 60, 5, 720, 10, true);
     }
 
     private HttpResponse<String> get(String scheme, int port, String path, String apiKey,

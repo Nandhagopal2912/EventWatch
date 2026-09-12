@@ -56,7 +56,7 @@ class PostgresBackendTest {
                 retentionDays,
                 60,
                 100,
-                false, "", "", "PKCS12", "", false, 10, 168, 60, "", 60, 5, 720, 10);
+                false, "", "", "PKCS12", "", false, 10, 168, 60, "", 60, 5, 720, 10, true);
     }
 
     @BeforeEach

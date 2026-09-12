@@ -47,7 +47,7 @@ class EngineLifecycleTest {
                 TestSupport.databaseUrl(temporaryDirectory, fileName), API_KEY, "text",
                 85.0, 80.0, 5, false, "", 1, 1, 1, 0,
                 shutdownGraceSeconds, "", "", poolSize, 0, 60, rateLimit,
-                false, "", "", "PKCS12", "", false, 10, 168, 60, "", 60, 5, 720, 10);
+                false, "", "", "PKCS12", "", false, 10, 168, 60, "", 60, 5, 720, 10, true);
     }
 
     @Test
@@ -68,7 +68,7 @@ class EngineLifecycleTest {
         EngineConfiguration withoutKey = new EngineConfiguration(0,
                 TestSupport.databaseUrl(temporaryDirectory, "nokey.db"), "  ", "text",
                 85.0, 80.0, 5, false, "", 1, 1, 1, 0, 0, "", "", 4, 0, 60, 100,
-                false, "", "", "PKCS12", "", false, 10, 168, 60, "", 60, 5, 720, 10);
+                false, "", "", "PKCS12", "", false, 10, 168, 60, "", 60, 5, 720, 10, true);
 
         Database.forgetLastOpened();
         IOException failure = assertThrows(IOException.class, () -> AnalyticsEngine.start(withoutKey));
@@ -81,7 +81,7 @@ class EngineLifecycleTest {
         EngineConfiguration unusable = new EngineConfiguration(0,
                 "jdbc:mysql://localhost/eventwatch", API_KEY, "text",
                 85.0, 80.0, 5, false, "", 1, 1, 1, 0, 0, "", "", 4, 0, 60, 100,
-                false, "", "", "PKCS12", "", false, 10, 168, 60, "", 60, 5, 720, 10);
+                false, "", "", "PKCS12", "", false, 10, 168, 60, "", 60, 5, 720, 10, true);
 
         Database.forgetLastOpened();
         assertThrows(IOException.class, () -> AnalyticsEngine.start(unusable));
@@ -127,7 +127,7 @@ class EngineLifecycleTest {
 
         engine = AnalyticsEngine.start(new EngineConfiguration(0, databaseUrl, API_KEY, "text",
                 85.0, 80.0, 5, false, "", 1, 1, 1, 0, 0, "", "", 4, 0, 60, 100,
-                false, "", "", "PKCS12", "", false, 10, 168, 60, "", 60, 5, 720, 10));
+                false, "", "", "PKCS12", "", false, 10, 168, 60, "", 60, 5, 720, 10, true));
 
         try (Connection connection = DriverManager.getConnection(databaseUrl);
                 Statement statement = connection.createStatement();
@@ -146,7 +146,7 @@ class EngineLifecycleTest {
                 TestSupport.databaseUrl(temporaryDirectory, "keystore.db"), API_KEY, "text",
                 85.0, 80.0, 5, false, "", 1, 1, 1, 0, 0, "", "", 4, 0, 60, 100,
                 true, temporaryDirectory.resolve("absent.p12").toString(), "changeit", "PKCS12",
-                "", false, 10, 168, 60, "", 60, 5, 720, 10);
+                "", false, 10, 168, 60, "", 60, 5, 720, 10, true);
 
         Database.forgetLastOpened();
         assertThrows(IOException.class, () -> AnalyticsEngine.start(missingKeystore));
@@ -162,7 +162,7 @@ class EngineLifecycleTest {
         EngineConfiguration zeroSweep = new EngineConfiguration(0,
                 TestSupport.databaseUrl(temporaryDirectory, "sweep.db"), API_KEY, "text",
                 85.0, 80.0, 5, false, "", 1, 1, 1, 0, 0, "", "", 0, 7, 0, 0,
-                false, "", "", "PKCS12", "", false, 10, 168, 60, "", 60, 5, 720, 10);
+                false, "", "", "PKCS12", "", false, 10, 168, 60, "", 60, 5, 720, 10, true);
 
         assertEquals(60, zeroSweep.retentionSweepMinutes(), "a non-positive period falls back");
         assertEquals(10, zeroSweep.databasePoolSize(), "a non-positive pool size falls back");

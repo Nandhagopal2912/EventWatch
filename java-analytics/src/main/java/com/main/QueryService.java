@@ -98,6 +98,45 @@ public class QueryService {
         return items;
     }
 
+    /** Every issued credential, newest first. The token itself never appears here. */
+    public ArrayNode agents(List<AgentCredential> credentials) {
+        ArrayNode items = objectMapper.createArrayNode();
+        for (AgentCredential credential : credentials) {
+            items.add(agentJson(credential));
+        }
+        return items;
+    }
+
+    public ObjectNode agentJson(AgentCredential credential) {
+        ObjectNode node = objectMapper.createObjectNode();
+        node.put("id", credential.id());
+        node.put("host_id", credential.hostId());
+        if (credential.label() == null) {
+            node.putNull("label");
+        } else {
+            node.put("label", credential.label());
+        }
+        node.put("created_at", credential.createdAt().toString());
+        if (credential.lastUsedAt() == null) {
+            node.putNull("last_used_at");
+        } else {
+            node.put("last_used_at", credential.lastUsedAt().toString());
+        }
+        if (credential.revokedAt() == null) {
+            node.putNull("revoked_at");
+        } else {
+            node.put("revoked_at", credential.revokedAt().toString());
+        }
+        return node;
+    }
+
+    /** The one response that ever carries the plaintext token, at the moment it is minted. */
+    public ObjectNode agentMinted(AgentCredential credential, String token) {
+        ObjectNode node = agentJson(credential);
+        node.put("token", token);
+        return node;
+    }
+
     /** Stored rules plus the configuration defaults they override. */
     public ObjectNode rules(List<AlertRule> rules, Map<String, Double> defaults) {
         ObjectNode response = objectMapper.createObjectNode();

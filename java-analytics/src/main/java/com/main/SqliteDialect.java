@@ -64,6 +64,17 @@ public class SqliteDialect implements SqlDialect {
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (rule_type, scope)
                 )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS agents (
+                    id TEXT PRIMARY KEY,
+                    host_id TEXT NOT NULL,
+                    label TEXT,
+                    token_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    last_used_at TEXT,
+                    revoked_at TEXT
+                )
                 """);
     }
 
@@ -76,7 +87,9 @@ public class SqliteDialect implements SqlDialect {
                 "CREATE INDEX IF NOT EXISTS idx_telemetry_events_host "
                         + "ON telemetry_events(host_id, event_timestamp)",
                 "CREATE INDEX IF NOT EXISTS idx_notification_deliveries_alert "
-                        + "ON notification_deliveries(alert_key, id DESC)");
+                        + "ON notification_deliveries(alert_key, id DESC)",
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_token_hash ON agents(token_hash)",
+                "CREATE INDEX IF NOT EXISTS idx_agents_host ON agents(host_id)");
     }
 
     @Override

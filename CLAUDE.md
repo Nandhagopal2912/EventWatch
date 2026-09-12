@@ -76,7 +76,8 @@ curl.exe "http://localhost:8082/capture?level=ERROR&msg=Database%20transaction%2
 ```text
 go-collector/main.go            Handlers, forwardToJava retries, durable file queue
 go-collector/identity.go        Stable per-agent host_id, persisted beside the queue
-go-collector/security.go        Bind policy, capture auth, backend TLS trust
+go-collector/security.go        Bind policy, capture auth, backend TLS trust,
+                                ingestion credential resolution (shared key vs. AGENT_TOKEN)
 go-collector/watchdog.go        Delivery-health tracking, agent alerts
 go-collector/logging.go         Structured JSON log lines, LOG_FORMAT switch
 go-collector/metrics.go         Prometheus counters, queue-depth gauge, /metrics handler
@@ -102,6 +103,11 @@ java-analytics/src/main/java/com/main/
   SessionHandler.java           POST/GET/DELETE /session: sign in, probe, sign out
   SessionStore.java             In-memory operator sessions, bounded and expiring
   DashboardHandler.java         Static files at /, with the traversal check
+  AgentsHandler.java            GET/POST /agents: list issued credentials, mint one
+  AgentDetailHandler.java       DELETE /agents/{id}: revoke
+  AgentCredential.java          One issued credential; the hash, never the token, is stored
+  AgentRepository.java          agents table: create, look up by token hash, revoke, touch
+  AgentTokens.java              Generates and SHA-256 hashes per-agent tokens
   RequestParameters.java        Query-string parsing, shared by every read route
   EventValidation.java          The ingestion contract in one place
   LogEntry.java                 One telemetry event, as the repositories and rules see it
@@ -153,6 +159,9 @@ java-analytics/src/test/java/com/main/
   MultipleEnginesTest.java      Two engines in one JVM: separate keys, metrics, windows
   SessionApiTest.java           Cookie attributes, revocation, rate limit, expiry
   DashboardServingTest.java     Static serving, content types, and the traversal attempts
+  AgentRepositoryTest.java      Hash storage, revoke, throttled last-used
+  AgentsApiTest.java            Mint/list/revoke, rotation, and that a token cannot self-admin
+  AgentIngestionTest.java       Token auth at /receive, host binding, the deprecation flag
   WatchdogHeartbeatTest.java    Heartbeat payload, failures, and the deliberate silence
 java-analytics/Dockerfile       Shaded jar on a JRE, database on a volume
 
@@ -189,15 +198,16 @@ Changes to this schema must stay backward compatible — additive fields only, n
 
 | Method | Path | Auth | Notes |
 | --- | --- | --- | --- |
-| POST | `/receive` (8080) | key | Ingest; rate limited per IP by `RATE_LIMIT_PER_MINUTE` (default 100) |
+| POST | `/receive` (8080) | key or agent token | Ingest; rate limited per IP by `RATE_LIMIT_PER_MINUTE` |
 | GET | `/` and dashboard assets (8080) | none | Served from `DASHBOARD_DIR`; the sign-in page |
 | POST | `/session` (8080) | key in body | Mints the session cookie; rate limited per IP |
 | GET | `/session` (8080) | key or cookie | 200 when signed in, 401 otherwise; used on reload |
 | DELETE | `/session` (8080) | none | Revokes the presented cookie and clears it |
 | GET | `/health` (8080, 8082) | none | 8080 also probes SQLite |
 | GET | `/metrics` (8080, 8082) | none, or key when `METRICS_REQUIRE_KEY` | Prometheus text format |
-
-Every route marked "key" accepts either the `X-EventWatch-Key` header or a session cookie.
+| GET | `/agents` (8080) | key | Every issued credential; never the token or its hash |
+| POST | `/agents` (8080) | key | Mints one: `host_id`, optional `label`; token shown once |
+| DELETE | `/agents/{id}` (8080) | key | Revoke; the row stays for history |
 | GET | `/capture?level=&msg=` (8082) | none on loopback, key when exposed | Agent ingress |
 | GET | `/stress` (8082) | same as `/capture` | 500 events, 32 concurrent |
 | GET | `/events?level=&host_id=&from=&to=&limit=&offset=` | key | limit ≤ 200, default 50 |
@@ -212,6 +222,8 @@ Every route marked "key" accepts either the `X-EventWatch-Key` header or a sessi
 | PUT | `/rules` | key | Upsert one rule: `rule_type`, optional `host_id`, `threshold`, `enabled` |
 | DELETE | `/rules?rule_type=&host_id=` | key | Remove an override; omit `host_id` for the fleet rule |
 | GET | `/rules/effective?host_id=` | key | What applies to one machine, with its source tier |
+
+"key" above means the `X-EventWatch-Key` header or a session cookie, except `/receive`, which never accepts a session — an agent has no cookie jar, and a browser session has no business posting telemetry. `/receive` accepts the fleet-wide key (while `SHARED_KEY_INGESTION_ENABLED`) or a per-agent token; `/agents` and `/agents/{id}` never accept an agent token, only the operator credential.
 
 ---
 
@@ -258,21 +270,23 @@ Every route marked "key" accepts either the `X-EventWatch-Key` header or a sessi
 
 ## 5. Current state — read before starting work
 
-**Phases 1–18 are complete.** Everything is green:
+**Phases 1–19 are complete.** Everything is green:
 
-- `cd java-analytics && mvn verify` → 208 tests, BUILD SUCCESS (12 of them need
-  `EVENTWATCH_TEST_POSTGRES_URL`; CI supplies a server, locally they skip)
-- `cd go-collector && go vet ./... && go test ./...` → 53 tests, pass
+- `cd java-analytics && mvn verify` → 241 tests, BUILD SUCCESS (12 of them need
+  `EVENTWATCH_TEST_POSTGRES_URL`; CI supplies a server, locally they skip). Verified against a
+  real PostgreSQL 16 container with all 241 running.
+- `cd go-collector && go vet ./... && go test ./...` → 58 tests, pass
 - `cd loadtest && go vet ./... && go test ./...` → 4 tests, pass
-- `docker compose up --build` → both services healthy, dashboard served on 8080
+- `docker compose up --build` → both services healthy; minting a token and ingesting through it
+  verified live in containers, spoof attempt included
 
 The phase roadmap (1–15) delivered the system; 16 onward is hardening for real use, planned in
-section 18. Phase 18 moved the dashboard behind the analytics service so the two share an origin,
-exchanged the API key for an HttpOnly session cookie, and deleted the CORS configuration and the
-separate dashboard container along with it.
+section 19. Phase 19 gave every agent its own ingestion credential: `POST /agents` mints one bound
+to a host, `DELETE /agents/{id}` revokes it, and the shared key still works behind
+`SHARED_KEY_INGESTION_ENABLED` during migration.
 
-**Next is Phase 19, per-agent credentials.** One shared key cannot be rotated or revoked per
-machine, so one leaked agent compromises every host.
+**Next is Phase 20, cleanup and closing gaps:** the scripted two-process outage test, one-off
+timestamp normalisation for pre-Phase-9 rows, and removing `/stress` from the shipped binary.
 
 B1–B17 in section 17 are all fixed.
 
@@ -389,7 +403,7 @@ filters meaning exactly the same thing everywhere.
 sweeps rate windows. The cutoff is exclusive, delivery history is pruned alongside the events that
 produced it, and a failed sweep is logged rather than thrown so the timer thread survives.
 
-**What is deliberately NOT done, and when to revisit** — see section 18. Short version: the file
+**What is deliberately NOT done, and when to revisit** — see section 19. Short version: the file
 queue and the two-service shape are both still comfortably inside what the measurements justify.
 
 ## 10. Phase 12 as built — host identity
@@ -464,7 +478,7 @@ logs a startup warning.
 
 **Rules are read on every event, so they are cached** in `AlertRules` and replaced wholesale on
 each write. That is correct for one analytics instance; a second instance would need a refresh
-interval or change notification — the same limitation as notification reminders in section 17.
+interval or change notification — the same limitation as notification reminders in section 18.
 
 **A wiring bug the tests caught before commit:** the CORS preflight still advertised
 `GET, POST, OPTIONS`, because the edit replaced the first of two identical strings — in the
@@ -619,7 +633,56 @@ directory, which is why the test asserts on the *content* rather than only the s
 different origin is now a reverse-proxy question, which is the correct answer anyway; the header
 path still works for anything that is not a browser.
 
-## 17. Fixed defects and remaining quality work
+## 17. Phase 19 as built — per-agent credentials
+
+**The token binds an identity, it does not just gate a request.** Minting stores `(host_id,
+token_hash)`; at ingestion, a valid token makes the payload's `host_id` irrelevant — the event is
+always stamped with the token's bound host. This is stricter than the plan going in, which
+proposed verifying the claim and rejecting a mismatch with a new 403. Overriding is simpler, needs
+no new status code, and removes an operational trap the reject-and-fail version would have had:
+an operator would otherwise have to keep `HOST_ID` on the agent and `host_id` at mint time in sync
+by hand. A mismatch is still logged at WARN, so a real misconfiguration is visible without being
+fatal. Verified live: an event claiming `attacker-host` while authenticated as `web-01`'s token
+landed under `web-01`, and `attacker-host` never received anything.
+
+**The shared key and per-agent tokens are tried the same way on purpose.** `authorize` in
+`ReceiveHandler` checks the shared key first, then falls through to a token-hash lookup; either a
+revoked token or a wrong shared key produces the identical 401. Distinguishing them would tell an
+attacker which kind of credential they guessed wrong.
+
+**Only the hash is ever stored.** The token is 256 random bits — the same entropy `SessionStore`
+already uses for a session — so SHA-256 is the right tool, the same choice GitHub and GitLab make
+for personal access tokens. A human password needs a slow salted KDF because it can be guessed;
+this cannot be, so hashing it is only about not keeping the plaintext lying around.
+
+**Multiple active tokens per host is a feature, not an oversight.** It is what makes rotation
+possible without downtime: mint the replacement, roll it out, then revoke the original. There is
+no uniqueness constraint on `host_id` in the `agents` table for exactly this reason.
+
+**A per-agent token cannot mint or revoke other credentials.** `AgentsHandler` and
+`AgentDetailHandler` extend `ApiHandler`, which checks the operator credential (key or session);
+a valid ingestion token fails that check, because `isAuthorized` never consults the agents table.
+Least privilege in the same direction as scoping the token to ingestion in the first place: an
+agent that can only send events must not also be its own administrator.
+
+**`last_used_at` is throttled at the SQL layer, not read-then-written in application code.**
+`UPDATE agents SET last_used_at = ? WHERE id = ? AND (last_used_at IS NULL OR last_used_at < ?)`
+is one statement and one round trip regardless of how often an agent reports; outside the throttle
+window it writes once, inside it, zero rows change and nothing else happens. An agent posting
+every few seconds costs the database one write every five minutes, not one per event.
+
+**Revoking marks a row rather than deleting it**, the same lifecycle-not-deletion choice already
+made for alerts. `DELETE /agents/{id}` is idempotent from the caller's side: revoking twice
+reports "no such active credential" both times, which does not distinguish "never existed" from
+"already gone" — a caller does not need to know which, and the row itself still says which if an
+operator looks.
+
+**Nothing new needed at the storage layer beyond one table.** Every other identifier this codebase
+exposes externally is application-generated text — `event_id`, `alert_key` — never a database
+autoincrement value read back through `getGeneratedKeys`. The agent `id` follows that precedent
+rather than introducing a new one.
+
+## 18. Fixed defects and remaining quality work
 
 ### Fixed (keep these fixed — each has a way to regress)
 
@@ -720,7 +783,7 @@ by reading `docker compose ps` rather than trusting that the stack was up.
   in memory alongside the SQL `lastDeliveredAt` lookup; a restart falls back to the SQL value, which
   is correct but means an in-flight reservation is lost. Fine for one instance, wrong for two.
 
-## 18. Roadmap and deferred work
+## 19. Roadmap and deferred work
 
 **The phase roadmap (1–15) is complete.** What follows is hardening for real use rather than new
 capability. Phases 16–20 are planned, one commit each, in this order.
@@ -752,7 +815,7 @@ accepting cookie or header. The key leaves page memory, the CORS configuration b
 and the separate static server and its Compose container disappear. A feature that deletes moving
 parts is usually the right shape.
 
-**Phase 19 — Per-agent credentials.** One shared key for a fleet cannot be rotated or revoked per
+**Phase 19 — Per-agent credentials.** Done (see section 17). One shared key for a fleet cannot be rotated or revoked per
 machine; one leaked agent compromises every host. An `agents` table with hashed tokens, `POST
 /agents` to mint and `DELETE /agents/{id}` to revoke, and `last_used` for spotting dead credentials.
 The shared key keeps working behind a deprecation switch during migration — the same additive
@@ -801,7 +864,7 @@ than changing databases.
 
 ---
 
-## 19. Definition of done for a release
+## 20. Definition of done for a release
 
 - Events are authenticated, validated, persisted transactionally, deduplicated, and queryable.
 - A temporary Java outage loses nothing and duplicates nothing.

@@ -61,7 +61,7 @@ class AnalyticsEngineIntegrationTest {
     private EngineConfiguration configurationWithThresholds(double cpu, double ram, int repeatedErrors) {
         return new EngineConfiguration(0, databaseUrl, API_KEY, "text",
                 cpu, ram, repeatedErrors, false, "", 1, 1, 1, 0, 0, "", "", 2, 0, 60, 100,
-                false, "", "", "PKCS12", "", false, 10, 168, 60, "", 60, 5, 720, 10);
+                false, "", "", "PKCS12", "", false, 10, 168, 60, "", 60, 5, 720, 10, true);
     }
 
     private String eventBody(String eventId, String level, double cpu, double ram) {

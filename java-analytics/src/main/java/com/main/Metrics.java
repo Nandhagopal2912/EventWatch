@@ -22,6 +22,8 @@ public final class Metrics {
     private final Map<String, AtomicLong> httpRequests = new ConcurrentHashMap<>();
     private final Map<String, AtomicLong> sessions = new ConcurrentHashMap<>();
     private final AtomicLong sessionsActive = new AtomicLong();
+    private final Map<String, AtomicLong> receiveAuth = new ConcurrentHashMap<>();
+    private final Map<String, AtomicLong> agentCredentials = new ConcurrentHashMap<>();
 
     public void recordEventReceived() {
         eventsReceived.incrementAndGet();
@@ -70,6 +72,16 @@ public final class Metrics {
         sessionsActive.set(count);
     }
 
+    /** method is shared_key or agent_token: which credential authorized an accepted ingest. */
+    public void recordReceiveAuth(String method) {
+        receiveAuth.computeIfAbsent(method, key -> new AtomicLong()).incrementAndGet();
+    }
+
+    /** outcome is minted or revoked. The active count is derivable: minted minus revoked. */
+    public void recordAgentCredential(String outcome) {
+        agentCredentials.computeIfAbsent(outcome, key -> new AtomicLong()).incrementAndGet();
+    }
+
     public void recordHttpRequest(String path, int status) {
         httpRequests.computeIfAbsent(path + " " + status, key -> new AtomicLong()).incrementAndGet();
     }
@@ -91,6 +103,11 @@ public final class Metrics {
                 "Dead-man switch heartbeats by outcome.", "outcome", watchdogPings);
         labelledCounter(builder, "eventwatch_sessions_total",
                 "Operator sign-in attempts by outcome.", "outcome", sessions);
+        labelledCounter(builder, "eventwatch_receive_auth_total",
+                "Accepted ingestion requests by which credential authorized them.",
+                "method", receiveAuth);
+        labelledCounter(builder, "eventwatch_agent_credentials_total",
+                "Per-agent ingestion credentials minted or revoked.", "outcome", agentCredentials);
         httpCounter(builder);
 
         gauge(builder, "eventwatch_alerts_active",

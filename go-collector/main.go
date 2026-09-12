@@ -50,13 +50,15 @@ var agentVersion = "0.15.0"
 var (
 	backendClient        *http.Client
 	configuredBackendURL string
-	configuredAPIKey     string
-	queueDirectory       string
-	queueCapacity        int
-	queueRetryInterval   time.Duration
-	queueWake            = make(chan struct{}, 1)
-	queueMutex           sync.Mutex
-	eventSequence        uint64
+	// The value sent as X-EventWatch-Key to Java: an AGENT_TOKEN if one is set, otherwise the
+	// fleet-wide EVENTWATCH_API_KEY. The name says what it is for, not which phase issued it.
+	configuredIngestionCredential string
+	queueDirectory                string
+	queueCapacity                 int
+	queueRetryInterval            time.Duration
+	queueWake                     = make(chan struct{}, 1)
+	queueMutex                    sync.Mutex
+	eventSequence                 uint64
 )
 
 func readHostMetrics() (float64, float64, error) {
@@ -285,15 +287,19 @@ func main() {
 		javaBackendURL = "http://localhost:8080/receive"
 	}
 	configureLogging(getEnv("LOG_FORMAT", "json"))
-	apiKey := os.Getenv("EVENTWATCH_API_KEY")
-	if apiKey == "" {
-		fmt.Println("EVENTWATCH_API_KEY is required")
+	ingestionCredential, credentialWarning, err := resolveIngestionCredential(
+		os.Getenv("EVENTWATCH_API_KEY"), getEnv("AGENT_TOKEN", ""), getEnv("HOST_ID", ""))
+	if err != nil {
+		fmt.Println(err.Error())
 		return
+	}
+	if credentialWarning != "" {
+		logWarn(credentialWarning, logFields{})
 	}
 
 	backendClient = &http.Client{Timeout: 5 * time.Second}
 	configuredBackendURL = javaBackendURL
-	configuredAPIKey = apiKey
+	configuredIngestionCredential = ingestionCredential
 	queueDirectory = getEnv("PENDING_EVENTS_DIR", "pending-events")
 	queueCapacity = getIntEnv("QUEUE_CAPACITY", 1000)
 	queueRetryInterval = time.Duration(getIntEnv("QUEUE_RETRY_SECONDS", 5)) * time.Second
@@ -395,7 +401,7 @@ func forwardToJava(jsonBytes []byte, correlationID string) (*http.Response, erro
 			return nil, err
 		}
 		request.Header.Set("Content-Type", "application/json")
-		request.Header.Set("X-EventWatch-Key", configuredAPIKey)
+		request.Header.Set("X-EventWatch-Key", configuredIngestionCredential)
 		if correlationID != "" {
 			request.Header.Set("X-Correlation-ID", correlationID)
 		}

@@ -144,3 +144,56 @@ func TestBackendTLSCanSkipVerificationExplicitly(t *testing.T) {
 		t.Error("skip verify must be honoured when explicitly requested")
 	}
 }
+
+func TestResolveIngestionCredentialFallsBackToTheSharedKey(t *testing.T) {
+	credential, warning, err := resolveIngestionCredential("fleet-secret", "", "web-01")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if credential != "fleet-secret" {
+		t.Errorf("no AGENT_TOKEN set, expected the shared key, got %q", credential)
+	}
+	if warning != "" {
+		t.Errorf("the shared key path needs no warning, got %q", warning)
+	}
+}
+
+func TestResolveIngestionCredentialPrefersTheAgentToken(t *testing.T) {
+	credential, warning, err := resolveIngestionCredential("fleet-secret", "agent-token", "web-01")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if credential != "agent-token" {
+		t.Errorf("expected the per-agent token to take over, got %q", credential)
+	}
+	if warning != "" {
+		t.Errorf("a pinned host id needs no warning, got %q", warning)
+	}
+}
+
+func TestResolveIngestionCredentialWarnsWithoutAPinnedHost(t *testing.T) {
+	_, warning, err := resolveIngestionCredential("fleet-secret", "agent-token", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if warning == "" {
+		t.Error("an unbound self-generated identity might not match the token; this must be surfaced")
+	}
+}
+
+func TestResolveIngestionCredentialRequiresOneOrTheOther(t *testing.T) {
+	if _, _, err := resolveIngestionCredential("", "", "web-01"); err == nil {
+		t.Error("with neither credential set, startup must refuse rather than send an empty header")
+	}
+}
+
+func TestResolveIngestionCredentialAcceptsTheTokenAlone(t *testing.T) {
+	// A deployment that has fully migrated off the shared key never sets EVENTWATCH_API_KEY.
+	credential, _, err := resolveIngestionCredential("", "agent-token", "web-01")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if credential != "agent-token" {
+		t.Errorf("expected the token alone to be sufficient, got %q", credential)
+	}
+}

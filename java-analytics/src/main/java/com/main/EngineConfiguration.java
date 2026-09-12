@@ -40,7 +40,8 @@ public record EngineConfiguration(
         int watchdogIntervalSeconds,
         int watchdogTimeoutSeconds,
         int sessionTimeToLiveMinutes,
-        int sessionRateLimitPerMinute) {
+        int sessionRateLimitPerMinute,
+        boolean sharedKeyIngestionEnabled) {
 
     /**
      * Settings where zero or negative is not a weaker setting but a crash: the pool rejects a
@@ -101,7 +102,8 @@ public record EngineConfiguration(
                 intValue(dotenv, "WATCHDOG_INTERVAL_SECONDS", 60),
                 intValue(dotenv, "WATCHDOG_TIMEOUT_SECONDS", 5),
                 intValue(dotenv, "SESSION_TTL_MINUTES", 720),
-                intValue(dotenv, "SESSION_RATE_LIMIT_PER_MINUTE", 10));
+                intValue(dotenv, "SESSION_RATE_LIMIT_PER_MINUTE", 10),
+                Boolean.parseBoolean(value(dotenv, "SHARED_KEY_INGESTION_ENABLED", "true")));
     }
 
     /**
@@ -111,7 +113,7 @@ public record EngineConfiguration(
     public static EngineConfiguration forTesting(String databaseUrl, String apiKey) {
         return new EngineConfiguration(0, databaseUrl, apiKey, "text",
                 85.0, 80.0, 5, false, "", 1, 1, 1, 0, 0, "", "", 2, 0, 60, 100,
-                false, "", "", "PKCS12", "", false, 10, 168, 60, "", 60, 5, 720, 10);
+                false, "", "", "PKCS12", "", false, 10, 168, 60, "", 60, 5, 720, 10, true);
     }
 
     private static String value(Dotenv dotenv, String name, String fallback) {

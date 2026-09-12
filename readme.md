@@ -10,11 +10,26 @@ It is built without web frameworks, an ORM, or a DI container on either side, so
 retries, queueing, deduplication, alert state, delivery — is visible in the code rather than hidden
 behind configuration.
 
-**Status:** Phases 1–18 complete. 265 tests pass: 208 Java, 53 Go agent, 4 load harness.
+**Status:** Phases 1–19 complete. 303 tests pass: 241 Java, 58 Go agent, 4 load harness.
 `CLAUDE.md` is the working guide for contributors and records what is deliberately deferred.
 
 **Scope:** built for roughly 5–50 machines. It is not an APM, a log aggregator, or a metrics
 warehouse, and it is not intended to replace Datadog, CloudWatch, or a SIEM.
+
+**Is it production-ready?** For its actual scope — a homelab, a personal VPS fleet, or a small
+team's internal machines, run by someone who reads this file — yes. Every reliability claim here
+is measured or tested rather than assumed: throughput numbers come from a load harness, an outage
+losing zero events was verified in running containers, and the security settings are proven with a
+live TLS handshake and a live cookie inspection rather than trusted on paper.
+
+Past that scope, the gap is specific rather than vague. There is no user identity: every signed-in
+operator is equivalent, so there is no record of *who* acknowledged or resolved an alert. There is
+one shared credential across the whole fleet until per-agent tokens land. There is exactly one
+analytics instance with no failover — an accepted tradeoff, not an oversight, but a real one.
+Sessions live in memory, so restarting the service signs every operator out. And there is no
+secrets manager, no encryption at rest, and no tested restore procedure — just a database file you
+are responsible for. None of that is a defect to be fixed quietly; it is the honest boundary of
+what a system built and reviewed by one person, at this scope, can claim.
 
 ---
 
@@ -68,6 +83,8 @@ of its own.
 **Signs operators in.** The dashboard is served by the analytics service, so the two share an
 origin. The API key is presented once, to `POST /session`, and exchanged for an `HttpOnly`
 cookie the page itself cannot read.
+
+**Gives every agent its own key.** `POST /agents` mints a token bound to one machine; a leaked agent is revoked alone, not rotated fleet-wide, and it can only ever report as the host it was minted for.
 
 **Defends itself.** The agent binds to loopback by default and refuses to bind anywhere else without
 a key. The analytics API authenticates every data route, rate-limits ingestion per client, validates
@@ -162,6 +179,11 @@ own class over a shared context, and the cross-cutting work every route repeated
 the method check, the API key, and turning a bad parameter into 400 and unreachable storage into 503
 — lives in one base class. The test that proves it starts two engines side by side.
 
+**17. A credential should bind an identity, not just gate a request.** A per-agent token is minted
+for one host, and ingestion stamps every event with that host regardless of what the payload
+claims — the token is the source of truth, not the message. This closes a gap the shared key could
+never close: with one key for the whole fleet, any caller holding it could claim to be any machine.
+
 ---
 
 ## Architecture
@@ -222,26 +244,34 @@ event to `pending-events/`. A background worker retries it later.
 | GET | `/metrics` | none | Prometheus text format |
 | GET | `/stress` | same as `/capture` | 500 synthetic events, 32 concurrent |
 
-**Analytics, port 8080.** Every data route requires `X-EventWatch-Key`.
+**Analytics, port 8080.** Every route below marked "key" accepts the `X-EventWatch-Key`
+header or a session cookie, except `/receive`, which never accepts a session — a browser has no
+business posting telemetry, and an agent has no cookie jar.
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| POST | `/receive` | Ingest one event; rate limited per client |
-| GET | `/health` | Availability and database reachability (no key) |
-| GET | `/metrics` | Prometheus text format (key only if `METRICS_REQUIRE_KEY`) |
-| GET | `/events?level=&host_id=&from=&to=&limit=&offset=` | Event history, limit ≤ 200 |
-| GET | `/summary` | Totals, active alerts, host count, five-event averages |
-| GET | `/hosts?limit=` | Fleet listing with status, version, queue depth |
-| GET | `/hosts/{host_id}` | One machine: averages, level counts, alerts, rules |
-| GET | `/alerts?status=&type=` | Active alerts |
-| GET | `/alerts/{alert_key}` | One alert |
-| POST | `/alerts/{alert_key}/acknowledge` | `OPEN` → `ACKNOWLEDGED` |
-| POST | `/alerts/{alert_key}/resolve` | → `RESOLVED` |
-| GET | `/alerts/{alert_key}/notifications?limit=` | Delivery attempts for that alert |
-| GET | `/rules` | Stored rules plus the `.env` defaults beneath them |
-| PUT | `/rules` | Create or replace one rule |
-| DELETE | `/rules?rule_type=&host_id=` | Remove an override |
-| GET | `/rules/effective?host_id=` | What applies to one machine, and from which tier |
+| Method | Path | Auth | Purpose |
+| --- | --- | --- | --- |
+| POST | `/receive` | shared key or agent token | Ingest one event; rate limited per client |
+| GET | `/health` | none | Availability and database reachability |
+| GET | `/metrics` | none, or key if `METRICS_REQUIRE_KEY` | Prometheus text format |
+| POST | `/session` | key, in the body | Exchange the key for a session cookie |
+| GET | `/session` | key or cookie | Whether a session is currently valid |
+| DELETE | `/session` | none | Revoke the presented cookie |
+| GET | `/agents` | key | Every issued credential; never the token or its hash |
+| POST | `/agents` | key | Mint one: `host_id`, optional `label`; token shown once |
+| DELETE | `/agents/{id}` | key | Revoke; the row is kept for history |
+| GET | `/events?level=&host_id=&from=&to=&limit=&offset=` | key | Event history, limit ≤ 200 |
+| GET | `/summary` | key | Totals, active alerts, host count, five-event averages |
+| GET | `/hosts?limit=` | key | Fleet listing with status, version, queue depth |
+| GET | `/hosts/{host_id}` | key | One machine: averages, level counts, alerts, rules |
+| GET | `/alerts?status=&type=` | key | Active alerts |
+| GET | `/alerts/{alert_key}` | key | One alert |
+| POST | `/alerts/{alert_key}/acknowledge` | key | `OPEN` → `ACKNOWLEDGED` |
+| POST | `/alerts/{alert_key}/resolve` | key | → `RESOLVED` |
+| GET | `/alerts/{alert_key}/notifications?limit=` | key | Delivery attempts for that alert |
+| GET | `/rules` | key | Stored rules plus the `.env` defaults beneath them |
+| PUT | `/rules` | key | Create or replace one rule |
+| DELETE | `/rules?rule_type=&host_id=` | key | Remove an override |
+| GET | `/rules/effective?host_id=` | key | What applies to one machine, and from which tier |
 
 Every endpoint answers JSON. Success uses `status: "ok"`; failures use `status: "error"` with a
 readable `message`.
@@ -270,6 +300,10 @@ Agent → analytics, `POST /receive`, `Content-Type: application/json`:
 1–128 characters and unique — a partial unique index makes retries idempotent. Usage values are
 finite numbers from 0 to 100. Identity and version fields are optional but bounded to 128 characters
 when present; `queue_depth` must be zero or more. Bodies are limited to 64 KiB.
+
+Authenticating with a per-agent token overrides `host_id` regardless of what the body claims: the
+token is the source of truth for identity, not the payload. `host_id` can be left out entirely when
+a token is in use — the identity comes from which credential was presented.
 
 ---
 
@@ -509,6 +543,18 @@ layer.
 live on another origin, put both behind one reverse proxy so they still share one — the cookie
 depends on it.
 
+**Per-agent credentials.** `POST /agents` mints a token bound to one `host_id`; the agent sends it
+as `AGENT_TOKEN` instead of the fleet-wide key. A leaked or decommissioned agent is revoked alone
+with `DELETE /agents/{id}` — nothing else needs to change. The bound host is enforced, not merely
+recorded: an event authenticated by that token always lands under its bound host, whatever `host_id`
+the payload itself claims, which is what actually stops one agent from spoofing another's identity —
+something the shared key never prevented. Multiple tokens per host are allowed on purpose, so a
+credential can be rotated by minting the replacement before revoking the original.
+
+The shared key still works everywhere it always has, gated by `SHARED_KEY_INGESTION_ENABLED`
+(default `true`). Turn it off once every agent holds its own token; `eventwatch_receive_auth_total`
+in `/metrics` shows the split between the two, which is how you know it is safe to.
+
 ---
 
 ## Watchdog
@@ -717,6 +763,8 @@ in-code fallback, so an absent key is never fatal.
 | `DASHBOARD_DIR` | `../dashboard` | Directory served at `/`; empty runs the service as an API only |
 | `SESSION_TTL_MINUTES` | `720` | How long an operator session lasts |
 | `SESSION_RATE_LIMIT_PER_MINUTE` | `10` | Sign-in attempts allowed per address |
+| `AGENT_TOKEN` | empty | This agent's own credential; falls back to the shared key |
+| `SHARED_KEY_INGESTION_ENABLED` | `true` | Whether the fleet-wide key still authenticates ingestion |
 | `METRICS_REQUIRE_KEY` | `false` | Close the analytics `/metrics` endpoint |
 | `HOST_ID` / `HOSTNAME_OVERRIDE` / `HOST_ID_FILE` | empty | Pin agent identity, rename it, or relocate its file |
 | `PENDING_EVENTS_DIR` | `pending-events` | Durable queue location |
@@ -749,12 +797,21 @@ in-code fallback, so an absent key is never fatal.
 
 ## Limitations and what is next
 
-- **One shared key for the whole fleet.** It cannot be rotated or revoked per machine, so one
-  leaked agent means rotating everywhere. Per-agent credentials are the next phase.
 - **Sessions do not survive a restart.** They are held in memory on purpose, rather than storing a
   second long-lived secret beside the telemetry; restarting the service signs operators out.
-- **One analytics instance.** Alert rules are cached per process and notification cooldowns are
-  held in memory, so a second instance would need cache invalidation and shared reservations.
+- **One analytics instance, no failover.** Alert rules are cached per process and notification
+  cooldowns are held in memory, so a second instance would need cache invalidation and shared
+  reservations — but the more basic fact is that stopping this one process is total downtime.
+- **No user identity or audit trail.** Every signed-in operator is equivalent; there is no record
+  of which person acknowledged or resolved a given alert. Fine for one or two operators, not for
+  a team that needs to know who did what.
+- **No secrets manager, no encryption at rest, no tested restore procedure.** Credentials live
+  in `.env` and on disk on each agent, and the telemetry lives in a plain database file. Protecting
+  all of it is left to the host.
+- **Revocation is immediate on the server but not announced to the agent.** A 401 is a permanent
+  rejection, not queued or retried, so a revoked agent's very next event fails outright — but
+  nothing pushes that fact to the agent process itself. It keeps trying and logging the rejection
+  until an operator notices and fixes its configuration.
 - **The watchdog still needs somewhere to point.** Phase 16 closed the silent-death gap from
   both directions, but the heartbeat has to reach an endpoint you run or subscribe to. That is
   the correct boundary — a monitor cannot be its own last line of defence — but it does mean
@@ -783,12 +840,13 @@ The project was built in phases; each is a single commit.
 | 10 | Testing and delivery | Unit, integration, failure and contract tests; Docker, Compose, CI |
 | 11 | Beyond SQLite | Pluggable storage, PostgreSQL, pooling, retention, load harness |
 | 12 | Host identity | Stable per-agent identity, per-host windows and alert keys, fleet listing |
-| 13 | Agent security | Loopback binding, mandatory auth when exposed, TLS, configurable CORS |
+| 13 | Agent security | Loopback binding, mandatory auth when exposed, TLS, CORS |
 | 14 | Per-host alert rules | Rules table, host → fleet → default precedence, rules API and editor |
 | 15 | Fleet operations | Silence detection, per-machine drill-down, agent version and queue depth |
 | 16 | Watchdog | Analytics heartbeat and agent-side delivery-stall alerts |
 | 17 | Internal structure | One class per route, one engine per instance, parallel tests |
 | 18 | Operator session | Same-origin dashboard, HttpOnly session cookie, no CORS |
+| 19 | Per-agent credentials | Mint, bind, and revoke per-machine ingestion tokens |
 
 `agent.md` is the original roadmap, kept for history. `CLAUDE.md` is the current authority on state,
 conventions, and what comes next.

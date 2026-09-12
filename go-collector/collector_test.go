@@ -62,10 +62,10 @@ func (s *backendStub) header(value atomic.Value) string {
 // withCollector points the package globals at a stub backend and a temporary queue.
 func withCollector(t *testing.T, stub *backendStub) {
 	t.Helper()
-	originalURL, originalKey, originalClient := configuredBackendURL, configuredAPIKey, backendClient
+	originalURL, originalKey, originalClient := configuredBackendURL, configuredIngestionCredential, backendClient
 	originalDirectory, originalCapacity, originalMetrics := queueDirectory, queueCapacity, metrics
 	t.Cleanup(func() {
-		configuredBackendURL, configuredAPIKey, backendClient = originalURL, originalKey, originalClient
+		configuredBackendURL, configuredIngestionCredential, backendClient = originalURL, originalKey, originalClient
 		queueDirectory, queueCapacity, metrics = originalDirectory, originalCapacity, originalMetrics
 	})
 
@@ -75,7 +75,7 @@ func withCollector(t *testing.T, stub *backendStub) {
 		// A closed listener address so every attempt fails at the transport layer.
 		configuredBackendURL = "http://127.0.0.1:1/receive"
 	}
-	configuredAPIKey = "test-secret"
+	configuredIngestionCredential = "test-secret"
 	backendClient = &http.Client{Timeout: 2 * time.Second}
 	queueDirectory = t.TempDir()
 	queueCapacity = 100
