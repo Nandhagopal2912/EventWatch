@@ -34,7 +34,7 @@ class AnalyticsEngineIntegrationTest {
     private final HttpClient client = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(5))
             .build();
-    private HttpServer server;
+    private AnalyticsEngine engine;
     private String databaseUrl;
     private int port;
 
@@ -46,16 +46,16 @@ class AnalyticsEngineIntegrationTest {
 
     @AfterEach
     void stopEngine() {
-        if (server != null) {
-            AnalyticsEngine.stop(server);
-            server = null;
+        if (engine != null) {
+            engine.stop();
+            engine = null;
         }
     }
 
     private void restart(EngineConfiguration configuration) throws IOException {
         stopEngine();
-        server = AnalyticsEngine.start(configuration);
-        port = server.getAddress().getPort();
+        engine = AnalyticsEngine.start(configuration);
+        port = engine.port();
     }
 
     private EngineConfiguration configurationWithThresholds(double cpu, double ram, int repeatedErrors) {

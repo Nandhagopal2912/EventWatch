@@ -42,7 +42,7 @@ class RetentionServiceTest {
     }
 
     private void storeEvent(String eventId, Instant timestamp) throws SQLException {
-        events.insertIfAbsent(new AnalyticsEngine.LogEntry(eventId, "INFO", "m", timestamp, 1, 1));
+        events.insertIfAbsent(new LogEntry(eventId, "INFO", "m", timestamp, 1, 1));
     }
 
     @Test

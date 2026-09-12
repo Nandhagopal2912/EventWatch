@@ -23,7 +23,7 @@ public class EventRepository {
      * Commits one event and reports whether it was new. The unique event_id index makes a
      * repeated delivery a no-op instead of a duplicate row.
      */
-    public synchronized boolean insertIfAbsent(AnalyticsEngine.LogEntry event) throws SQLException {
+    public synchronized boolean insertIfAbsent(LogEntry event) throws SQLException {
         String query = dialect.insertEventIgnoringDuplicates();
         try (Connection connection = connections.getConnection();
                 PreparedStatement statement = connection.prepareStatement(query)) {
@@ -48,12 +48,12 @@ public class EventRepository {
         }
     }
 
-    public List<AnalyticsEngine.LogEntry> find(String level, Instant from, Instant to,
+    public List<LogEntry> find(String level, Instant from, Instant to,
             int limit, int offset) throws SQLException {
         return find(level, null, from, to, limit, offset);
     }
 
-    public List<AnalyticsEngine.LogEntry> find(String level, String hostId, Instant from, Instant to,
+    public List<LogEntry> find(String level, String hostId, Instant from, Instant to,
             int limit, int offset) throws SQLException {
         StringBuilder query = new StringBuilder(
                 "SELECT event_id, level, message, event_timestamp, host_id, hostname, agent_version, queue_depth, cpu_usage, ram_usage "
@@ -77,7 +77,7 @@ public class EventRepository {
         }
         query.append(" ORDER BY event_timestamp DESC LIMIT ? OFFSET ?");
 
-        List<AnalyticsEngine.LogEntry> events = new ArrayList<>();
+        List<LogEntry> events = new ArrayList<>();
         try (Connection connection = connections.getConnection();
                 PreparedStatement statement = connection.prepareStatement(query.toString())) {
             int index = 1;
@@ -221,7 +221,7 @@ public class EventRepository {
             Instant lastSeen, String agentVersion, Integer queueDepth) {
     }
 
-    public AnalyticsEngine.LogEntry latest() throws SQLException {
+    public LogEntry latest() throws SQLException {
         String query = "SELECT event_id, level, message, event_timestamp, host_id, hostname, agent_version, queue_depth, cpu_usage, ram_usage "
                 + "FROM telemetry_events ORDER BY event_timestamp DESC LIMIT 1";
         try (Connection connection = connections.getConnection();
@@ -231,12 +231,12 @@ public class EventRepository {
         }
     }
 
-    public List<AnalyticsEngine.LogEntry> recent(int limit) throws SQLException {
+    public List<LogEntry> recent(int limit) throws SQLException {
         return find(null, null, null, limit, 0);
     }
 
-    private AnalyticsEngine.LogEntry toLogEntry(ResultSet results) throws SQLException {
-        return new AnalyticsEngine.LogEntry(
+    private LogEntry toLogEntry(ResultSet results) throws SQLException {
+        return new LogEntry(
                 results.getString("event_id"),
                 results.getString("level"),
                 results.getString("message"),

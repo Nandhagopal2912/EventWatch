@@ -13,7 +13,7 @@ public class SqliteDialect implements SqlDialect {
     }
 
     @Override
-    public List<String> schemaStatements() {
+    public List<String> tableStatements() {
         return List.of("""
                 CREATE TABLE IF NOT EXISTS telemetry_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -30,12 +30,6 @@ public class SqliteDialect implements SqlDialect {
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
                 """,
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_telemetry_events_event_id "
-                        + "ON telemetry_events(event_id) WHERE event_id IS NOT NULL",
-                "CREATE INDEX IF NOT EXISTS idx_telemetry_events_level "
-                        + "ON telemetry_events(level, event_timestamp)",
-                "CREATE INDEX IF NOT EXISTS idx_telemetry_events_host "
-                        + "ON telemetry_events(host_id, event_timestamp)",
                 """
                 CREATE TABLE IF NOT EXISTS alerts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,8 +55,6 @@ public class SqliteDialect implements SqlDialect {
                     attempted_at TEXT NOT NULL
                 )
                 """,
-                "CREATE INDEX IF NOT EXISTS idx_notification_deliveries_alert "
-                        + "ON notification_deliveries(alert_key, id DESC)",
                 """
                 CREATE TABLE IF NOT EXISTS alert_rules (
                     rule_type TEXT NOT NULL,
@@ -73,6 +65,18 @@ public class SqliteDialect implements SqlDialect {
                     PRIMARY KEY (rule_type, scope)
                 )
                 """);
+    }
+
+    @Override
+    public List<String> indexStatements() {
+        return List.of("CREATE UNIQUE INDEX IF NOT EXISTS idx_telemetry_events_event_id "
+                        + "ON telemetry_events(event_id) WHERE event_id IS NOT NULL",
+                "CREATE INDEX IF NOT EXISTS idx_telemetry_events_level "
+                        + "ON telemetry_events(level, event_timestamp)",
+                "CREATE INDEX IF NOT EXISTS idx_telemetry_events_host "
+                        + "ON telemetry_events(host_id, event_timestamp)",
+                "CREATE INDEX IF NOT EXISTS idx_notification_deliveries_alert "
+                        + "ON notification_deliveries(alert_key, id DESC)");
     }
 
     @Override

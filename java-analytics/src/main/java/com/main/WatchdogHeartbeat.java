@@ -85,7 +85,7 @@ public class WatchdogHeartbeat {
         payload.put("service", "java-analytics");
         payload.put("timestamp", Instant.now().toString());
         try {
-            payload.put("hosts", events.hosts(AnalyticsEngine.MAX_HOSTS_LISTED).size());
+            payload.put("hosts", events.hosts(QueryService.MAX_HOSTS_LISTED).size());
             payload.put("active_alerts", alerts.findActive().size());
         } catch (Exception exception) {
             // The ping matters more than its contents; a counting failure must not stop it.

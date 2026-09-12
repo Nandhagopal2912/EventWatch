@@ -28,12 +28,12 @@ public class AlertEngine {
      * are scoped to the host, so a fleet sharing one analytics service raises one alert per
      * machine instead of fighting over a single row.
      */
-    public void evaluate(List<AnalyticsEngine.LogEntry> events) throws SQLException {
+    public void evaluate(List<LogEntry> events) throws SQLException {
         if (events.isEmpty()) {
             return;
         }
         int start = Math.max(0, events.size() - movingWindowSize);
-        List<AnalyticsEngine.LogEntry> recentEvents = events.subList(start, events.size());
+        List<LogEntry> recentEvents = events.subList(start, events.size());
         Instant now = recentEvents.get(recentEvents.size() - 1).timestamp;
         String hostId = recentEvents.get(recentEvents.size() - 1).hostId;
 
@@ -59,7 +59,7 @@ public class AlertEngine {
             return;
         }
         Map<String, Integer> errorCounts = new HashMap<>();
-        for (AnalyticsEngine.LogEntry event : recentEvents) {
+        for (LogEntry event : recentEvents) {
             if ("ERROR".equalsIgnoreCase(event.level) || "CRITICAL".equalsIgnoreCase(event.level)) {
                 errorCounts.merge(event.message, 1, Integer::sum);
             }
@@ -86,7 +86,7 @@ public class AlertEngine {
 
     /** Alert keys appear in URLs, so the host is appended rather than embedded with a separator. */
     static String alertKey(String rule, String hostId) {
-        return rule + "@" + (hostId == null || hostId.isBlank() ? AnalyticsEngine.UNKNOWN_HOST : hostId);
+        return rule + "@" + (hostId == null || hostId.isBlank() ? LogEntry.UNKNOWN_HOST : hostId);
     }
 
     // Delivery is the notification service's concern; the rules only report what changed.

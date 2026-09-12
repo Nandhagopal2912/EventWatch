@@ -92,7 +92,22 @@ go-collector/watchdog_test.go   Stall detection, recovery, payload, metrics
 go-collector/Dockerfile         Static binary on alpine, queue on a volume
 
 java-analytics/src/main/java/com/main/
-  AnalyticsEngine.java          main(), HTTP routing, auth, validation, rate limit, SQLite bootstrap
+  AnalyticsEngine.java          One running engine: start/stop, route registration, timers
+  EngineContext.java            Everything one engine owns, built once and passed to handlers
+  ApiHandler.java               Preflight, method, key, and the 400/503 every route shares
+  ReceiveHandler.java           Ingestion; the only route that writes telemetry
+  HealthHandler.java            /health      MetricsHandler.java  /metrics
+  EventsHandler.java            /events      SummaryHandler.java  /summary
+  HostsHandler.java             /hosts and the per-machine drill-down
+  AlertsHandler.java            /alerts      AlertDetailHandler.java  one alert and its actions
+  RulesHandler.java             /rules and /rules/effective
+  HttpSupport.java              Auth, CORS policy, response envelope, correlation id
+  RequestParameters.java        Query-string parsing, shared by every read route
+  EventValidation.java          The ingestion contract in one place
+  LogEntry.java                 One telemetry event, as the repositories and rules see it
+  RecentEvents.java             Per-host in-memory window and the stored-event total
+  RateLimiter.java              One-minute window per client address, swept on the timer
+  TelemetryReport.java          The running summary, as ASCII or as one log line
   EventRepository.java          Telemetry queries (find/count/latest/recent)
   AlertRepository.java          Alert upsert + lifecycle transitions
   AlertEngine.java              Moving-window CPU/RAM/repeated-error rules
@@ -106,6 +121,7 @@ java-analytics/src/main/java/com/main/
   Metrics.java                  Prometheus counters, gauges, and text rendering
   EngineConfiguration.java      Every runtime setting; fromDotenv() and forTesting()
   Database.java                 Picks the backend from the JDBC url, pools, creates the schema
+                                (tables, then legacy migrations, then indexes - see B16)
   ConnectionProvider.java       Where repositories get connections from
   SqlDialect.java               The few places SQLite and PostgreSQL disagree
   SqliteDialect.java / PostgresDialect.java
@@ -134,6 +150,7 @@ java-analytics/src/test/java/com/main/
   AlertRulesPostgresTest.java   Rule storage on a real PostgreSQL; skipped without one
   AgentSilenceMonitorTest.java  Silence thresholds, the forget window, the gauge
   FleetApiTest.java             Fleet listing, drill-down, silence raised and resolved
+  MultipleEnginesTest.java      Two engines in one JVM: separate keys, metrics, windows
   WatchdogHeartbeatTest.java    Heartbeat payload, failures, and the deliberate silence
 java-analytics/Dockerfile       Shaded jar on a JRE, database on a volume
 
@@ -215,6 +232,10 @@ Changes to this schema must stay backward compatible — additive fields only, n
   package-private helpers; use `@TempDir` with `TestSupport.databaseUrl` rather than a shared file.
   Go tests use `withCollector` to swap the package globals and restore them on cleanup. A change to
   the Go/Java JSON contract must update `testdata/event-contract.json`, which both suites assert on.
+- **Test classes run in parallel** (`src/test/resources/junit-platform.properties`); methods inside
+  one class stay sequential. A class that touches process-wide state must say so with
+  `@ResourceLock` - `Resources.GLOBAL` for `System.out` or the logger, a named lock for a shared
+  external server. Anything else must isolate itself with `@TempDir` and port 0.
 - **Configuration over constants:** ports, database path, and the shutdown grace are all in
   `EngineConfiguration`. Anything a container or a test needs to vary belongs there, not in a
   `static final`.
@@ -229,25 +250,25 @@ Changes to this schema must stay backward compatible — additive fields only, n
 
 ## 5. Current state — read before starting work
 
-**Phases 1–16 are complete.** Everything is green:
+**Phases 1–17 are complete.** Everything is green:
 
-- `cd java-analytics && mvn verify` → 186 tests, BUILD SUCCESS (12 of them need
-  `EVENTWATCH_TEST_POSTGRES_URL`; CI supplies a server, locally they skip)
+- `cd java-analytics && mvn verify` → 191 tests, BUILD SUCCESS (12 of them need
+  `EVENTWATCH_TEST_POSTGRES_URL`; CI supplies a server, locally they skip). Verified against a real
+  PostgreSQL 16 container with all 191 running.
 - `cd go-collector && go vet ./... && go test ./...` → 53 tests, pass
 - `cd loadtest && go vet ./... && go test ./...` → 4 tests, pass
 - `docker compose up --build` → all services healthy
 
 The phase roadmap (1–15) delivered the system; 16 onward is hardening for real use, planned in
-section 16. Phase 16 closed the silent-death gap from both directions: analytics sends a heartbeat
-while healthy, and the agent reports when nothing has reached analytics. Verified live — the
-heartbeat stopped when analytics was killed, the agent alerted with `stalled_seconds: 62` and
-`queue_depth: 1`, and a `delivery_recovered` alert followed once the queue drained.
+section 17. Phase 17 rewrote the internals with no change to the HTTP surface: the routes are nine
+handler classes over an `EngineContext`, and `AnalyticsEngine` is an instance rather than a page of
+static fields, so several engines can run in one JVM. Test classes now run in parallel.
 
-**Next is Phase 17, the internal structure refactor.** It comes before the two auth phases on
-purpose: both add routes and state, and `AnalyticsEngine` is already a thousand lines of inline
-lambdas over static fields.
+**Next is Phase 18, the operator session.** Serving the dashboard from the analytics service makes
+it same-origin, which lets the API key move into an HttpOnly cookie and deletes the CORS
+configuration and the separate static container along with it.
 
-B1–B15 in section 15 are all fixed.
+B1–B17 in section 16 are all fixed.
 
 ## 6. Phase 8 as built — notifications
 
@@ -362,7 +383,7 @@ filters meaning exactly the same thing everywhere.
 sweeps rate windows. The cutoff is exclusive, delivery history is pruned alongside the events that
 produced it, and a failed sweep is logged rather than thrown so the timer thread survives.
 
-**What is deliberately NOT done, and when to revisit** — see section 16. Short version: the file
+**What is deliberately NOT done, and when to revisit** — see section 17. Short version: the file
 queue and the two-service shape are both still comfortably inside what the measurements justify.
 
 ## 10. Phase 12 as built — host identity
@@ -437,7 +458,7 @@ logs a startup warning.
 
 **Rules are read on every event, so they are cached** in `AlertRules` and replaced wholesale on
 each write. That is correct for one analytics instance; a second instance would need a refresh
-interval or change notification — the same limitation as notification reminders in section 15.
+interval or change notification — the same limitation as notification reminders in section 16.
 
 **A wiring bug the tests caught before commit:** the CORS preflight still advertised
 `GET, POST, OPTIONS`, because the edit replaced the first of two identical strings — in the
@@ -503,7 +524,45 @@ outage. The three outcomes the watchdog reads are `delivered`, `queued`, and `fa
 **The signal is read where it is already classified.** `recordForward` knows the outcome, so the
 watchdog hooks in there rather than at six call sites that could drift apart.
 
-## 15. Fixed defects and remaining quality work
+## 15. Phase 17 as built — internal structure
+
+No user-visible change. `AnalyticsEngine` went from 1097 lines to 213, and `start()` from 615 to 56.
+
+**The static fields were the real problem, not the length.** Twenty mutable statics meant one engine
+per JVM, and the `synchronized` window methods locked the *class* object — a process-wide lock
+guarding one engine's five-event window. `EngineContext` holds that state now, and `AnalyticsEngine`
+is an instance: `start()` returns the engine and `engine.stop()` replaces `stop(server)`. Passing
+the server back in to stop it was the old API admitting its state lived elsewhere.
+
+**`ApiHandler` holds what every route repeated.** The preflight, the method check with its `Allow`
+header, the API key, and the two failures every route turns into the same status — a bad parameter
+into 400, unreachable storage into 503. Each handler now contains only what its route does. The
+per-route differences that had to survive are constructor arguments: the allowed methods, the 503
+message, and whether the failure counts as a database failure (only `/rules` did).
+
+**`/alerts/` no longer carries its own copy of the CORS policy.** That duplicate string is exactly
+how the phase 14 preflight bug happened; there is now one `ALLOWED_METHODS` in `HttpSupport`.
+
+**The one deliberate behaviour change is an added `Allow` header.** Only `/receive` and `/rules`
+sent one on a 405 before; the shared base sends it everywhere, which is what RFC 7231 asks for.
+Nothing else about the HTTP surface moved, and that was the acceptance criterion for the phase.
+
+**`MultipleEnginesTest` is the proof.** Two engines, two databases, one JVM. Every assertion in it
+fails against the old shape — most sharply the one about keys, because `start()` assigned a static
+`apiKey`, so starting a second engine would have stopped the first from accepting its own agents.
+
+**Test classes run in parallel now: 30s → 20s.** Three classes opt out through `@ResourceLock`,
+because they touch state the refactor does not make per-instance: `ObservabilityTest` replaces
+`System.out` and reconfigures the process-wide logger, and the two PostgreSQL suites drop tables on
+one real server. Worth knowing: under parallel classes Surefire files some results in the wrong
+per-class XML, though every `<testcase>` still carries its own correct `classname`. Fork-level
+parallelism keeps the grouping exact but only reached 25s, so it was not worth the memory.
+
+**What stays static, and why.** `StructuredLogger` and the log format are properties of the process
+rather than of one engine, so they stay global — and that is precisely why `ObservabilityTest` needs
+its lock.
+
+## 16. Fixed defects and remaining quality work
 
 ### Fixed (keep these fixed — each has a way to regress)
 
@@ -576,12 +635,27 @@ connection unreusable, so the harness timed TCP handshakes; and `percentile` tru
 using nearest rank, biasing p95/p99 downward. Both fixed. (The published Phase 11 numbers are
 unaffected: at 3000 samples both percentile formulas select the same index.)
 
+**B16 — upgrading from an older database crashed at startup.** `initializeSchema` ran every
+statement in `schemaStatements()` and *then* the guarded `ALTER TABLE` migrations — but that list
+included `CREATE INDEX ... ON telemetry_events(host_id, event_timestamp)`, a column an old database
+only gains during the migration. Starting against a real pre-phase-12 file died with
+`no such column: host_id`; against a pre-phase-5 one, `no such column: event_id`. Every test used a
+fresh database, where those columns are part of `CREATE TABLE`, so the ordering never showed. The
+dialects now expose `tableStatements()` and `indexStatements()` separately and the migrations run
+between them. Found by starting the service against the actual local `events.db`, which is the only
+reason it surfaced at all; `EngineLifecycleTest.aDatabaseFromAnOlderBuildIsUpgradedOnStartup` builds
+that old schema and was checked to fail against the previous ordering.
+
+**B17 — the collector container could never become healthy.** Both Dockerfiles probed with
+`wget --quiet --spider`, which sends a HEAD request, and `/health` answers HEAD with 405. The
+analytics image hid it: GNU wget retries with GET after that, so its check passed. The collector is
+on alpine, whose busybox wget does not retry, so the container sat `unhealthy` forever — enough to
+break `depends_on: service_healthy` or make an orchestrator restart it in a loop. Both checks now
+issue a plain GET (`--output-document=/dev/null`), which behaves the same under either wget. Found
+by reading `docker compose ps` rather than trusting that the stack was up.
+
 ### Remaining quality work
 
-- **Routing and static state.** `start()` is still a long run of inline lambdas, and the engine's
-  collaborators live in static fields, so only one instance can run per JVM. Extracting handlers
-  into their own classes with an injected context would fix both and let the integration tests run
-  in parallel.
 - **Timestamps.** Go now sends UTC `Z` values so lexical order matches chronological order, but rows
   written by older builds may carry a local offset. A one-off normalization pass would make range
   filters exact for that history.
@@ -589,7 +663,7 @@ unaffected: at 3000 samples both percentile formulas select the same index.)
   in memory alongside the SQL `lastDeliveredAt` lookup; a restart falls back to the SQL value, which
   is correct but means an in-flight reservation is lost. Fine for one instance, wrong for two.
 
-## 16. Roadmap and deferred work
+## 17. Roadmap and deferred work
 
 **The phase roadmap (1–15) is complete.** What follows is hardening for real use rather than new
 capability. Phases 16–20 are planned, one commit each, in this order.
@@ -610,7 +684,7 @@ independent halves, neither needing another service:
 Goes first because it is the only item where the current state can fail silently, and because it
 barely touches the routing the next phase rewrites.
 
-**Phase 17 — Internal structure.** No user-visible change; enabling work. Extract the route handlers
+**Phase 17 — Internal structure.** Done (see section 15). No user-visible change; enabling work. Extract the route handlers
 out of `start()` into classes with an injected context and drop the static collaborator fields.
 Unlocks parallel test execution and stops phases 18 and 19 from adding several hundred lines to a
 class that is already a thousand. Doing it before those two, rather than after, is the whole point.
@@ -670,7 +744,7 @@ than changing databases.
 
 ---
 
-## 17. Definition of done for a release
+## 18. Definition of done for a release
 
 - Events are authenticated, validated, persisted transactionally, deduplicated, and queryable.
 - A temporary Java outage loses nothing and duplicates nothing.

@@ -6,8 +6,11 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import com.sun.net.httpserver.HttpServer;
 import java.io.IOException;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.Statement;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
@@ -24,13 +27,13 @@ class EngineLifecycleTest {
     @TempDir
     Path temporaryDirectory;
 
-    private HttpServer server;
+    private AnalyticsEngine engine;
 
     @AfterEach
     void stopEngine() {
-        if (server != null) {
-            AnalyticsEngine.stop(server);
-            server = null;
+        if (engine != null) {
+            engine.stop();
+            engine = null;
         }
     }
 
@@ -49,12 +52,15 @@ class EngineLifecycleTest {
 
     @Test
     void stopReleasesTheConnectionPool() throws IOException {
-        server = AnalyticsEngine.start(configuration("stop.db", 0, 100));
-        assertNotNull(AnalyticsEngine.database(), "a started engine holds a database");
+        AnalyticsEngine started = AnalyticsEngine.start(configuration("stop.db", 0, 100));
+        engine = started;
+        Database pool = started.database();
+        assertNotNull(pool, "a started engine holds a database");
 
-        AnalyticsEngine.stop(server);
-        server = null;
-        assertNull(AnalyticsEngine.database(), "stop must release the pool, not leak it");
+        started.stop();
+        engine = null;
+        assertNull(started.database(), "stop must release the pool, not leak it");
+        assertTrue(pool.isClosed(), "stop must close the pool it opened");
     }
 
     @Test
@@ -64,9 +70,10 @@ class EngineLifecycleTest {
                 85.0, 80.0, 5, false, "", 1, 1, 1, 0, 0, "", "", 4, 0, 60, 100,
                 false, "", "", "PKCS12", List.of("http://localhost:3000"), false, 10, 168, 60, "", 60, 5);
 
+        Database.forgetLastOpened();
         IOException failure = assertThrows(IOException.class, () -> AnalyticsEngine.start(withoutKey));
         assertTrue(failure.getMessage().contains("EVENTWATCH_API_KEY"), failure.getMessage());
-        assertNull(AnalyticsEngine.database(), "a rejected configuration must not leave a pool open");
+        assertNull(Database.lastOpened(), "the key is checked before a pool is ever opened");
     }
 
     @Test
@@ -76,8 +83,76 @@ class EngineLifecycleTest {
                 85.0, 80.0, 5, false, "", 1, 1, 1, 0, 0, "", "", 4, 0, 60, 100,
                 false, "", "", "PKCS12", List.of("http://localhost:3000"), false, 10, 168, 60, "", 60, 5);
 
+        Database.forgetLastOpened();
         assertThrows(IOException.class, () -> AnalyticsEngine.start(unusable));
-        assertNull(AnalyticsEngine.database(), "a failed start must not leave a pool open");
+        assertNull(Database.lastOpened(), "an unsupported url is refused before a pool is opened");
+    }
+
+    @Test
+    void aDatabaseFromAnOlderBuildIsUpgradedOnStartup() throws Exception {
+        // Regression for B16: the host index was created before the migration that adds the
+        // host_id column, so starting against a database written by a pre-phase-12 build died
+        // with "no such column: host_id". Every test before this one used a fresh database,
+        // where the column is part of CREATE TABLE and the ordering never showed.
+        String databaseUrl = TestSupport.databaseUrl(temporaryDirectory, "legacy.db");
+        try (Connection connection = DriverManager.getConnection(databaseUrl);
+                Statement statement = connection.createStatement()) {
+            statement.executeUpdate("""
+                    CREATE TABLE telemetry_events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        level TEXT NOT NULL,
+                        message TEXT NOT NULL,
+                        event_timestamp TEXT NOT NULL,
+                        cpu_usage REAL NOT NULL,
+                        ram_usage REAL NOT NULL,
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """);
+            statement.executeUpdate("""
+                    CREATE TABLE alerts (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        alert_key TEXT NOT NULL UNIQUE,
+                        alert_type TEXT NOT NULL,
+                        message TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        first_seen TEXT NOT NULL,
+                        last_seen TEXT NOT NULL,
+                        occurrence_count INTEGER NOT NULL DEFAULT 1
+                    )
+                    """);
+            statement.executeUpdate("INSERT INTO telemetry_events "
+                    + "(level, message, event_timestamp, cpu_usage, ram_usage) "
+                    + "VALUES ('ERROR', 'written by an older build', '2026-01-01T00:00:00Z', 10.0, 20.0)");
+        }
+
+        engine = AnalyticsEngine.start(new EngineConfiguration(0, databaseUrl, API_KEY, "text",
+                85.0, 80.0, 5, false, "", 1, 1, 1, 0, 0, "", "", 4, 0, 60, 100,
+                false, "", "", "PKCS12", List.of("http://localhost:3000"), false, 10, 168, 60, "", 60, 5));
+
+        try (Connection connection = DriverManager.getConnection(databaseUrl);
+                Statement statement = connection.createStatement();
+                ResultSet results = statement.executeQuery(
+                        "SELECT host_id, agent_version, queue_depth FROM telemetry_events")) {
+            assertTrue(results.next(), "the row written by the older build must survive");
+            assertNull(results.getString("host_id"), "an old row has no identity, and that is allowed");
+        }
+    }
+
+    @Test
+    void aFailureAfterTheDatabaseIsOpenStillReleasesThePool() {
+        // Regression for B12: the pool is allocated before the listener exists, so every failure
+        // from there on has to release it. A missing keystore is the cheapest way to get there.
+        EngineConfiguration missingKeystore = new EngineConfiguration(0,
+                TestSupport.databaseUrl(temporaryDirectory, "keystore.db"), API_KEY, "text",
+                85.0, 80.0, 5, false, "", 1, 1, 1, 0, 0, "", "", 4, 0, 60, 100,
+                true, temporaryDirectory.resolve("absent.p12").toString(), "changeit", "PKCS12",
+                List.of("http://localhost:3000"), false, 10, 168, 60, "", 60, 5);
+
+        Database.forgetLastOpened();
+        assertThrows(IOException.class, () -> AnalyticsEngine.start(missingKeystore));
+        Database opened = Database.lastOpened();
+        assertNotNull(opened, "this failure happens after the pool is opened");
+        assertTrue(opened.isClosed(), "a failed start must not leave a pool open");
     }
 
     @Test
@@ -93,8 +168,8 @@ class EngineLifecycleTest {
         assertEquals(10, zeroSweep.databasePoolSize(), "a non-positive pool size falls back");
         assertEquals(100, zeroSweep.rateLimitPerMinute(), "a non-positive rate limit falls back");
 
-        server = AnalyticsEngine.start(zeroSweep);
-        assertNotNull(server, "the engine must still start with retention enabled");
+        engine = AnalyticsEngine.start(zeroSweep);
+        assertNotNull(engine, "the engine must still start with retention enabled");
     }
 
     @Test
@@ -103,29 +178,30 @@ class EngineLifecycleTest {
         // executor, so work still running lost its database mid-flight. Driving this through
         // HTTP is unreliable - server.stop() either waits for the exchanges itself or tears
         // their connections down - so the ordering is asserted on the executor directly.
-        server = AnalyticsEngine.start(configuration("drain.db", 1, 100_000));
+        AnalyticsEngine started = AnalyticsEngine.start(configuration("drain.db", 1, 100_000));
+        engine = started;
 
         AtomicBoolean databaseWasStillOpen = new AtomicBoolean();
         CountDownLatch taskStarted = new CountDownLatch(1);
         CountDownLatch taskFinished = new CountDownLatch(1);
-        AnalyticsEngine.requestExecutor().execute(() -> {
+        started.requestExecutor().execute(() -> {
             taskStarted.countDown();
             try {
                 Thread.sleep(1500);
             } catch (InterruptedException exception) {
                 Thread.currentThread().interrupt();
             }
-            databaseWasStillOpen.set(AnalyticsEngine.database() != null);
+            databaseWasStillOpen.set(started.database() != null);
             taskFinished.countDown();
         });
 
         assertTrue(taskStarted.await(5, TimeUnit.SECONDS), "the task should reach the executor");
-        AnalyticsEngine.stop(server);
-        server = null;
+        started.stop();
+        engine = null;
 
         assertTrue(taskFinished.await(5, TimeUnit.SECONDS), "stop must wait for in-flight work");
         assertTrue(databaseWasStillOpen.get(),
                 "work in flight lost its database because the pool was closed before the drain");
-        assertNull(AnalyticsEngine.database(), "once drained, the pool is released");
+        assertNull(started.database(), "once drained, the pool is released");
     }
 }

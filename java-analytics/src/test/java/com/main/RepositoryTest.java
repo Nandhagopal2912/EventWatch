@@ -36,14 +36,14 @@ class RepositoryTest {
         database.close();
     }
 
-    private AnalyticsEngine.LogEntry entry(String eventId, String level, String message,
+    private LogEntry entry(String eventId, String level, String message,
             String timestamp, double cpu, double ram) {
-        return new AnalyticsEngine.LogEntry(eventId, level, message, Instant.parse(timestamp), cpu, ram);
+        return new LogEntry(eventId, level, message, Instant.parse(timestamp), cpu, ram);
     }
 
-    private AnalyticsEngine.LogEntry entry(String eventId, String hostId, String level,
+    private LogEntry entry(String eventId, String hostId, String level,
             String message, String timestamp) {
-        return new AnalyticsEngine.LogEntry(eventId, level, message, Instant.parse(timestamp),
+        return new LogEntry(eventId, level, message, Instant.parse(timestamp),
                 hostId, hostId + ".local", 10.0, 20.0);
     }
 
@@ -57,7 +57,7 @@ class RepositoryTest {
     @Test
     void storesAnEventAndReadsItBack() throws SQLException {
         assertTrue(events.insertIfAbsent(entry("e1", "ERROR", "disk full", "2026-09-11T10:00:00Z", 55.5, 44.4)));
-        List<AnalyticsEngine.LogEntry> stored = events.recent(10);
+        List<LogEntry> stored = events.recent(10);
         assertEquals(1, stored.size());
         assertEquals("e1", stored.get(0).eventId);
         assertEquals("ERROR", stored.get(0).level);
@@ -87,7 +87,7 @@ class RepositoryTest {
         assertEquals(1, events.count("ERROR", Instant.parse("2026-09-11T10:30:00Z"), null));
         assertEquals(1, events.count(null, null, Instant.parse("2026-09-11T09:30:00Z")));
 
-        List<AnalyticsEngine.LogEntry> errors = events.find("ERROR", null, null, 10, 0);
+        List<LogEntry> errors = events.find("ERROR", null, null, 10, 0);
         assertEquals(2, errors.size());
         assertEquals("three", errors.get(0).message, "newest first");
     }
@@ -120,7 +120,7 @@ class RepositoryTest {
     @Test
     void hostIdentityRoundTrips() throws SQLException {
         events.insertIfAbsent(entry("h1", "web-01", "INFO", "m", "2026-09-11T10:00:00Z"));
-        AnalyticsEngine.LogEntry stored = events.recent(1).get(0);
+        LogEntry stored = events.recent(1).get(0);
         assertEquals("web-01", stored.hostId);
         assertEquals("web-01.local", stored.hostname);
     }
@@ -128,7 +128,7 @@ class RepositoryTest {
     @Test
     void anEventStoredWithoutIdentityReadsBackAsUnknown() throws SQLException {
         events.insertIfAbsent(entry("legacy", "INFO", "m", "2026-09-11T10:00:00Z", 5, 5));
-        assertEquals(AnalyticsEngine.UNKNOWN_HOST, events.recent(1).get(0).hostId);
+        assertEquals(LogEntry.UNKNOWN_HOST, events.recent(1).get(0).hostId);
     }
 
     @Test

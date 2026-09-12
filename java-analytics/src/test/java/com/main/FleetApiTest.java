@@ -28,22 +28,22 @@ class FleetApiTest {
     Path temporaryDirectory;
 
     private final HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
-    private HttpServer server;
+    private AnalyticsEngine engine;
     private int port;
     private int sequence;
 
     @BeforeEach
     void startEngine() throws IOException {
-        server = AnalyticsEngine.start(EngineConfiguration.forTesting(
+        engine = AnalyticsEngine.start(EngineConfiguration.forTesting(
                 TestSupport.databaseUrl(temporaryDirectory, "fleet.db"), API_KEY));
-        port = server.getAddress().getPort();
+        port = engine.port();
     }
 
     @AfterEach
     void stopEngine() {
-        if (server != null) {
-            AnalyticsEngine.stop(server);
-            server = null;
+        if (engine != null) {
+            engine.stop();
+            engine = null;
         }
     }
 
@@ -160,7 +160,7 @@ class FleetApiTest {
         report("db-01", "INFO", 10, 30);
         report("web-01", "INFO", 10, 0);
 
-        assertEquals(1, AnalyticsEngine.agentSilenceMonitor().check(Instant.now()));
+        assertEquals(1, engine.agentSilenceMonitor().check(Instant.now()));
 
         JsonNode alert = get("/alerts/agent-silent@db-01");
         assertEquals(AlertRules.AGENT_SILENT, alert.path("alert_type").asText());
@@ -174,7 +174,7 @@ class FleetApiTest {
     @Test
     void aMachineThatReportsAgainResolvesItsSilenceAlert() throws Exception {
         report("db-01", "INFO", 10, 30);
-        AnalyticsEngine.agentSilenceMonitor().check(Instant.now());
+        engine.agentSilenceMonitor().check(Instant.now());
         assertEquals("OPEN", get("/alerts/agent-silent@db-01").path("status").asText());
 
         report("db-01", "INFO", 10, 0);
@@ -192,7 +192,7 @@ class FleetApiTest {
         report("laptop-01", "INFO", 10, 60);
         report("db-01", "INFO", 10, 60);
 
-        assertEquals(1, AnalyticsEngine.agentSilenceMonitor().check(Instant.now()));
+        assertEquals(1, engine.agentSilenceMonitor().check(Instant.now()));
         assertEquals(404, send("GET", "/alerts/agent-silent@laptop-01", null, true).statusCode());
         assertEquals(200, send("GET", "/alerts/agent-silent@db-01", null, true).statusCode());
     }

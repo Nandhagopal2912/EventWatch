@@ -28,7 +28,7 @@ class RulesApiTest {
     Path temporaryDirectory;
 
     private final HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
-    private HttpServer server;
+    private AnalyticsEngine engine;
     private String databaseUrl;
     private int port;
     private int sequence;
@@ -41,17 +41,17 @@ class RulesApiTest {
 
     @AfterEach
     void stopEngine() {
-        if (server != null) {
-            AnalyticsEngine.stop(server);
-            server = null;
+        if (engine != null) {
+            engine.stop();
+            engine = null;
         }
     }
 
     private void restart() throws IOException {
         stopEngine();
         // Defaults: CPU 85, RAM 80, repeated errors 5.
-        server = AnalyticsEngine.start(EngineConfiguration.forTesting(databaseUrl, API_KEY));
-        port = server.getAddress().getPort();
+        engine = AnalyticsEngine.start(EngineConfiguration.forTesting(databaseUrl, API_KEY));
+        port = engine.port();
     }
 
     private HttpResponse<String> send(String method, String path, String body, String contentType,

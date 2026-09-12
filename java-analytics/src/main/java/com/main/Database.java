@@ -6,12 +6,19 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.Locale;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Chooses the storage backend from the JDBC URL and creates its schema. SQLite stays the
  * default so a checkout still runs with no external services.
  */
 public final class Database implements AutoCloseable {
+    // start() opens its pool on the calling thread, so remembering the newest one per thread
+    // lets a test assert that a failed start released what it had allocated. A shared counter
+    // would do the same, but not while test classes run in parallel.
+    private static final ThreadLocal<Database> LAST_OPENED = new ThreadLocal<>();
+
+    private final AtomicBoolean closed = new AtomicBoolean();
     private final ConnectionProvider connections;
     private final SqlDialect dialect;
 
@@ -24,13 +31,33 @@ public final class Database implements AutoCloseable {
         String url = configuration.databaseUrl();
         String lowerCaseUrl = url.toLowerCase(Locale.ROOT);
         if (lowerCaseUrl.startsWith("jdbc:postgresql:")) {
-            return new Database(new PooledConnectionProvider(configuration), new PostgresDialect());
+            return register(new Database(new PooledConnectionProvider(configuration), new PostgresDialect()));
         }
         if (lowerCaseUrl.startsWith("jdbc:sqlite:")) {
-            return new Database(new PooledConnectionProvider(configuration, tuneSqlite(url)), new SqliteDialect());
+            return register(new Database(
+                    new PooledConnectionProvider(configuration, tuneSqlite(url)), new SqliteDialect()));
         }
         throw new IllegalArgumentException(
                 "Unsupported database url: expected jdbc:sqlite: or jdbc:postgresql:, got " + url);
+    }
+
+    private static Database register(Database database) {
+        LAST_OPENED.set(database);
+        return database;
+    }
+
+    /** Visible for tests: the pool this thread opened most recently, or null if none. */
+    static Database lastOpened() {
+        return LAST_OPENED.get();
+    }
+
+    /** Visible for tests that need to tell "opened then closed" from "never opened". */
+    static void forgetLastOpened() {
+        LAST_OPENED.remove();
+    }
+
+    boolean isClosed() {
+        return closed.get();
     }
 
     public ConnectionProvider connections() {
@@ -45,10 +72,15 @@ public final class Database implements AutoCloseable {
     public void initializeSchema() throws SQLException {
         try (Connection connection = connections.getConnection();
                 Statement statement = connection.createStatement()) {
-            for (String ddl : dialect.schemaStatements()) {
+            for (String ddl : dialect.tableStatements()) {
                 statement.executeUpdate(ddl);
             }
+            // Migrations run between the tables and the indexes on purpose: an index can cover a
+            // column that an older database only gains here, and creating it first would throw.
             dialect.applyLegacyMigrations(statement);
+            for (String ddl : dialect.indexStatements()) {
+                statement.executeUpdate(ddl);
+            }
         }
     }
 
@@ -63,7 +95,10 @@ public final class Database implements AutoCloseable {
 
     @Override
     public void close() {
-        connections.close();
+        // Stopping an engine twice is normal in tests; only the first close counts.
+        if (closed.compareAndSet(false, true)) {
+            connections.close();
+        }
     }
 
     /**

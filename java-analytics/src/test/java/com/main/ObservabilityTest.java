@@ -10,8 +10,11 @@ import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.parallel.ResourceLock;
+import org.junit.jupiter.api.parallel.Resources;
 import org.junit.jupiter.api.Test;
 
+@ResourceLock(Resources.GLOBAL)
 class ObservabilityTest {
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private final PrintStream originalOut = System.out;

@@ -25,6 +25,9 @@ ENV HTTP_PORT=8080 \
 
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD wget --quiet --spider http://127.0.0.1:8080/health || exit 1
+    # A GET, not --spider: that sends HEAD, which /health answers with 405. GNU wget hides
+    # this by retrying with GET; the collector's busybox wget does not, so its container
+    # could never become healthy.
+    CMD wget --quiet --output-document=/dev/null http://127.0.0.1:8080/health || exit 1
 
 ENTRYPOINT ["java", "-jar", "/app/analytics.jar"]

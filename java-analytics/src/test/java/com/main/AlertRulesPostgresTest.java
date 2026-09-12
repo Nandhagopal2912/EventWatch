@@ -11,12 +11,14 @@ import java.util.List;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.api.Test;
 
 /**
  * The rule storage on a real PostgreSQL. Skipped unless EVENTWATCH_TEST_POSTGRES_URL is set,
  * so a checkout without a server still builds; CI provides one.
  */
+@ResourceLock("postgres")
 class AlertRulesPostgresTest {
     private Database database;
     private AlertRuleRepository repository;

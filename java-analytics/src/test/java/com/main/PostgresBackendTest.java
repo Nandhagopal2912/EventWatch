@@ -22,6 +22,7 @@ import java.time.temporal.ChronoUnit;
 import java.util.List;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 
@@ -31,6 +32,7 @@ import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
  * CI provides one as a service container.
  */
 @EnabledIfEnvironmentVariable(named = "EVENTWATCH_TEST_POSTGRES_URL", matches = ".+")
+@ResourceLock("postgres")
 class PostgresBackendTest {
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final String API_KEY = "postgres-secret";
@@ -81,8 +83,8 @@ class PostgresBackendTest {
         }
     }
 
-    private AnalyticsEngine.LogEntry entry(String eventId, String level, String message, Instant timestamp) {
-        return new AnalyticsEngine.LogEntry(eventId, level, message, timestamp, 42.5, 24.5);
+    private LogEntry entry(String eventId, String level, String message, Instant timestamp) {
+        return new LogEntry(eventId, level, message, timestamp, 42.5, 24.5);
     }
 
     @Test
@@ -104,7 +106,7 @@ class PostgresBackendTest {
         Instant timestamp = Instant.parse("2026-09-11T10:00:00Z");
         assertTrue(events.insertIfAbsent(entry("e1", "ERROR", "disk full", timestamp)));
 
-        List<AnalyticsEngine.LogEntry> stored = events.recent(10);
+        List<LogEntry> stored = events.recent(10);
         assertEquals(1, stored.size());
         assertEquals("e1", stored.get(0).eventId);
         assertEquals("disk full", stored.get(0).message);
@@ -190,9 +192,9 @@ class PostgresBackendTest {
         database.close();
         database = null;
 
-        HttpServer server = AnalyticsEngine.start(configuration(0));
+        AnalyticsEngine engine = AnalyticsEngine.start(configuration(0));
         try {
-            int port = server.getAddress().getPort();
+            int port = engine.port();
             HttpResponse<String> ingest = client.send(HttpRequest
                     .newBuilder(URI.create("http://127.0.0.1:" + port + "/receive"))
                     .timeout(Duration.ofSeconds(10))
@@ -218,7 +220,7 @@ class PostgresBackendTest {
                     .timeout(Duration.ofSeconds(10)).GET().build(), HttpResponse.BodyHandlers.ofString());
             assertEquals(200, health.statusCode());
         } finally {
-            AnalyticsEngine.stop(server);
+            engine.stop();
         }
     }
 }

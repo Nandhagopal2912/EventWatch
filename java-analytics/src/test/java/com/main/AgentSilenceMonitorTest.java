@@ -49,7 +49,7 @@ class AgentSilenceMonitorTest {
 
     /** Records one event from a machine, as of so many minutes before NOW. */
     private void reported(String hostId, long minutesAgo) throws SQLException {
-        events.insertIfAbsent(new AnalyticsEngine.LogEntry(
+        events.insertIfAbsent(new LogEntry(
                 hostId + "-" + minutesAgo, "INFO", "heartbeat",
                 NOW.minus(Duration.ofMinutes(minutesAgo)), hostId, hostId, "0.15.0", 0, 5.0, 5.0));
     }

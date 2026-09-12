@@ -10,7 +10,7 @@ It is built without web frameworks, an ORM, or a DI container on either side, so
 retries, queueing, deduplication, alert state, delivery — is visible in the code rather than hidden
 behind configuration.
 
-**Status:** Phases 1–16 complete. 243 tests pass: 186 Java, 53 Go agent, 4 load harness.
+**Status:** Phases 1–17 complete. 248 tests pass: 191 Java, 53 Go agent, 4 load harness.
 `CLAUDE.md` is the working guide for contributors and records what is deliberately deferred.
 
 **Scope:** built for roughly 5–50 machines. It is not an APM, a log aggregator, or a metrics
@@ -146,6 +146,12 @@ from a service that cannot store anything is worse than none.
 shutdown grace, and silence windows all come from `.env` with in-code fallbacks. A deployment or a
 test should never need a source change — and a hardcoded rate limit once made a whole benchmark
 meaningless.
+
+**15. One class per route, one engine per instance.** Routing used to be six hundred lines of inline
+lambdas over static fields, which meant a single engine could run in a JVM. Each route is now its
+own class over a shared context, and the cross-cutting work every route repeated — the preflight,
+the method check, the API key, and turning a bad parameter into 400 and unreachable storage into 503
+— lives in one base class. The test that proves it starts two engines side by side.
 
 ---
 
@@ -291,6 +297,10 @@ java-analytics/                 Maven Java analytics service
 		RetentionService.java          Prunes history past the window
 		TlsSupport.java                HTTPS listener from a keystore
 		WatchdogHeartbeat.java         Dead-man switch: a heartbeat while healthy
+		EngineContext.java             Everything one running engine owns
+		ApiHandler.java                What every authenticated route repeats
+		*Handler.java                  One class per route
+		HttpSupport.java               Auth, CORS policy, response envelope
 		Metrics.java                   Prometheus counters and gauges
 		StructuredLogger.java          One JSON object per log line
 	src/test/java/com/main/            180 tests, including a live PostgreSQL suite
@@ -622,6 +632,11 @@ metric and log formats. An end-to-end pass drives the real HTTP server on an eph
 temporary database, covering restart recovery, two machines staying independent, per-host rules
 changing which machines alert, and a silent machine raising and then resolving its own alert.
 
+Test classes run in parallel, which the phase 17 refactor made possible: two engines can now run in
+one JVM without sharing a key, a database, a metrics registry or an event window, and one test
+starts a pair side by side to prove it. A class that touches process-wide state — `System.out`, the
+logger, or a shared PostgreSQL server — declares a `@ResourceLock` and runs alone.
+
 The Go suite covers retry classification, the capture handler, durable-queue outcomes, correlation
 IDs, host identity and its persistence across restarts, the bind and authentication policy,
 delivery-health tracking and its alerts, and metric rendering, using an `httptest` stand-in for the analytics service.
@@ -749,6 +764,7 @@ The project was built in phases; each is a single commit.
 | 14 | Per-host alert rules | Rules table, host → fleet → default precedence, rules API and editor |
 | 15 | Fleet operations | Silence detection, per-machine drill-down, agent version and queue depth |
 | 16 | Watchdog | Analytics heartbeat and agent-side delivery-stall alerts |
+| 17 | Internal structure | One class per route, one engine per instance, parallel tests |
 
 `agent.md` is the original roadmap, kept for history. `CLAUDE.md` is the current authority on state,
 conventions, and what comes next.

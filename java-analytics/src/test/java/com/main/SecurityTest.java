@@ -30,13 +30,13 @@ class SecurityTest {
     @TempDir
     Path temporaryDirectory;
 
-    private HttpServer server;
+    private AnalyticsEngine engine;
 
     @AfterEach
     void stopEngine() {
-        if (server != null) {
-            AnalyticsEngine.stop(server);
-            server = null;
+        if (engine != null) {
+            engine.stop();
+            engine = null;
         }
     }
 
@@ -64,9 +64,9 @@ class SecurityTest {
 
     @Test
     void corsAllowsOnlyConfiguredOrigins() throws Exception {
-        server = AnalyticsEngine.start(configuration(false, "", "",
+        engine = AnalyticsEngine.start(configuration(false, "", "",
                 List.of("https://ops.example.com", "http://localhost:3000"), false));
-        int port = server.getAddress().getPort();
+        int port = engine.port();
         HttpClient client = HttpClient.newHttpClient();
 
         HttpResponse<String> allowed = get("http", port, "/alerts", API_KEY,
@@ -83,8 +83,8 @@ class SecurityTest {
 
     @Test
     void anEmptyOriginListAllowsNothing() throws Exception {
-        server = AnalyticsEngine.start(configuration(false, "", "", List.of(), false));
-        int port = server.getAddress().getPort();
+        engine = AnalyticsEngine.start(configuration(false, "", "", List.of(), false));
+        int port = engine.port();
 
         HttpResponse<String> response = get("http", port, "/alerts", API_KEY,
                 "http://localhost:3000", HttpClient.newHttpClient());
@@ -93,14 +93,14 @@ class SecurityTest {
 
     @Test
     void metricsAreOpenByDefaultAndCanBeClosed() throws Exception {
-        server = AnalyticsEngine.start(configuration(false, "", "", List.of(), false));
+        engine = AnalyticsEngine.start(configuration(false, "", "", List.of(), false));
         HttpClient client = HttpClient.newHttpClient();
-        assertEquals(200, get("http", server.getAddress().getPort(), "/metrics", null, null, client).statusCode(),
+        assertEquals(200, get("http", engine.port(), "/metrics", null, null, client).statusCode(),
                 "scrapers rarely send custom headers, so metrics stay open by default");
 
-        AnalyticsEngine.stop(server);
-        server = AnalyticsEngine.start(configuration(false, "", "", List.of(), true));
-        int port = server.getAddress().getPort();
+        engine.stop();
+        engine = AnalyticsEngine.start(configuration(false, "", "", List.of(), true));
+        int port = engine.port();
         assertEquals(401, get("http", port, "/metrics", null, null, client).statusCode(),
                 "METRICS_REQUIRE_KEY must close the endpoint");
         assertEquals(200, get("http", port, "/metrics", API_KEY, null, client).statusCode());
@@ -127,8 +127,8 @@ class SecurityTest {
         String password = "changeit";
         TestKeystore.generate(keystore, password);
 
-        server = AnalyticsEngine.start(configuration(true, keystore.toString(), password, List.of(), false));
-        int port = server.getAddress().getPort();
+        engine = AnalyticsEngine.start(configuration(true, keystore.toString(), password, List.of(), false));
+        int port = engine.port();
 
         HttpClient client = HttpClient.newBuilder()
                 .sslContext(trustEverything())

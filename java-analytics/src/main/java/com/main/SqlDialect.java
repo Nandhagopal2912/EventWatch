@@ -12,8 +12,15 @@ public interface SqlDialect {
     /** A readable backend name for logs and metrics. */
     String name();
 
-    /** Table and index creation, run at startup and safe to repeat. */
-    List<String> schemaStatements();
+    /** Table creation, run at startup and safe to repeat. */
+    List<String> tableStatements();
+
+    /**
+     * Index creation, run after {@link #applyLegacyMigrations}. Indexes are separate because
+     * some of them cover columns that an older database only gains during the migration, and
+     * creating them first made upgrading such a database fail at startup.
+     */
+    List<String> indexStatements();
 
     /** Insert that silently does nothing when the event id is already stored. */
     String insertEventIgnoringDuplicates();

@@ -40,14 +40,14 @@ class AlertEngineTest {
 
     private static final String HOST = "web-01";
 
-    private List<AnalyticsEngine.LogEntry> window(double cpu, double ram, int count) {
+    private List<LogEntry> window(double cpu, double ram, int count) {
         return window(HOST, cpu, ram, count);
     }
 
-    private List<AnalyticsEngine.LogEntry> window(String hostId, double cpu, double ram, int count) {
-        List<AnalyticsEngine.LogEntry> events = new ArrayList<>();
+    private List<LogEntry> window(String hostId, double cpu, double ram, int count) {
+        List<LogEntry> events = new ArrayList<>();
         for (int index = 0; index < count; index++) {
-            events.add(new AnalyticsEngine.LogEntry(hostId + "-e" + index, "INFO", "m",
+            events.add(new LogEntry(hostId + "-e" + index, "INFO", "m",
                     Instant.parse("2026-09-11T10:00:00Z").plusSeconds(index), hostId, hostId, cpu, ram));
         }
         return events;
@@ -77,8 +77,8 @@ class AlertEngineTest {
     @Test
     void oneSpikeInsideTheWindowDoesNotAlert() throws SQLException {
         // Four calm samples and one spike average below the threshold.
-        List<AnalyticsEngine.LogEntry> events = window(10.0, 10.0, 4);
-        events.add(new AnalyticsEngine.LogEntry("spike", "INFO", "m",
+        List<LogEntry> events = window(10.0, 10.0, 4);
+        events.add(new LogEntry("spike", "INFO", "m",
                 Instant.parse("2026-09-11T10:00:10Z"), HOST, HOST, 100.0, 10.0));
         engine.evaluate(events);
         assertNull(alerts.findByKey(key("cpu-high")));
@@ -103,7 +103,7 @@ class AlertEngineTest {
     @Test
     void onlyTheNewestEventsCount() throws SQLException {
         // Ten calm samples followed by five hot ones: only the last five are evaluated.
-        List<AnalyticsEngine.LogEntry> events = new ArrayList<>(window(5.0, 5.0, 10));
+        List<LogEntry> events = new ArrayList<>(window(5.0, 5.0, 10));
         events.addAll(window(95.0, 5.0, WINDOW));
         engine.evaluate(events);
         assertNotNull(alerts.findByKey(key("cpu-high")));
@@ -118,9 +118,9 @@ class AlertEngineTest {
 
     @Test
     void repeatedErrorsRaiseAnAlertOnceTheThresholdIsMet() throws SQLException {
-        List<AnalyticsEngine.LogEntry> events = new ArrayList<>();
+        List<LogEntry> events = new ArrayList<>();
         for (int index = 0; index < 3; index++) {
-            events.add(new AnalyticsEngine.LogEntry("e" + index, "ERROR", "database deadlock",
+            events.add(new LogEntry("e" + index, "ERROR", "database deadlock",
                     Instant.parse("2026-09-11T10:00:00Z").plusSeconds(index), HOST, HOST, 5.0, 5.0));
         }
         engine.evaluate(events);
@@ -133,9 +133,9 @@ class AlertEngineTest {
 
     @Test
     void repeatedErrorsBelowTheThresholdStaySilent() throws SQLException {
-        List<AnalyticsEngine.LogEntry> events = new ArrayList<>();
+        List<LogEntry> events = new ArrayList<>();
         for (int index = 0; index < 2; index++) {
-            events.add(new AnalyticsEngine.LogEntry("e" + index, "ERROR", "database deadlock",
+            events.add(new LogEntry("e" + index, "ERROR", "database deadlock",
                     Instant.parse("2026-09-11T10:00:00Z").plusSeconds(index), HOST, HOST, 5.0, 5.0));
         }
         engine.evaluate(events);
@@ -144,9 +144,9 @@ class AlertEngineTest {
 
     @Test
     void criticalCountsTowardsRepeatedErrors() throws SQLException {
-        List<AnalyticsEngine.LogEntry> events = new ArrayList<>();
+        List<LogEntry> events = new ArrayList<>();
         for (int index = 0; index < 3; index++) {
-            events.add(new AnalyticsEngine.LogEntry("e" + index, "CRITICAL", "out of memory",
+            events.add(new LogEntry("e" + index, "CRITICAL", "out of memory",
                     Instant.parse("2026-09-11T10:00:00Z").plusSeconds(index), HOST, HOST, 5.0, 5.0));
         }
         engine.evaluate(events);
@@ -155,17 +155,17 @@ class AlertEngineTest {
 
     @Test
     void differentMessagesAreTrackedSeparately() throws SQLException {
-        List<AnalyticsEngine.LogEntry> events = new ArrayList<>();
+        List<LogEntry> events = new ArrayList<>();
         for (int index = 0; index < 3; index++) {
-            events.add(new AnalyticsEngine.LogEntry("a" + index, "ERROR", "deadlock",
+            events.add(new LogEntry("a" + index, "ERROR", "deadlock",
                     Instant.parse("2026-09-11T10:00:00Z").plusSeconds(index), HOST, HOST, 5.0, 5.0));
         }
         engine.evaluate(events);
         String firstKey = alerts.findActive().get(0).getAlertKey();
 
-        List<AnalyticsEngine.LogEntry> others = new ArrayList<>();
+        List<LogEntry> others = new ArrayList<>();
         for (int index = 0; index < 3; index++) {
-            others.add(new AnalyticsEngine.LogEntry("b" + index, "ERROR", "timeout",
+            others.add(new LogEntry("b" + index, "ERROR", "timeout",
                     Instant.parse("2026-09-11T11:00:00Z").plusSeconds(index), HOST, HOST, 5.0, 5.0));
         }
         engine.evaluate(others);
@@ -206,17 +206,17 @@ class AlertEngineTest {
 
     @Test
     void anEventWithoutIdentityFallsBackToAnUnknownHost() throws SQLException {
-        List<AnalyticsEngine.LogEntry> legacy = new ArrayList<>();
+        List<LogEntry> legacy = new ArrayList<>();
         for (int index = 0; index < WINDOW; index++) {
-            legacy.add(new AnalyticsEngine.LogEntry("legacy-" + index, "INFO", "m",
+            legacy.add(new LogEntry("legacy-" + index, "INFO", "m",
                     Instant.parse("2026-09-11T10:00:00Z").plusSeconds(index), 95.0, 10.0));
         }
         engine.evaluate(legacy);
 
         AlertRecord alert = alerts.findByKey(
-                AlertEngine.alertKey("cpu-high", AnalyticsEngine.UNKNOWN_HOST));
+                AlertEngine.alertKey("cpu-high", LogEntry.UNKNOWN_HOST));
         assertNotNull(alert, "an agent older than phase 12 still raises alerts");
-        assertEquals(AnalyticsEngine.UNKNOWN_HOST, alert.getHostId());
+        assertEquals(LogEntry.UNKNOWN_HOST, alert.getHostId());
     }
 
     @Test

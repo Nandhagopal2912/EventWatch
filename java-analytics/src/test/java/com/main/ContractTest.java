@@ -28,7 +28,7 @@ class ContractTest {
 
     @Test
     void theSharedContractEventIsAccepted() throws IOException {
-        assertNull(AnalyticsEngine.validateEvent(contract()),
+        assertNull(EventValidation.validate(contract()),
                 "the canonical collector payload must pass validation unchanged");
     }
 
@@ -53,7 +53,7 @@ class ContractTest {
                 "correlation_id", "host_id", "hostname", "agent_version", "queue_depth"}) {
             ObjectNode without = ((ObjectNode) contract()).deepCopy();
             without.remove(optional);
-            assertNull(AnalyticsEngine.validateEvent(without), "removing " + optional + " must still validate");
+            assertNull(EventValidation.validate(without), "removing " + optional + " must still validate");
         }
     }
 
@@ -61,16 +61,16 @@ class ContractTest {
     void identityFieldsAreBoundedWhenPresent() throws IOException {
         ObjectNode oversized = ((ObjectNode) contract()).deepCopy();
         oversized.put("host_id", "x".repeat(129));
-        assertTrue(AnalyticsEngine.validateEvent(oversized) != null,
+        assertTrue(EventValidation.validate(oversized) != null,
                 "an unbounded host id would become an unbounded alert key");
 
         ObjectNode wrongType = ((ObjectNode) contract()).deepCopy();
         wrongType.put("hostname", 42);
-        assertTrue(AnalyticsEngine.validateEvent(wrongType) != null);
+        assertTrue(EventValidation.validate(wrongType) != null);
 
         ObjectNode negativeQueue = ((ObjectNode) contract()).deepCopy();
         negativeQueue.put("queue_depth", -1);
-        assertTrue(AnalyticsEngine.validateEvent(negativeQueue) != null,
+        assertTrue(EventValidation.validate(negativeQueue) != null,
                 "a negative queue depth is not a measurement");
     }
 
@@ -80,7 +80,7 @@ class ContractTest {
                 "event_id", "level", "msg", "timestamp", "cpu_usage", "ram_usage"}) {
             ObjectNode broken = ((ObjectNode) contract()).deepCopy();
             broken.remove(field);
-            assertTrue(AnalyticsEngine.validateEvent(broken) != null,
+            assertTrue(EventValidation.validate(broken) != null,
                     "removing " + field + " should fail validation");
         }
     }

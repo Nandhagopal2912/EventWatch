@@ -56,7 +56,7 @@ class WatchdogHeartbeatTest {
 
     @Test
     void aHealthyServicePingsWithSomethingWorthLogging() throws Exception {
-        events.insertIfAbsent(new AnalyticsEngine.LogEntry("e1", "INFO", "heartbeat",
+        events.insertIfAbsent(new LogEntry("e1", "INFO", "heartbeat",
                 Instant.now(), "web-01", "web-01", "0.15.0", 0, 5.0, 5.0));
         alerts.saveOccurrence(new AlertRecord("cpu-high@web-01", "HIGH_CPU", "web-01", "hot", Instant.now()));
 

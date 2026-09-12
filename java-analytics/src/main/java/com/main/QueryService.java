@@ -13,6 +13,8 @@ import java.util.Map;
 public class QueryService {
     public static final int DEFAULT_LIMIT = 50;
     public static final int MAX_LIMIT = 200;
+    /** The fleet listing repeats a per-host lookup, so the page size stays bounded. */
+    public static final int MAX_HOSTS_LISTED = 200;
 
     private final EventRepository eventRepository;
     private final AlertRepository alertRepository;
@@ -29,24 +31,24 @@ public class QueryService {
 
     public ObjectNode events(String level, String hostId, Instant from, Instant to, int limit, int offset)
             throws SQLException {
-        List<AnalyticsEngine.LogEntry> events = eventRepository.find(level, hostId, from, to, limit, offset);
+        List<LogEntry> events = eventRepository.find(level, hostId, from, to, limit, offset);
         ObjectNode response = objectMapper.createObjectNode();
         response.put("limit", limit);
         response.put("offset", offset);
         response.put("total", eventRepository.count(level, hostId, from, to));
         ArrayNode items = response.putArray("items");
-        for (AnalyticsEngine.LogEntry event : events) {
+        for (LogEntry event : events) {
             items.add(eventJson(event));
         }
         return response;
     }
 
     public ObjectNode summary() throws SQLException {
-        List<AnalyticsEngine.LogEntry> recent = eventRepository.recent(movingWindowSize);
+        List<LogEntry> recent = eventRepository.recent(movingWindowSize);
         ObjectNode response = objectMapper.createObjectNode();
         response.put("total_events", eventRepository.count(null, null, null));
         response.put("active_alerts", alertRepository.findActive().size());
-        response.put("hosts", eventRepository.hosts(AnalyticsEngine.MAX_HOSTS_LISTED).size());
+        response.put("hosts", eventRepository.hosts(QueryService.MAX_HOSTS_LISTED).size());
         if (recent.isEmpty()) {
             response.putNull("latest_event");
             response.put("average_cpu", 0.0);
@@ -152,7 +154,7 @@ public class QueryService {
 
     /** Everything known about one machine, for the drill-down view. */
     public ObjectNode hostDetail(EventRepository.HostSummary host, AlertRules rules, Instant now,
-            List<AnalyticsEngine.LogEntry> recentEvents, Map<String, Long> levelCounts,
+            List<LogEntry> recentEvents, Map<String, Long> levelCounts,
             List<AlertRecord> activeAlerts) {
         ObjectNode response = hostJson(host, rules, now);
         response.put("first_seen", host.firstSeen().toString());
@@ -202,7 +204,7 @@ public class QueryService {
         return node;
     }
 
-    private ObjectNode eventJson(AnalyticsEngine.LogEntry event) {
+    private ObjectNode eventJson(LogEntry event) {
         ObjectNode response = objectMapper.createObjectNode();
         response.put("event_id", event.eventId);
         response.put("host_id", event.hostId);
