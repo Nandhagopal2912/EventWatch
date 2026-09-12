@@ -4,8 +4,13 @@ This walks you from a fresh clone to a working fleet monitor with a real alert o
 explains what the system is actually doing after each step. If you only want the short version,
 `readme.md` has it; this file is for the first time, when it helps to know why each command matters.
 
-By the end you will have two services running, a dashboard you are signed in to, an alert you
-deliberately caused, and a demonstration that nothing is lost when the analytics service dies.
+By the end you will have two services running, a fleet board that fills itself in without you
+touching anything, an alert you deliberately caused, and a demonstration that nothing is lost when
+the analytics service dies.
+
+**The short version of how it works:** the agent measures its own machine every 60 seconds on a
+timer. You do not have to send anything for monitoring to happen — `/capture` exists so *your*
+scripts can add their own events to that stream.
 
 Budget about fifteen minutes.
 
@@ -141,6 +146,13 @@ Wait for `agent started`.
    agent will refuse to start without `CAPTURE_API_KEY`. Exposure and authentication are coupled on
    purpose, so an exposed agent cannot be an unauthenticated one.
 5. It started a background loop that retries anything sitting in the queue every five seconds.
+6. **It started sampling this machine every 60 seconds.** This is the part that makes it a monitor
+   rather than a log shipper: from now on the agent reports CPU, RAM, and disk on a timer whether
+   or not anything asks it to.
+
+Wait a minute and refresh the dashboard. **Your machine appears on the fleet board on its own** —
+no command needed. That is the system working as intended; everything below is you adding your own
+events on top of a stream that is already flowing.
 
 You now have both halves running. One agent per machine is the intended shape — the agent measures
 *the machine it runs on*, so pointing several machines at one shared agent would stamp every event
@@ -148,7 +160,11 @@ with that agent's CPU rather than their own.
 
 ---
 
-## Step 5 — Send your first event
+## Step 5 — Send an event of your own
+
+The agent is already reporting on its own. `/capture` is for events *you* care about — a backup
+script reporting failure, a cron job, a systemd `OnFailure=` hook — which then travel with the same
+machine identity and host readings as the scheduled samples.
 
 In a **third terminal** (or just stop watching a log for a moment):
 
@@ -172,7 +188,8 @@ You should get `{"message":"log forwarded to analytics engine successfully","sta
 7. The correlation ID came back in the response header, and appears in the logs of *both* services
    — so one event is traceable end to end.
 
-Refresh the dashboard. You now have one machine and one event, with its CPU, RAM, and disk reading.
+Refresh the dashboard. Your event sits alongside the scheduled `host sample` entries, carrying the
+same machine identity and readings — the only difference is what triggered it.
 
 > **Note the `%20`.** That is a URL-encoded space. Spaces in a URL will otherwise break the
 > request or truncate your message.
@@ -198,8 +215,12 @@ Refresh the dashboard. **Active alerts** now shows one.
 
 **What just happened.** The engine looks at the last five events *for this machine* and counts
 identical error messages. The default threshold is five, so all five events in the window have to
-be the same error — which is why they need to be consecutive. It raised an alert keyed
+be the same error — which is why they need to be consecutive and quick. It raised an alert keyed
 `repeated-error-…@your-host-id`.
+
+> If no alert appears, a scheduled sample most likely landed in the middle of your five and pushed
+> one out of the window. Run the loop again. That interleaving is the moving window behaving
+> correctly: five errors *spread over an hour* are not a burst and should not alert like one.
 
 That `@your-host-id` is important: alert keys carry the machine. Two machines with the same problem
 get two separate alerts rather than fighting over one row, which is what makes this work for a
@@ -268,7 +289,9 @@ This is the property worth seeing for yourself.
 
    You get `503` and the message `backend unavailable; event queued for retry`. That is the
    system working, not failing.
-3. **Look in `go-collector/pending-events/`.** There is a `.json` file per event.
+3. **Look in `go-collector/pending-events/`.** There is a `.json` file per event — including the
+   scheduled samples, which keep being taken every 60 seconds throughout the outage. Leave it a
+   few minutes and watch the count climb on its own.
 4. **Restart the analytics service** (same command as Step 2).
 5. **Wait about five seconds**, then refresh the dashboard.
 
@@ -315,6 +338,11 @@ can never report as another machine, which the shared key could never prevent. R
 | `go-collector/pending-events/` | Events awaiting delivery | Only if empty; files here are undelivered events |
 | `go-collector/pending-events/host-id` | This machine's stable identity | No — deleting makes it a "new" machine |
 | `go-collector/pending-events/rejected-events/` | Events permanently refused | Yes, after you have looked at why |
+
+**A note on growth.** With sampling on, each machine writes about 1,440 events a day — roughly half
+a million a year. `RETENTION_DAYS` defaults to 30 and prunes anything older, so the database settles
+at a steady size rather than growing forever. Set it to `0` only if you genuinely want to keep
+everything.
 
 Both `.env` and `events.db` are gitignored. Never commit either.
 
@@ -366,6 +394,10 @@ is handled automatically now; if you still see it, deleting `events.db` resets e
 
 **An alert will not go away** — repeated-error alerts never auto-resolve by design. Resolve it from
 the dashboard.
+
+**A machine shows as `silent` even though the agent is running** — check the agent's log for
+`periodic host sampling is disabled`. With `SAMPLE_INTERVAL_SECONDS=0` the agent only reports when
+`/capture` is called, so a quiet machine looks dead. That is the setting doing what it says.
 
 ---
 

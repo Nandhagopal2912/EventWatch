@@ -148,12 +148,21 @@ func logHandler(w http.ResponseWriter, r *http.Request) {
 	if msg == "" {
 		msg = "Default cloud event"
 	}
+	status, message := captureEvent(level, msg, correlationID)
+	writeMessage(w, status, message)
+}
+
+// captureEvent samples this machine, builds one event, and delivers or queues it.
+//
+// The HTTP endpoint and the timer both call this, so an event takes the same path no matter what
+// triggered it. It returns the status and message the capture endpoint answers with, which is
+// also the vocabulary the queue already classifies outcomes by.
+func captureEvent(level, msg, correlationID string) (int, string) {
 	cpuUsage, ramUsage, err := readHostMetrics()
 	if err != nil {
 		metrics.recordHostFailure()
 		logError("host metrics unavailable", logFields{"correlation_id": correlationID, "error": err.Error()})
-		writeMessage(w, http.StatusInternalServerError, "host metrics unavailable")
-		return
+		return http.StatusInternalServerError, "host metrics unavailable"
 	}
 
 	payload := LogPayload{
@@ -194,8 +203,7 @@ func logHandler(w http.ResponseWriter, r *http.Request) {
 	jsonBytes, err := json.Marshal(payload)
 	if err != nil {
 		logError("event serialization failed", logFields{"correlation_id": correlationID, "error": err.Error()})
-		writeMessage(w, http.StatusInternalServerError, "internal payload error")
-		return
+		return http.StatusInternalServerError, "internal payload error"
 	}
 
 	resp, err := forwardToJava(jsonBytes, correlationID)
@@ -208,16 +216,14 @@ func logHandler(w http.ResponseWriter, r *http.Request) {
 				"error":          err.Error(),
 				"queue_error":    queueErr.Error(),
 			})
-			writeMessage(w, http.StatusServiceUnavailable, "backend unavailable and local queue is full")
-			return
+			return http.StatusServiceUnavailable, "backend unavailable and local queue is full"
 		}
 		metrics.recordForward("queued")
 		logWarn("analytics unavailable; event queued", logFields{
 			"correlation_id": correlationID,
 			"error":          err.Error(),
 		})
-		writeMessage(w, http.StatusServiceUnavailable, "backend unavailable; event queued for retry")
-		return
+		return http.StatusServiceUnavailable, "backend unavailable; event queued for retry"
 	}
 
 	defer resp.Body.Close()
@@ -232,31 +238,52 @@ func logHandler(w http.ResponseWriter, r *http.Request) {
 					"status":         resp.StatusCode,
 					"queue_error":    queueErr.Error(),
 				})
-				writeMessage(w, http.StatusServiceUnavailable, "backend unavailable and local queue is full")
-				return
+				return http.StatusServiceUnavailable, "backend unavailable and local queue is full"
 			}
 			metrics.recordForward("queued")
 			logWarn("analytics returned a retryable status; event queued", logFields{
 				"correlation_id": correlationID,
 				"status":         resp.StatusCode,
 			})
-			writeMessage(w, http.StatusServiceUnavailable, "backend unavailable; event queued for retry")
-			return
+			return http.StatusServiceUnavailable, "backend unavailable; event queued for retry"
 		}
 		metrics.recordForward("rejected")
 		logWarn("analytics rejected the event", logFields{
 			"correlation_id": correlationID,
 			"status":         resp.StatusCode,
 		})
-		writeMessage(w, resp.StatusCode, "Java backend rejected the log")
-		return
+		return resp.StatusCode, "Java backend rejected the log"
 	}
 	metrics.recordForward("delivered")
 	logInfo("event delivered to analytics", logFields{
 		"correlation_id": correlationID,
 		"event_id":       payload.EventID,
 	})
-	writeMessage(w, http.StatusOK, "log forwarded to analytics engine successfully")
+	return http.StatusOK, "log forwarded to analytics engine successfully"
+}
+
+// The level and message every scheduled sample carries. Stable on purpose: a changing message
+// would look like distinct errors to the repeated-error rule, and INFO keeps samples out of it
+// entirely.
+const (
+	sampleLevel   = "INFO"
+	sampleMessage = "host sample"
+)
+
+// sampleHostPeriodically is what makes this a monitor rather than a log shipper.
+//
+// Without it the agent measures nothing unless something calls /capture, which means a CPU spike
+// at three in the morning is invisible, the five-event window averages "the last five times
+// someone ran curl", and AGENT_SILENT fires on a healthy machine that simply had nothing to say.
+// A machine now reports on a timer whether or not anyone asks it to.
+func sampleHostPeriodically(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for range ticker.C {
+		// captureEvent logs every outcome itself, including queueing through an outage, so there
+		// is nothing useful to add here.
+		_, _ = captureEvent(sampleLevel, sampleMessage, newEventID())
+	}
 }
 
 func main() {
@@ -281,6 +308,7 @@ func main() {
 	configuredBackendURL = javaBackendURL
 	configuredIngestionCredential = ingestionCredential
 	configuredDiskPaths = splitPaths(getEnv("DISK_PATHS", ""))
+	sampleInterval := time.Duration(getIntEnv("SAMPLE_INTERVAL_SECONDS", 60)) * time.Second
 	queueDirectory = getEnv("PENDING_EVENTS_DIR", "pending-events")
 	queueCapacity = getIntEnv("QUEUE_CAPACITY", 1000)
 	queueRetryInterval = time.Duration(getIntEnv("QUEUE_RETRY_SECONDS", 5)) * time.Second
@@ -330,6 +358,16 @@ func main() {
 		time.Duration(getIntEnv("AGENT_ALERT_TIMEOUT_SECONDS", 5))*time.Second)
 
 	go retryPendingEvents()
+
+	// time.NewTicker panics on a non-positive duration, so the guard is load-bearing rather than
+	// defensive - the same lesson as B13 on the Java side. Zero disables sampling deliberately.
+	if sampleInterval > 0 {
+		go sampleHostPeriodically(sampleInterval)
+		logInfo("periodic host sampling enabled", logFields{"interval_seconds": int(sampleInterval.Seconds())})
+	} else {
+		logWarn("periodic host sampling is disabled; this agent only reports when /capture is called",
+			logFields{"setting": "SAMPLE_INTERVAL_SECONDS"})
+	}
 
 	http.HandleFunc("/capture", logHandler)
 	http.HandleFunc("/health", healthHandler)

@@ -10,7 +10,7 @@ It is built without web frameworks, an ORM, or a DI container on either side, so
 retries, queueing, deduplication, alert state, delivery — is visible in the code rather than hidden
 behind configuration.
 
-**Status:** Phases 1–21 complete. 323 tests pass: 255 Java, 64 Go agent, 4 load harness, plus a
+**Status:** Phases 1–22 complete. 331 tests pass: 258 Java, 69 Go agent, 4 load harness, plus a
 scripted two-process outage test that runs in CI on every push.
 `CLAUDE.md` is the working guide for contributors and records what is deliberately deferred.
 
@@ -36,9 +36,13 @@ what a system built and reviewed by one person, at this scope, can claim.
 
 ## What it does
 
-**Collects.** Each agent accepts events on `GET /capture`, samples its own machine's CPU, RAM, and
-fullest filesystem, and stamps every event with a stable host identity, a correlation ID, its own
-version, and its pending-queue depth. One agent runs per machine.
+**Measures on its own.** Each agent samples its machine's CPU, RAM, and fullest filesystem every
+60 seconds without being asked, so the fleet board is live and a spike at three in the morning is
+seen. `SAMPLE_INTERVAL_SECONDS` changes the cadence; `0` turns it off.
+
+**Collects events too.** `GET /capture` accepts an event from anything on the host — a script, a
+cron job, a systemd `OnFailure=` hook — and stamps it with the same host identity, correlation ID,
+agent version, and pending-queue depth. One agent runs per machine.
 
 **Never loses an event.** If the analytics service is unreachable, the agent retries with bounded
 attempts, then writes the event atomically to a durable file queue. A background worker drains the
@@ -48,8 +52,8 @@ makes a retry a no-op rather than a duplicate row.
 
 **Stores and queries.** Telemetry lands in SQLite by default, or PostgreSQL when `DATABASE_URL`
 names one — the same repository code, the same API behaviour, the same test suite on both. Events,
-summaries, hosts, and alerts are queryable over a bounded JSON API. `RETENTION_DAYS` prunes old
-history when set.
+summaries, hosts, and alerts are queryable over a bounded JSON API. `RETENTION_DAYS` prunes
+history past 30 days by default, because the agent never stops sampling.
 
 **Alerts per machine.** The engine evaluates each machine's last five events independently, so one
 busy host never drags an idle one into an alert. It raises `HIGH_CPU`, `HIGH_RAM`, `HIGH_DISK`,
@@ -649,8 +653,14 @@ constraint. Timestamps are stored as ISO-8601 text on both, so ordering, range f
 values mean exactly the same thing either way.
 
 `RETENTION_DAYS` deletes telemetry and delivery history older than that window, swept every
-`RETENTION_SWEEP_MINUTES`. The default of `0` keeps everything — right for a local install, wrong
-for a long-running one.
+`RETENTION_SWEEP_MINUTES`. It defaults to **30 days**, because continuous sampling writes about
+1,440 rows per machine per day whether or not anyone is using the system — keeping everything
+forever is a decision that should be made deliberately rather than discovered later. Set it to `0`
+to keep everything.
+
+If you are upgrading and your `.env` already contains `RETENTION_DAYS=0`, that explicit value still
+wins. An upgrade does not silently start deleting your history; change the line yourself when you
+want the new behaviour.
 
 ---
 
@@ -814,13 +824,14 @@ in-code fallback, so an absent key is never fatal.
 | `SHARED_KEY_INGESTION_ENABLED` | `true` | Whether the fleet-wide key still authenticates ingestion |
 | `DISK_ALERT_THRESHOLD` | `90` | Percentage at which the fullest filesystem alerts |
 | `DISK_PATHS` | empty | Mounts the agent measures; empty means every real filesystem |
+| `SAMPLE_INTERVAL_SECONDS` | `60` | How often the agent samples itself; `0` disables it |
 | `METRICS_REQUIRE_KEY` | `false` | Close the analytics `/metrics` endpoint |
 | `HOST_ID` / `HOSTNAME_OVERRIDE` / `HOST_ID_FILE` | empty | Pin agent identity, rename it, or relocate its file |
 | `PENDING_EVENTS_DIR` | `pending-events` | Durable queue location |
 | `QUEUE_CAPACITY` | `1000` | Maximum queued events before drops are reported |
 | `QUEUE_RETRY_SECONDS` | `5` | How often the recovery worker retries |
 | `RATE_LIMIT_PER_MINUTE` | `100` | Ingestion limit per client address |
-| `RETENTION_DAYS` | `0` | Prune history past this window; `0` keeps everything |
+| `RETENTION_DAYS` | `30` | Prune history past this window; `0` keeps everything |
 | `RETENTION_SWEEP_MINUTES` | `60` | How often retention runs |
 | `CPU_ALERT_THRESHOLD` / `RAM_ALERT_THRESHOLD` | `85` / `80` | Default percentage thresholds |
 | `REPEATED_ERROR_THRESHOLD` | `5` | Repeats of one message within the five-event window |
@@ -905,6 +916,7 @@ The project was built in phases; each is a single commit.
 | 19 | Per-agent credentials | Mint, bind, and revoke per-machine ingestion tokens |
 | 20 | Cleanup and closing gaps | Scripted outage test in CI, `/stress` removed |
 | 21 | Disk usage | Fullest-mount sampling, `HIGH_DISK` judged on the latest reading |
+| 22 | Continuous sampling | The agent measures on a timer, not only when asked |
 
 `agent.md` is the original roadmap, kept for history. `CLAUDE.md` is the current authority on state,
 conventions, and what comes next.

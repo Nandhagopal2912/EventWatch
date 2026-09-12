@@ -21,6 +21,11 @@ if [ -z "$PYTHON" ]; then
 fi
 
 export EVENTWATCH_API_KEY="${EVENTWATCH_API_KEY:-outage-test-secret}"
+# The agent normally samples itself every 60 seconds, which would add an unpredictable number of
+# events to the counts below. What this test measures is the durable queue - that every event handed
+# to the agent survives an outage - so the timer is switched off to keep the arithmetic exact. The
+# sampler has its own tests in go-collector/sampling_test.go.
+export SAMPLE_INTERVAL_SECONDS=0
 BEFORE_COUNT=5
 DURING_COUNT=5
 TOTAL_EXPECTED=$((BEFORE_COUNT + DURING_COUNT))

@@ -17,7 +17,7 @@ downstream — per-host windows, per-host alert keys, the fleet listing — foll
 
 | Service | Language | Port | Role |
 | --- | --- | --- | --- |
-| `go-collector/` | Go 1.27, stdlib + gopsutil + godotenv | 8082 | One per machine: stable identity, version, host CPU/RAM/disk, durable retry queue |
+| `go-collector/` | Go 1.27, stdlib + gopsutil + godotenv | 8082 | One per machine: samples CPU/RAM/disk on a timer, stable identity, durable retry queue |
 | `java-analytics/` | Java 17, Maven, `com.sun.net.httpserver` + Jackson + sqlite-jdbc/PostgreSQL + HikariCP | 8080 | Validates, persists, evaluates per-host rules, serves query and rules API |
 | `dashboard/` | Static HTML/CSS/JS, no build step | served by analytics on 8080 | Reads the Java query API only; never touches SQLite |
 
@@ -74,7 +74,8 @@ curl.exe "http://localhost:8082/capture?level=ERROR&msg=Database%20transaction%2
 ## 3. Code map
 
 ```text
-go-collector/main.go            Handlers, forwardToJava retries, durable file queue
+go-collector/main.go            Handlers, captureEvent (shared by /capture and the sampler),
+                                periodic host sampling, forwardToJava retries, file queue
 go-collector/identity.go        Stable per-agent host_id, persisted beside the queue
 go-collector/security.go        Bind policy, capture auth, backend TLS trust,
                                 ingestion credential resolution (shared key vs. AGENT_TOKEN)
@@ -89,6 +90,7 @@ go-collector/identity_test.go   Identity generation, persistence, overrides
 go-collector/security_test.go   Bind policy, capture auth, backend TLS trust
 go-collector/watchdog_test.go   Stall detection, recovery, payload, metrics
 go-collector/disk_test.go       Fullest-mount selection, unreadable paths, DISK_PATHS
+go-collector/sampling_test.go   The timer path, and that it matches the /capture path
 go-collector/Dockerfile         Static binary on alpine, queue on a volume
 
 java-analytics/src/main/java/com/main/
@@ -158,6 +160,7 @@ java-analytics/src/test/java/com/main/
   RulesApiTest.java             The rules API changing which machines alert, end to end
   AlertRulesPostgresTest.java   Rule storage on a real PostgreSQL; skipped without one
   AgentSilenceMonitorTest.java  Silence thresholds, the forget window, the gauge
+  ConfigurationDefaultsTest.java  The defaults a fresh install gets, retention included
   FleetApiTest.java             Fleet listing, drill-down, silence raised and resolved
   MultipleEnginesTest.java      Two engines in one JVM: separate keys, metrics, windows
   SessionApiTest.java           Cookie attributes, revocation, rate limit, expiry
@@ -281,27 +284,23 @@ Changes to this schema must stay backward compatible — additive fields only, n
 
 ## 5. Current state — read before starting work
 
-**Phases 1–21 are complete.** Everything is green:
+**Phases 1–22 are complete.** Everything is green:
 
-- `cd java-analytics && mvn verify` → 255 tests, BUILD SUCCESS (12 of them need
-  `EVENTWATCH_TEST_POSTGRES_URL`; CI supplies a server, locally they skip). Verified against a real
-  PostgreSQL 16 container with all 255 running.
-- `cd go-collector && go vet ./... && go test ./...` → 64 tests, pass
+- `cd java-analytics && mvn verify` → 258 tests, BUILD SUCCESS (12 of them need
+  `EVENTWATCH_TEST_POSTGRES_URL`; CI supplies a server, locally they skip)
+- `cd go-collector && go vet ./... && go test ./...` → 69 tests, pass
 - `cd loadtest && go vet ./... && go test ./...` → 4 tests, pass
 - `docker compose up --build` → both services healthy
-- `scripts/outage-test.sh` → builds both images, kills analytics mid-traffic, proves zero loss;
-  runs in CI on every push
+- `scripts/outage-test.sh` → builds both images, kills analytics mid-traffic, proves zero loss
 
-Phases 16–20 were hardening. Phase 21 is the first feature growth since the roadmap closed: the
-agent now samples disk as well as CPU and RAM, and `HIGH_DISK` joins the rule types. It was chosen
-over the other candidates deliberately — see section 19 for why network and custom metrics were
-refused rather than deferred.
+Phase 22 fixed the gap that made the phrase "fleet monitor" an overstatement: the agent now samples
+itself on a timer instead of only when something calls `/capture`. Section 20 explains why that
+repaired three features rather than adding one.
 
-**Nothing is planned after this.** The roadmap is finished and disk was the one addition judged
-worth making. Section 20 records what was considered and turned down, with the trigger that would
+**Nothing is planned after this.** Section 21 records what was refused and the trigger that would
 justify reopening each.
 
-B1–B17 in section 20 are all fixed.
+B1–B18 in section 21 are all fixed.
 
 ## 6. Phase 8 as built — notifications
 
@@ -416,7 +415,7 @@ filters meaning exactly the same thing everywhere.
 sweeps rate windows. The cutoff is exclusive, delivery history is pruned alongside the events that
 produced it, and a failed sweep is logged rather than thrown so the timer thread survives.
 
-**What is deliberately NOT done, and when to revisit** — see section 21. Short version: the file
+**What is deliberately NOT done, and when to revisit** — see section 22. Short version: the file
 queue and the two-service shape are both still comfortably inside what the measurements justify.
 
 ## 10. Phase 12 as built — host identity
@@ -491,7 +490,7 @@ logs a startup warning.
 
 **Rules are read on every event, so they are cached** in `AlertRules` and replaced wholesale on
 each write. That is correct for one analytics instance; a second instance would need a refresh
-interval or change notification — the same limitation as notification reminders in section 20.
+interval or change notification — the same limitation as notification reminders in section 21.
 
 **A wiring bug the tests caught before commit:** the CORS preflight still advertised
 `GET, POST, OPTIONS`, because the edit replaced the first of two identical strings — in the
@@ -734,7 +733,7 @@ CPU and RAM, so it needed no new machinery at all. Network is a rate, unbounded 
 and — the disqualifying part — has no natural threshold: "more than 100 MB/s" means nothing without
 knowing the link, and high throughput usually means things are working. Custom metrics would need
 dynamic rule types and a metric registry, which is the line between this and a metrics warehouse the
-readme explicitly disclaims. Process liveness was the closest call and is discussed in section 21.
+readme explicitly disclaims. Process liveness was the closest call and is discussed in section 22.
 
 **Disk is judged on the newest reading, not the window average.** This is the first rule type to
 break that assumption, and deliberately. The window exists because CPU is spiky and needs a noise
@@ -770,7 +769,53 @@ pointer — into `logFields`. Under `LOG_FORMAT=json` that marshals fine, but th
 `%v` and would have printed a memory address. The log now carries the dereferenced value, and only
 when there is one.
 
-## 20. Fixed defects and remaining quality work
+## 20. Phase 22 as built — continuous sampling
+
+**The agent measured nothing unless asked.** `readHostMetrics` and `readFullestDisk` were called
+from exactly one place: the `/capture` HTTP handler. Nobody calling `/capture` meant no samples, no
+trend, and no evaluation — so what the readme called a fleet monitor was really an event pipeline
+that stamped host metrics onto whatever events happened to pass through. Twenty-one phases were
+built on that phrase without anyone checking whether the agent monitored anything on its own.
+
+**This repaired three features rather than adding one.**
+
+- *Threshold alerts could only fire by coincidence.* A CPU spike at three in the morning was
+  invisible unless something happened to call `/capture` during it. The rules were correct; they
+  were never given a chance to look.
+- *The five-event window was close to meaningless.* It averaged the last five times someone ran
+  curl, which could span seconds or weeks. Phase 21 noticed this and treated it as a disk-specific
+  quirk — "the window is counted in events, so a machine reporting hourly would alert on a
+  five-hour average". It was never disk-specific. With a sample a minute the window is five
+  minutes, which is what the moving average always meant to be.
+- *`AGENT_SILENT` was actively misleading.* It reads as "this machine may be down" but meant
+  "nobody curled it recently", so a healthy idle machine raised it. A false-alarm generator is
+  worse than no alarm, because it teaches an operator to ignore the board.
+
+**One path, two triggers.** `captureEvent` holds everything from sampling to delivery or queueing,
+and both the HTTP handler and the timer call it. Duplicating that logic for the timer is how the
+two would have drifted — one gaining a field or a metric the other missed. `captureEvent` returns
+the status and message the endpoint answers with, because that is already the vocabulary the queue
+classifies outcomes by; inventing a second enum that mapped one-to-one would have been worse.
+
+**The interval guard is load-bearing, not defensive.** `time.NewTicker` panics on a non-positive
+duration, so `SAMPLE_INTERVAL_SECONDS=0` would crash the agent at startup rather than disabling
+sampling — the same shape as B13, where a non-positive sweep period crashed the analytics service.
+Zero now disables it, and the agent logs a warning saying what that costs.
+
+**Samples are `INFO` and carry a fixed message.** A changing message would look like distinct
+errors to the repeated-error rule; an `ERROR` level would raise an alert on every healthy machine
+in the fleet once a minute.
+
+**Retention stopped being optional.** A sample a minute is 1,440 rows per machine per day — around
+26 million a year across fifty machines. `RETENTION_DAYS` now defaults to 30 rather than 0, because
+keeping everything forever is not a default anyone chooses; it is one they discover months later.
+`ConfigurationDefaultsTest` pins it, since the default deletes data.
+
+Note for an existing install: a `.env` copied from an older `.env.example` has `RETENTION_DAYS=0`
+written into it explicitly, so the new default does not reach it. That is deliberate — an upgrade
+should not silently start deleting history — but it does mean the line has to be changed by hand.
+
+## 21. Fixed defects and remaining quality work
 
 ### Fixed (keep these fixed — each has a way to regress)
 
@@ -862,6 +907,15 @@ break `depends_on: service_healthy` or make an orchestrator restart it in a loop
 issue a plain GET (`--output-document=/dev/null`), which behaves the same under either wget. Found
 by reading `docker compose ps` rather than trusting that the stack was up.
 
+**B18 — the agent only measured the machine when something asked it to.** Host metrics were
+sampled inside the `/capture` handler and nowhere else, so an idle machine produced no data at all.
+Threshold alerts could only fire if a request happened to coincide with the condition, the
+five-event moving average covered "the last five manual calls" rather than a span of time, and
+`AGENT_SILENT` fired on healthy machines that simply had nothing to report. Fixed by sampling on a
+timer through the same `captureEvent` path the endpoint uses. Found by a user asking why events had
+to be sent by hand — not by a test, because every test supplied its own events and so could never
+have noticed.
+
 ### Remaining quality work
 
 - **Timestamps.** Go now sends UTC `Z` values so lexical order matches chronological order, but rows
@@ -871,7 +925,7 @@ by reading `docker compose ps` rather than trusting that the stack was up.
   in memory alongside the SQL `lastDeliveredAt` lookup; a restart falls back to the SQL value, which
   is correct but means an in-flight reservation is lost. Fine for one instance, wrong for two.
 
-## 21. Roadmap and deferred work
+## 22. Roadmap and deferred work
 
 **The phase roadmap (1–15) is complete.** What follows is hardening for real use rather than new
 capability. Phases 16–20 are planned, one commit each, in this order.
@@ -916,6 +970,10 @@ assumed timestamp-normalisation task, which turned out on inspection not to be n
 **Phase 21 — Disk usage.** Done (see section 19). The one host sample judged worth adding: a full
 disk is the most common way a service on a small fleet dies quietly, and it fit the existing rule
 machinery without structural change.
+
+**Phase 22 — Continuous sampling.** Done (see section 20). The agent samples itself on a timer
+rather than only when `/capture` is called, which is what the word "monitor" had been promising
+since phase 1.
 
 ### Host samples considered and refused
 
@@ -982,7 +1040,7 @@ than changing databases.
 
 ---
 
-## 22. Definition of done for a release
+## 23. Definition of done for a release
 
 - Events are authenticated, validated, persisted transactionally, deduplicated, and queryable.
 - A temporary Java outage loses nothing and duplicates nothing.
@@ -993,12 +1051,12 @@ than changing databases.
 - Logs, metrics, health checks, and traces make a failure diagnosable without a debugger.
 
 Every item above is met, with one substitution: there are no traces, because OpenTelemetry was
-refused (section 21) and the correlation ID answers the same question across the single hop that
+refused (section 22) and the correlation ID answers the same question across the single hop that
 exists. TLS, retention, and the Phase 9–10 observability work — the three things an earlier version
 of this section named as blockers — all landed in phases 11, 13 and 9–10.
 
 What that does and does not mean: within its stated scope, EventWatch is a finished system rather
-than an unfinished one, and section 21 records what was refused rather than left undone. It is
+than an unfinished one, and section 22 records what was refused rather than left undone. It is
 still not a replacement for Datadog, CloudWatch, or a SIEM, for reasons that are about scope rather
 than incompleteness — no user identity or audit trail, one instance with no failover, and no
 secrets manager or tested restore procedure. The readme states those plainly.

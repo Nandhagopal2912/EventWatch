@@ -88,7 +88,9 @@ public record EngineConfiguration(
                 value(dotenv, "DATABASE_USER", ""),
                 value(dotenv, "DATABASE_PASSWORD", ""),
                 intValue(dotenv, "DATABASE_POOL_SIZE", 10),
-                intValue(dotenv, "RETENTION_DAYS", 0),
+                // Continuous sampling makes unbounded history a slow surprise rather than a
+                // choice: one sample a minute is 1,440 rows per machine per day.
+                intValue(dotenv, "RETENTION_DAYS", 30),
                 intValue(dotenv, "RETENTION_SWEEP_MINUTES", 60),
                 intValue(dotenv, "RATE_LIMIT_PER_MINUTE", 100),
                 Boolean.parseBoolean(value(dotenv, "TLS_ENABLED", "false")),
