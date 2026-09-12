@@ -59,8 +59,13 @@ class AnalyticsEngineIntegrationTest {
     }
 
     private EngineConfiguration configurationWithThresholds(double cpu, double ram, int repeatedErrors) {
+        return configurationWithThresholds(cpu, ram, 90.0, repeatedErrors);
+    }
+
+    private EngineConfiguration configurationWithThresholds(double cpu, double ram, double disk,
+            int repeatedErrors) {
         return new EngineConfiguration(0, databaseUrl, API_KEY, "text",
-                cpu, ram, repeatedErrors, false, "", 1, 1, 1, 0, 0, "", "", 2, 0, 60, 100,
+                cpu, ram, disk, repeatedErrors, false, "", 1, 1, 1, 0, 0, "", "", 2, 0, 60, 100,
                 false, "", "", "PKCS12", "", false, 10, 168, 60, "", 60, 5, 720, 10, true);
     }
 
@@ -446,5 +451,69 @@ class AnalyticsEngineIntegrationTest {
         JsonNode summary = MAPPER.readTree(get("/summary", true).body());
         assertEquals(0, summary.path("total_events").asLong());
         assertFalse(summary.path("latest_event").isMissingNode());
+    }
+
+    @Test
+    void diskTravelsFromIngestionThroughToTheQueryApi() throws Exception {
+        restart(configurationWithThresholds(85.0, 80.0, 90.0, 5));
+        String body = """
+                {"event_id":"disk-1","level":"INFO","host_id":"web-01","hostname":"web-01",
+                 "msg":"disk event","timestamp":"%s","cpu_usage":5,"ram_usage":5,
+                 "disk_usage":93.5,"disk_path":"/var"}""".formatted(Instant.now().toString());
+        assertEquals(200, post("/receive", body, true).statusCode());
+
+        JsonNode events = MAPPER.readTree(get("/events?limit=1", true).body());
+        JsonNode stored = events.path("items").get(0);
+        assertEquals(93.5, stored.path("disk_usage").asDouble(), 0.001);
+        assertEquals("/var", stored.path("disk_path").asText());
+
+        // The fleet listing reads each machine's newest reading, beside its version and queue.
+        JsonNode host = MAPPER.readTree(get("/hosts/web-01", true).body());
+        assertEquals(93.5, host.path("disk_usage").asDouble(), 0.001);
+        assertEquals("/var", host.path("disk_path").asText());
+
+        // And it crossed the threshold, so the machine has a disk alert naming its mount.
+        JsonNode alerts = MAPPER.readTree(get("/alerts", true).body());
+        assertEquals(1, alerts.size(), alerts.toString());
+        assertEquals("HIGH_DISK", alerts.get(0).path("alert_type").asText());
+        assertTrue(alerts.get(0).path("message").asText().contains("/var"),
+                alerts.get(0).path("message").asText());
+    }
+
+    @Test
+    void anEventWithoutDiskIsStoredAndReadBackAsUnknown() throws Exception {
+        restart(configurationWithThresholds(85.0, 80.0, 90.0, 5));
+        assertEquals(200, post("/receive", eventBody("nodisk-1", "INFO", 5, 5), true).statusCode());
+
+        JsonNode stored = MAPPER.readTree(get("/events?limit=1", true).body()).path("items").get(0);
+        assertTrue(stored.path("disk_usage").isNull(),
+                "an agent that reports no disk must read back as unknown, not as an empty one");
+        assertTrue(stored.path("disk_path").isNull());
+    }
+
+    @Test
+    void theDiskThresholdIsEditableThroughTheRulesApi() throws Exception {
+        restart(configurationWithThresholds(85.0, 80.0, 90.0, 5));
+        JsonNode defaults = MAPPER.readTree(get("/rules", true).body()).path("defaults");
+        assertEquals(90.0, defaults.path("HIGH_DISK").asDouble());
+
+        HttpRequest put = request("/rules")
+                .header("X-EventWatch-Key", API_KEY)
+                .header("Content-Type", "application/json")
+                .PUT(HttpRequest.BodyPublishers.ofString(
+                        "{\"rule_type\":\"HIGH_DISK\",\"host_id\":\"web-01\",\"threshold\":50}"))
+                .build();
+        assertEquals(200, client.send(put, HttpResponse.BodyHandlers.ofString()).statusCode());
+
+        JsonNode effective = MAPPER.readTree(get("/rules/effective?host_id=web-01", true).body());
+        boolean found = false;
+        for (JsonNode rule : effective.path("rules")) {
+            if ("HIGH_DISK".equals(rule.path("rule_type").asText())) {
+                assertEquals(50.0, rule.path("threshold").asDouble());
+                assertEquals("host", rule.path("source").asText());
+                found = true;
+            }
+        }
+        assertTrue(found, "the disk rule must appear in the effective set: " + effective);
     }
 }

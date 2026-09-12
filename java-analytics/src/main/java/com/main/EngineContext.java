@@ -71,6 +71,7 @@ class EngineContext {
                 new AlertRuleRepository(database.connections()),
                 configuration.cpuThreshold(),
                 configuration.ramThreshold(),
+                configuration.diskThreshold(),
                 configuration.repeatedErrorThreshold(),
                 configuration.agentSilenceMinutes(),
                 MOVING_AVERAGE_WINDOW);

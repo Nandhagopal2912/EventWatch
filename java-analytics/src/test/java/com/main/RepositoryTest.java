@@ -262,4 +262,46 @@ class RepositoryTest {
         assertNull(notifications.lastDeliveredAt("other"));
         assertEquals(1, notifications.findByAlertKey("cpu-high", 1).size());
     }
+
+    @Test
+    void diskSurvivesAStorageRoundTrip() throws SQLException {
+        LogEntry event = new LogEntry("disk-1", "INFO", "m", Instant.now(), "web-01", "web-01", 5.0, 5.0);
+        event.diskUsage = 93.5;
+        event.diskPath = "/var";
+        events.insertIfAbsent(event);
+
+        LogEntry stored = events.latest();
+        assertEquals(93.5, stored.diskUsage, 0.001);
+        assertEquals("/var", stored.diskPath);
+    }
+
+    @Test
+    void anEventWithoutDiskReadsBackAsNullRatherThanZero() throws SQLException {
+        // A row written before this column existed, or by an agent that cannot read a filesystem,
+        // must not come back claiming an empty disk.
+        events.insertIfAbsent(new LogEntry("nodisk-1", "INFO", "m", Instant.now(), "web-01", "web-01", 5.0, 5.0));
+
+        LogEntry stored = events.latest();
+        assertNull(stored.diskUsage, "no reading is not a zero reading");
+        assertNull(stored.diskPath);
+    }
+
+    @Test
+    void theFleetListingCarriesEachMachinesNewestDisk() throws SQLException {
+        LogEntry older = new LogEntry("d1", "INFO", "m", Instant.parse("2026-09-11T10:00:00Z"),
+                "web-01", "web-01", 5.0, 5.0);
+        older.diskUsage = 99.0;
+        older.diskPath = "/var";
+        events.insertIfAbsent(older);
+
+        LogEntry newer = new LogEntry("d2", "INFO", "m", Instant.parse("2026-09-11T11:00:00Z"),
+                "web-01", "web-01", 5.0, 5.0);
+        newer.diskUsage = 20.0;
+        newer.diskPath = "/var";
+        events.insertIfAbsent(newer);
+
+        EventRepository.HostSummary host = events.host("web-01");
+        assertEquals(20.0, host.diskUsage(), 0.001,
+                "a disk that has since been cleared must stop being reported as full");
+    }
 }

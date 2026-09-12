@@ -47,7 +47,7 @@ class PostgresBackendTest {
                 System.getenv("EVENTWATCH_TEST_POSTGRES_URL"),
                 API_KEY,
                 "text",
-                85.0, 80.0, 5,
+                85.0, 80.0, 90.0, 5,
                 false, "", 1, 1, 1, 0,
                 0,
                 System.getenv().getOrDefault("EVENTWATCH_TEST_POSTGRES_USER", "eventwatch"),

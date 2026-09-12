@@ -232,6 +232,13 @@ public class QueryService {
         } else {
             node.put("queue_depth", host.queueDepth());
         }
+        if (host.diskUsage() == null) {
+            node.putNull("disk_usage");
+            node.putNull("disk_path");
+        } else {
+            node.put("disk_usage", host.diskUsage());
+            node.put("disk_path", host.diskPath());
+        }
         node.put("event_count", host.eventCount());
         node.put("last_seen", host.lastSeen().toString());
 
@@ -253,6 +260,14 @@ public class QueryService {
         response.put("timestamp", event.timestamp.toString());
         response.put("cpu_usage", event.cpuUsage);
         response.put("ram_usage", event.ramUsage);
+        // Absent on a row from an older agent, and null rather than zero says so honestly.
+        if (event.diskUsage == null) {
+            response.putNull("disk_usage");
+            response.putNull("disk_path");
+        } else {
+            response.put("disk_usage", event.diskUsage);
+            response.put("disk_path", event.diskPath);
+        }
         return response;
     }
 }

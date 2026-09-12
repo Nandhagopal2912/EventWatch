@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/joho/godotenv"
 	"github.com/shirou/gopsutil/v4/cpu"
+	"github.com/shirou/gopsutil/v4/disk"
 	"github.com/shirou/gopsutil/v4/mem"
 )
 
@@ -36,6 +38,10 @@ type LogPayload struct {
 	Time          string  `json:"timestamp"`
 	CPUUsage      float64 `json:"cpu_usage"`
 	RAMUsage      float64 `json:"ram_usage"`
+	// A pointer so an unreadable disk is absent rather than zero: an empty disk and an unknown
+	// disk are not the same claim, and 0% would read as the healthiest possible machine.
+	DiskUsage *float64 `json:"disk_usage,omitempty"`
+	DiskPath  string   `json:"disk_path,omitempty"`
 }
 
 const maxBackendAttempts = 3
@@ -55,6 +61,8 @@ var (
 	queueWake                     = make(chan struct{}, 1)
 	queueMutex                    sync.Mutex
 	eventSequence                 uint64
+	// Empty means every real filesystem; DISK_PATHS narrows it to the mounts that matter.
+	configuredDiskPaths []string
 )
 
 func readHostMetrics() (float64, float64, error) {
@@ -69,6 +77,48 @@ func readHostMetrics() (float64, float64, error) {
 	}
 
 	return cpuPercent[0], memory.UsedPercent, nil
+}
+
+// readFullestDisk reports the most-used filesystem on this machine, and which mount that is.
+//
+// A machine has several mounts and the contract carries one reading, so the fullest is the one
+// worth reporting: it is the one that stops the machine working first. The mount travels with it
+// because "95% full" is only actionable once you know which disk. DISK_PATHS narrows the search
+// when only certain mounts matter — a containerised agent, for instance, sees its own overlay
+// filesystem rather than the host's disks unless the host is mounted in and named here.
+//
+// found is false when nothing can be read, and the agent then omits the field entirely.
+func readFullestDisk() (usedPercent float64, mountpoint string, found bool) {
+	paths := configuredDiskPaths
+	if len(paths) == 0 {
+		partitions, err := disk.Partitions(false)
+		if err != nil {
+			return 0, "", false
+		}
+		for _, partition := range partitions {
+			paths = append(paths, partition.Mountpoint)
+		}
+	}
+
+	for _, path := range paths {
+		usage, err := disk.Usage(path)
+		// A pseudo-filesystem reports no size; its "percent used" would be noise or a divide by zero.
+		if err != nil || usage == nil || usage.Total == 0 {
+			continue
+		}
+		percent := usage.UsedPercent
+		if math.IsNaN(percent) || math.IsInf(percent, 0) {
+			continue
+		}
+		// Reserved blocks can push a filesystem just past 100%. Java validates this field as a
+		// percentage and rejects the whole event otherwise, so one disk quirk must not cost an
+		// event that is otherwise fine.
+		percent = math.Min(math.Max(percent, 0), 100)
+		if !found || percent > usedPercent {
+			usedPercent, mountpoint, found = percent, path, true
+		}
+	}
+	return usedPercent, mountpoint, found
 }
 
 func logHandler(w http.ResponseWriter, r *http.Request) {
@@ -119,15 +169,27 @@ func logHandler(w http.ResponseWriter, r *http.Request) {
 		CPUUsage:      cpuUsage,
 		RAMUsage:      ramUsage,
 	}
+	// A machine with no readable filesystem still reports everything else it knows.
+	diskUsage, diskPath, diskFound := readFullestDisk()
+	if diskFound {
+		payload.DiskUsage = &diskUsage
+		payload.DiskPath = diskPath
+	}
 	metrics.recordCapture(level)
-	logInfo("captured event", logFields{
+	captured := logFields{
 		"host_id":        configuredHostID,
 		"correlation_id": correlationID,
 		"event_id":       payload.EventID,
 		"event_level":    level,
 		"cpu_usage":      cpuUsage,
 		"ram_usage":      ramUsage,
-	})
+	}
+	if diskFound {
+		// The value, not the pointer: the text formatter would print an address.
+		captured["disk_usage"] = diskUsage
+		captured["disk_path"] = diskPath
+	}
+	logInfo("captured event", captured)
 
 	jsonBytes, err := json.Marshal(payload)
 	if err != nil {
@@ -218,6 +280,7 @@ func main() {
 	backendClient = &http.Client{Timeout: 5 * time.Second}
 	configuredBackendURL = javaBackendURL
 	configuredIngestionCredential = ingestionCredential
+	configuredDiskPaths = splitPaths(getEnv("DISK_PATHS", ""))
 	queueDirectory = getEnv("PENDING_EVENTS_DIR", "pending-events")
 	queueCapacity = getIntEnv("QUEUE_CAPACITY", 1000)
 	queueRetryInterval = time.Duration(getIntEnv("QUEUE_RETRY_SECONDS", 5)) * time.Second
@@ -509,6 +572,17 @@ func getEnv(name, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+// splitPaths reads a comma-separated setting, dropping blanks so a trailing comma is harmless.
+func splitPaths(raw string) []string {
+	var paths []string
+	for _, candidate := range strings.Split(raw, ",") {
+		if trimmed := strings.TrimSpace(candidate); trimmed != "" {
+			paths = append(paths, trimmed)
+		}
+	}
+	return paths
 }
 
 func getIntEnv(name string, fallback int) int {

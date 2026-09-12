@@ -63,6 +63,16 @@ final class EventValidation {
                 && (!queueDepth.isIntegralNumber() || queueDepth.asLong() < 0)) {
             return "queue_depth must be a whole number of zero or more";
         }
+        // Disk is optional for the same reason identity is: an older agent sends neither, and a
+        // machine whose filesystems cannot be read still has CPU and RAM worth reporting.
+        JsonNode diskUsage = json.path("disk_usage");
+        if (!diskUsage.isMissingNode() && !diskUsage.isNull() && !isValidPercentage(json, "disk_usage")) {
+            return "disk_usage must be a number between 0 and 100";
+        }
+        String diskPathError = validateIdentity(json, "disk_path");
+        if (diskPathError != null) {
+            return diskPathError;
+        }
         return null;
     }
 
@@ -96,7 +106,7 @@ final class EventValidation {
     /** Reads an event into the model, assuming {@link #validate} has already passed. */
     static LogEntry toLogEntry(JsonNode json) {
         JsonNode depthNode = json.path("queue_depth");
-        return new LogEntry(
+        LogEntry event = new LogEntry(
                 json.path("event_id").asText(),
                 json.path("level").asText().toUpperCase(Locale.ROOT),
                 json.path("msg").asText(),
@@ -107,5 +117,11 @@ final class EventValidation {
                 depthNode.isIntegralNumber() ? depthNode.asInt() : null,
                 json.path("cpu_usage").asDouble(),
                 json.path("ram_usage").asDouble());
+        JsonNode diskNode = json.path("disk_usage");
+        if (diskNode.isNumber()) {
+            event.diskUsage = diskNode.asDouble();
+            event.diskPath = textOrNull(json, "disk_path");
+        }
+        return event;
     }
 }

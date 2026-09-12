@@ -17,7 +17,7 @@ downstream — per-host windows, per-host alert keys, the fleet listing — foll
 
 | Service | Language | Port | Role |
 | --- | --- | --- | --- |
-| `go-collector/` | Go 1.27, stdlib + gopsutil + godotenv | 8082 | One per machine: stable identity, version, host CPU/RAM, durable retry queue |
+| `go-collector/` | Go 1.27, stdlib + gopsutil + godotenv | 8082 | One per machine: stable identity, version, host CPU/RAM/disk, durable retry queue |
 | `java-analytics/` | Java 17, Maven, `com.sun.net.httpserver` + Jackson + sqlite-jdbc/PostgreSQL + HikariCP | 8080 | Validates, persists, evaluates per-host rules, serves query and rules API |
 | `dashboard/` | Static HTML/CSS/JS, no build step | served by analytics on 8080 | Reads the Java query API only; never touches SQLite |
 
@@ -88,6 +88,7 @@ go-collector/contract_test.go   Shared JSON contract, against testdata/
 go-collector/identity_test.go   Identity generation, persistence, overrides
 go-collector/security_test.go   Bind policy, capture auth, backend TLS trust
 go-collector/watchdog_test.go   Stall detection, recovery, payload, metrics
+go-collector/disk_test.go       Fullest-mount selection, unreadable paths, DISK_PATHS
 go-collector/Dockerfile         Static binary on alpine, queue on a volume
 
 java-analytics/src/main/java/com/main/
@@ -117,7 +118,8 @@ java-analytics/src/main/java/com/main/
   TelemetryReport.java          The running summary, as ASCII or as one log line
   EventRepository.java          Telemetry queries (find/count/latest/recent)
   AlertRepository.java          Alert upsert + lifecycle transitions
-  AlertEngine.java              Moving-window CPU/RAM/repeated-error rules
+  AlertEngine.java              Moving-window CPU/RAM/repeated-error rules; disk on the
+                                newest reading rather than the window - see section 19
   AlertRecord.java              Alert model     AlertStatus.java  OPEN|ACKNOWLEDGED|RESOLVED
   QueryService.java             JSON shaping for /events, /summary, alert DTOs
   NotificationRecord.java       Delivery-attempt row
@@ -183,7 +185,7 @@ Go → Java `POST /receive`, header `X-EventWatch-Key`, `Content-Type: applicati
 { "event_id": "...", "correlation_id": "...", "host_id": "...", "hostname": "web-01",
   "agent_version": "0.15.0", "queue_depth": 0,
   "level": "ERROR", "msg": "...", "timestamp": "2026-09-04T18:46:00Z",
-  "cpu_usage": 88.4, "ram_usage": 12.1 }
+  "cpu_usage": 88.4, "ram_usage": 12.1, "disk_usage": 91.7, "disk_path": "/var" }
 ```
 
 `correlation_id` is optional and carried in the payload so a queued event keeps it across a retry;
@@ -192,6 +194,10 @@ optional too — an agent older than Phase 12 sends neither and its events are a
 `unknown` — but bounded to 128 characters when present, because `host_id` becomes part of an alert
 key and a metric label. `agent_version` is bounded the same way and `queue_depth` must be a
 whole number of zero or more; both are optional, so an older agent still reports.
+`disk_usage` is the fullest filesystem the agent can see and `disk_path` names that mount;
+both are optional and **absent rather than zero** when no filesystem can be read, because an
+unknown disk and an empty one are not the same claim. `disk_usage` is validated as a
+percentage and `disk_path` is bounded at 128 characters like the identity fields.
 Rules: `level` ∈ INFO|WARN|ERROR|CRITICAL; `msg` 1–1000 chars; `event_id` 1–128 chars and unique
 (partial unique index makes retries idempotent); usages are finite numbers 0–100; body ≤ 64 KiB.
 Changes to this schema must stay backward compatible — additive fields only, never renames.
@@ -275,26 +281,27 @@ Changes to this schema must stay backward compatible — additive fields only, n
 
 ## 5. Current state — read before starting work
 
-**Phases 1–20 are complete — the whole planned roadmap.** Everything is green:
+**Phases 1–21 are complete.** Everything is green:
 
-- `cd java-analytics && mvn verify` → 241 tests, BUILD SUCCESS (12 of them need
-  `EVENTWATCH_TEST_POSTGRES_URL`; CI supplies a server, locally they skip)
-- `cd go-collector && go vet ./... && go test ./...` → 57 tests, pass
+- `cd java-analytics && mvn verify` → 255 tests, BUILD SUCCESS (12 of them need
+  `EVENTWATCH_TEST_POSTGRES_URL`; CI supplies a server, locally they skip). Verified against a real
+  PostgreSQL 16 container with all 255 running.
+- `cd go-collector && go vet ./... && go test ./...` → 64 tests, pass
 - `cd loadtest && go vet ./... && go test ./...` → 4 tests, pass
 - `docker compose up --build` → both services healthy
 - `scripts/outage-test.sh` → builds both images, kills analytics mid-traffic, proves zero loss;
   runs in CI on every push
 
-Phase 20 closed the three items the roadmap had left open: a real two-process outage test now
-runs automatically instead of being reverified by hand each phase; `/stress` is gone from the
-shipped binary now that `loadtest/` properly supersedes it; and the assumed timestamp-normalisation
-task turned out, on inspection, not to be needed — see section 18 for why.
+Phases 16–20 were hardening. Phase 21 is the first feature growth since the roadmap closed: the
+agent now samples disk as well as CPU and RAM, and `HIGH_DISK` joins the rule types. It was chosen
+over the other candidates deliberately — see section 19 for why network and custom metrics were
+refused rather than deferred.
 
-**The five hardening phases (16–20) are done.** What is next is a separate conversation: more host
-samples beyond CPU and RAM (disk, network, process liveness, custom application metrics), which
-Phase 14's rule machinery already accepts without structural change.
+**Nothing is planned after this.** The roadmap is finished and disk was the one addition judged
+worth making. Section 20 records what was considered and turned down, with the trigger that would
+justify reopening each.
 
-B1–B17 in section 19 are all fixed.
+B1–B17 in section 20 are all fixed.
 
 ## 6. Phase 8 as built — notifications
 
@@ -409,7 +416,7 @@ filters meaning exactly the same thing everywhere.
 sweeps rate windows. The cutoff is exclusive, delivery history is pruned alongside the events that
 produced it, and a failed sweep is logged rather than thrown so the timer thread survives.
 
-**What is deliberately NOT done, and when to revisit** — see section 20. Short version: the file
+**What is deliberately NOT done, and when to revisit** — see section 21. Short version: the file
 queue and the two-service shape are both still comfortably inside what the measurements justify.
 
 ## 10. Phase 12 as built — host identity
@@ -484,7 +491,7 @@ logs a startup warning.
 
 **Rules are read on every event, so they are cached** in `AlertRules` and replaced wholesale on
 each write. That is correct for one analytics instance; a second instance would need a refresh
-interval or change notification — the same limitation as notification reminders in section 19.
+interval or change notification — the same limitation as notification reminders in section 20.
 
 **A wiring bug the tests caught before commit:** the CORS preflight still advertised
 `GET, POST, OPTIONS`, because the edit replaced the first of two identical strings — in the
@@ -718,7 +725,52 @@ configured load generator in the production binary bought nothing `loadtest/` do
 better. `queueOrDrop`, the two stress-only constants, and the one test that asserted the route was
 still behind the key all went with it.
 
-## 19. Fixed defects and remaining quality work
+## 19. Phase 21 as built — disk usage
+
+**One sample was added, and three candidates were refused.** Disk, network, process liveness and
+custom application metrics were discussed together as "more host samples", but they are four
+different shapes and only one of them fits this system. Disk is a level from 0 to 100, exactly like
+CPU and RAM, so it needed no new machinery at all. Network is a rate, unbounded and per-interface,
+and — the disqualifying part — has no natural threshold: "more than 100 MB/s" means nothing without
+knowing the link, and high throughput usually means things are working. Custom metrics would need
+dynamic rule types and a metric registry, which is the line between this and a metrics warehouse the
+readme explicitly disclaims. Process liveness was the closest call and is discussed in section 21.
+
+**Disk is judged on the newest reading, not the window average.** This is the first rule type to
+break that assumption, and deliberately. The window exists because CPU is spiky and needs a noise
+filter; a filesystem is a level that moves over hours, so averaging it only delays the alert. Worse,
+the window is counted in *events* rather than minutes: a machine that reports hourly would alert on
+an average spanning five hours, and if the fullest mount changed between those events the average
+would blend two different disks. `AlertEngineTest.diskAlertsOnTheNewestReadingRatherThanTheWindowAverage`
+pins this — four healthy readings then one full disk averages to 39%, and the test was checked to
+fail when disk was switched to the averaged path.
+
+**The agent reports the fullest mount, and names it.** A machine has several filesystems and the
+contract carries one reading, so the fullest is the one worth alerting on — it is the one that stops
+the machine working first. The mount travels with it because "95% full" is only actionable once you
+know which disk, and the alert message reads `C: is 96.6% (threshold 90.0%)`. Enumerating partitions
+also solved the cross-platform default: there is no hardcoded `/` to break on Windows or `C:\` to
+break in a container. `DISK_PATHS` narrows the search when only certain mounts matter, which is what
+a containerised agent needs — it otherwise measures its own overlay filesystem.
+
+**Absent, never zero.** The payload field is a pointer on the Go side and nullable everywhere after
+it, so a machine whose filesystems cannot be read omits `disk_usage` entirely rather than reporting
+0%. Zero would read as the healthiest possible machine. The same reasoning runs through the whole
+path: an event with no disk reading leaves an existing alert exactly where it is rather than
+resolving it, because silence is not a recovery — the same judgement the watchdog makes when it
+withholds a heartbeat it cannot honestly send.
+
+**One clamp is defensive on purpose.** Reserved blocks can push a filesystem slightly past 100%, and
+Java validates this field as a percentage — so an unclamped reading would fail validation and cost
+the *whole event*, CPU and RAM included, over one disk quirk. The agent clamps to 0–100 and skips
+NaN rather than letting one optional sample sink the rest.
+
+**A bug caught while writing it:** the capture log line first passed `payload.DiskUsage` — a
+pointer — into `logFields`. Under `LOG_FORMAT=json` that marshals fine, but the text formatter uses
+`%v` and would have printed a memory address. The log now carries the dereferenced value, and only
+when there is one.
+
+## 20. Fixed defects and remaining quality work
 
 ### Fixed (keep these fixed — each has a way to regress)
 
@@ -819,7 +871,7 @@ by reading `docker compose ps` rather than trusting that the stack was up.
   in memory alongside the SQL `lastDeliveredAt` lookup; a restart falls back to the SQL value, which
   is correct but means an in-flight reservation is lost. Fine for one instance, wrong for two.
 
-## 20. Roadmap and deferred work
+## 21. Roadmap and deferred work
 
 **The phase roadmap (1–15) is complete.** What follows is hardening for real use rather than new
 capability. Phases 16–20 are planned, one commit each, in this order.
@@ -861,11 +913,41 @@ discipline the event contract follows.
 test that Phase 10 left open; `/stress` removed now that `loadtest/` covers it properly; and the
 assumed timestamp-normalisation task, which turned out on inspection not to be needed at all.
 
-**Agreed for discussion after Phase 20 — more host samples.** The agent samples only CPU and RAM.
-Disk usage, network, process liveness, or an application pushing its own custom metric would each
-widen what the system can alert on, and Phase 14's rule machinery already accepts new rule types
-without structural change. This is feature growth rather than hardening, so it is a separate
-conversation once the five phases above are done.
+**Phase 21 — Disk usage.** Done (see section 19). The one host sample judged worth adding: a full
+disk is the most common way a service on a small fleet dies quietly, and it fit the existing rule
+machinery without structural change.
+
+### Host samples considered and refused
+
+**Network — refused, not deferred.** It breaks the shape three ways: unbounded rather than 0–100,
+per-interface rather than per-host, and cumulative counters needing delta computation in the agent.
+The disqualifying one is simpler: there is no natural threshold to alert on. It is a graphing
+metric, and this system only has an alerting pipeline. Reopen only with a concrete "this would have
+paged me" case.
+
+**Custom application metrics — refused on scope.** Arbitrary `{name: value}` pairs would require
+dynamic rule types, a metric registry, and cardinality bounds. That is the step that turns this into
+a worse Prometheus, which already exists and can be run alongside. The readme's own scope line —
+not an APM, a log aggregator, or a metrics warehouse — is the reason.
+
+**Process liveness — refused, with the escape hatch already built.** It was the closest call and the
+second most valuable idea, but it crosses a line disk does not: CPU, RAM and disk are properties of
+*the machine*, while a process is a property of *what runs on* it. Accepting it invites "can it
+check a port?" and then "can it check an HTTP endpoint?", and the agent stops being a host agent.
+Anything on the host can already POST to `/capture` — a systemd `OnFailure=` hook, a cron script, a
+health check — so the capability exists without the agent needing to know what a process is, and it
+lives in that host's own configuration where something inherently per-machine belongs.
+
+The first cut of this idea looked cheaper than it was: emitting an event when a watched process
+disappears would have ridden `REPEATED_ERROR` for free, but repeated-error alerts never auto-resolve
+(section 12), so every restart would need hand-resolving. Auto-resolution would have required the
+agent to report *presence*, meaning a fourth scalar — which is where the generalisation pressure
+below starts.
+
+**The generalisation trigger.** CPU and RAM were two scalars; disk makes three, each hardcoded in
+about six places. Four is where the pull toward a `samples: {name: value}` map becomes real — and
+that map *is* the metrics-warehouse boundary. So: do not generalise. Reconsider only on a fifth
+proposed scalar, or the first request for a user-defined metric name.
 
 ### Deferred on evidence, not forgotten
 
@@ -900,7 +982,7 @@ than changing databases.
 
 ---
 
-## 21. Definition of done for a release
+## 22. Definition of done for a release
 
 - Events are authenticated, validated, persisted transactionally, deduplicated, and queryable.
 - A temporary Java outage loses nothing and duplicates nothing.

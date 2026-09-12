@@ -50,9 +50,10 @@ public class AlertEngine {
         notify(repository.resolve(alertKey(AgentSilenceMonitor.ALERT_RULE, hostId), now));
 
         evaluateThreshold(alertKey("cpu-high", hostId), rules.effective(AlertRules.HIGH_CPU, hostId),
-                hostId, "CPU", averageCpu, now);
+                hostId, "CPU average", averageCpu, now);
         evaluateThreshold(alertKey("ram-high", hostId), rules.effective(AlertRules.HIGH_RAM, hostId),
-                hostId, "RAM", averageRam, now);
+                hostId, "RAM average", averageRam, now);
+        evaluateDisk(recentEvents.get(recentEvents.size() - 1), hostId, now);
 
         AlertRules.EffectiveRule errorRule = rules.effective(AlertRules.REPEATED_ERROR, hostId);
         if (!errorRule.enabled()) {
@@ -73,11 +74,30 @@ public class AlertEngine {
         }
     }
 
+    /**
+     * Disk is judged on the newest reading, not the window average that CPU and RAM use.
+     *
+     * <p>CPU is spiky and needs the average as a noise filter; a filesystem is a level that moves
+     * over hours, so averaging it only delays the alert. The window is counted in events rather
+     * than minutes, so on a machine that reports rarely those five events can span hours — and if
+     * the fullest mount changes between them, the average would blend two different disks.
+     */
+    private void evaluateDisk(LogEntry latest, String hostId, Instant timestamp) throws SQLException {
+        // An agent that cannot read a filesystem, or one older than this feature, reports nothing
+        // here. Silence is not a recovery, so an alert already raised is left where it is.
+        if (latest.diskUsage == null) {
+            return;
+        }
+        String mount = latest.diskPath == null || latest.diskPath.isBlank() ? "disk" : latest.diskPath;
+        evaluateThreshold(alertKey("disk-high", hostId), rules.effective(AlertRules.HIGH_DISK, hostId),
+                hostId, mount, latest.diskUsage, timestamp);
+    }
+
     private void evaluateThreshold(String alertKey, AlertRules.EffectiveRule rule, String hostId,
             String resource, double value, Instant timestamp) throws SQLException {
         // A disabled rule no longer describes this machine, so an alert it raised is resolved.
         if (rule.enabled() && value >= rule.threshold()) {
-            String message = "%s average is %.1f%% (threshold %.1f%%)".formatted(resource, value, rule.threshold());
+            String message = "%s is %.1f%% (threshold %.1f%%)".formatted(resource, value, rule.threshold());
             notify(repository.saveOccurrence(new AlertRecord(alertKey, rule.ruleType(), hostId, message, timestamp)));
         } else {
             notify(repository.resolve(alertKey, timestamp));

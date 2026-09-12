@@ -30,12 +30,13 @@
       <article class="metric"><span>Active alerts</span><strong id="active-alerts">--</strong></article>
       <article class="metric"><span>Average CPU</span><strong id="average-cpu">--</strong></article>
       <article class="metric"><span>Average RAM</span><strong id="average-ram">--</strong></article>
+      <article class="metric"><span>Fullest disk</span><strong id="fullest-disk">--</strong></article>
     </section>
 
     <section class="grid">
       <article class="panel events-panel">
         <div class="panel-heading"><div><p class="eyebrow">RECENT TELEMETRY</p><h2>Events</h2></div><div class="panel-controls"><select id="host-filter" aria-label="Filter by machine"><option value="">All machines</option></select><button id="refresh" class="quiet" type="button">Refresh</button></div></div>
-        <div class="table-wrap"><table><thead><tr><th>Level</th><th>Machine</th><th>Message</th><th>Timestamp</th><th>CPU</th><th>RAM</th></tr></thead><tbody id="events-body"></tbody></table></div>
+        <div class="table-wrap"><table><thead><tr><th>Level</th><th>Machine</th><th>Message</th><th>Timestamp</th><th>CPU</th><th>RAM</th><th>Disk</th></tr></thead><tbody id="events-body"></tbody></table></div>
       </article>
       <article class="panel alerts-panel">
         <div class="panel-heading"><div><p class="eyebrow">RESPONSE QUEUE</p><h2>Active alerts</h2></div></div>
@@ -45,7 +46,7 @@
 
     <section class="panel fleet-panel">
       <div class="panel-heading"><div><p class="eyebrow">FLEET</p><h2>Machines</h2></div></div>
-      <div class="table-wrap"><table><thead><tr><th>Machine</th><th>Status</th><th>Last seen</th><th>Events</th><th>Agent</th><th>Queue</th><th></th></tr></thead><tbody id="fleet-body"></tbody></table></div>
+      <div class="table-wrap"><table><thead><tr><th>Machine</th><th>Status</th><th>Last seen</th><th>Events</th><th>Disk</th><th>Agent</th><th>Queue</th><th></th></tr></thead><tbody id="fleet-body"></tbody></table></div>
       <div id="host-detail" class="host-detail"></div>
     </section>
 
@@ -56,6 +57,7 @@
         <select id="rule-type" aria-label="Rule type">
           <option value="HIGH_CPU">High CPU (%)</option>
           <option value="HIGH_RAM">High RAM (%)</option>
+          <option value="HIGH_DISK">High disk (%)</option>
           <option value="REPEATED_ERROR">Repeated error (count in last 5 events)</option>
         </select>
         <select id="rule-host" aria-label="Applies to"><option value="">All machines</option></select>

@@ -42,6 +42,12 @@ public class EventRepository {
             }
             statement.setDouble(9, event.cpuUsage);
             statement.setDouble(10, event.ramUsage);
+            if (event.diskUsage == null) {
+                statement.setNull(11, java.sql.Types.DOUBLE);
+            } else {
+                statement.setDouble(11, event.diskUsage);
+            }
+            statement.setString(12, event.diskPath);
             int inserted = statement.executeUpdate();
             connection.commit();
             return inserted > 0;
@@ -56,7 +62,7 @@ public class EventRepository {
     public List<LogEntry> find(String level, String hostId, Instant from, Instant to,
             int limit, int offset) throws SQLException {
         StringBuilder query = new StringBuilder(
-                "SELECT event_id, level, message, event_timestamp, host_id, hostname, agent_version, queue_depth, cpu_usage, ram_usage "
+                "SELECT event_id, level, message, event_timestamp, host_id, hostname, agent_version, queue_depth, cpu_usage, ram_usage, disk_usage, disk_path "
                         + "FROM telemetry_events WHERE 1 = 1");
         List<String> parameters = new ArrayList<>();
         if (level != null) {
@@ -171,7 +177,13 @@ public class EventRepository {
                 + "(SELECT l.agent_version FROM telemetry_events l WHERE l.host_id = t.host_id "
                 + "ORDER BY l.event_timestamp DESC LIMIT 1) AS agent_version, "
                 + "(SELECT l.queue_depth FROM telemetry_events l WHERE l.host_id = t.host_id "
-                + "ORDER BY l.event_timestamp DESC LIMIT 1) AS queue_depth "
+                + "ORDER BY l.event_timestamp DESC LIMIT 1) AS queue_depth, "
+                // Newest rather than highest, for the same reason as the version above: a disk
+                // that has since been cleared should stop being reported as full.
+                + "(SELECT l.disk_usage FROM telemetry_events l WHERE l.host_id = t.host_id "
+                + "ORDER BY l.event_timestamp DESC LIMIT 1) AS disk_usage, "
+                + "(SELECT l.disk_path FROM telemetry_events l WHERE l.host_id = t.host_id "
+                + "ORDER BY l.event_timestamp DESC LIMIT 1) AS disk_path "
                 + "FROM telemetry_events t WHERE t.host_id IS NOT NULL"
                 + (hostId == null ? "" : " AND t.host_id = ?")
                 + " GROUP BY t.host_id ORDER BY last_seen DESC LIMIT ?";
@@ -192,7 +204,9 @@ public class EventRepository {
                             Instant.parse(results.getString("first_seen")),
                             Instant.parse(results.getString("last_seen")),
                             results.getString("agent_version"),
-                            results.getObject("queue_depth") == null ? null : results.getInt("queue_depth")));
+                            results.getObject("queue_depth") == null ? null : results.getInt("queue_depth"),
+                            results.getObject("disk_usage") == null ? null : results.getDouble("disk_usage"),
+                            results.getString("disk_path")));
                 }
             }
         }
@@ -218,11 +232,11 @@ public class EventRepository {
 
     /** A machine as the analytics service knows it. */
     public record HostSummary(String hostId, String hostname, long eventCount, Instant firstSeen,
-            Instant lastSeen, String agentVersion, Integer queueDepth) {
+            Instant lastSeen, String agentVersion, Integer queueDepth, Double diskUsage, String diskPath) {
     }
 
     public LogEntry latest() throws SQLException {
-        String query = "SELECT event_id, level, message, event_timestamp, host_id, hostname, agent_version, queue_depth, cpu_usage, ram_usage "
+        String query = "SELECT event_id, level, message, event_timestamp, host_id, hostname, agent_version, queue_depth, cpu_usage, ram_usage, disk_usage, disk_path "
                 + "FROM telemetry_events ORDER BY event_timestamp DESC LIMIT 1";
         try (Connection connection = connections.getConnection();
                 PreparedStatement statement = connection.prepareStatement(query);
@@ -236,7 +250,7 @@ public class EventRepository {
     }
 
     private LogEntry toLogEntry(ResultSet results) throws SQLException {
-        return new LogEntry(
+        LogEntry event = new LogEntry(
                 results.getString("event_id"),
                 results.getString("level"),
                 results.getString("message"),
@@ -247,5 +261,9 @@ public class EventRepository {
                 results.getObject("queue_depth") == null ? null : results.getInt("queue_depth"),
                 results.getDouble("cpu_usage"),
                 results.getDouble("ram_usage"));
+        // Rows written before this column existed read back as null, not as an empty disk.
+        event.diskUsage = results.getObject("disk_usage") == null ? null : results.getDouble("disk_usage");
+        event.diskPath = results.getString("disk_path");
+        return event;
     }
 }

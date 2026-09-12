@@ -19,6 +19,7 @@ const hostDetail = document.querySelector("#host-detail");
 const ruleLabels = {
   HIGH_CPU: "High CPU",
   HIGH_RAM: "High RAM",
+  HIGH_DISK: "High disk",
   REPEATED_ERROR: "Repeated error",
 };
 let knownHosts = [];
@@ -115,6 +116,13 @@ function describeSilence(seconds) {
   return `${Math.floor(total / 86400)}d ago`;
 }
 
+// A machine that cannot read a filesystem shows "--" rather than a reassuring 0%.
+function describeDisk(host) {
+  if (host.disk_usage === null || host.disk_usage === undefined) return "--";
+  const mount = host.disk_path ? ` ${escapeHtml(host.disk_path)}` : "";
+  return `${Number(host.disk_usage).toFixed(1)}%<span class="host-tag">${mount}</span>`;
+}
+
 function renderFleet(hosts) {
   fleetBody.innerHTML =
     hosts
@@ -124,12 +132,33 @@ function renderFleet(hosts) {
     <td><span class="badge ${host.status === "silent" ? "badge-silent" : ""}">${escapeHtml(host.status)}</span></td>
     <td>${escapeHtml(describeSilence(host.silent_seconds))}</td>
     <td>${Number(host.event_count)}</td>
+    <td>${describeDisk(host)}</td>
     <td class="host-tag">${escapeHtml(host.agent_version ?? "unknown")}</td>
     <td>${host.queue_depth === null || host.queue_depth === undefined ? "--" : Number(host.queue_depth)}</td>
     <td><button class="quiet" type="button" data-host="${escapeHtml(host.host_id)}">Details</button></td></tr>`,
       )
       .join("") ||
-    '<tr><td colspan="7" class="empty">No machines have reported yet.</td></tr>';
+    '<tr><td colspan="8" class="empty">No machines have reported yet.</td></tr>';
+  renderFullestDisk(hosts);
+}
+
+// The fleet's worst disk, computed from the listing the page already has rather than asking the
+// service for a number it would have to derive the same way. An average across machines would
+// hide the one that is about to fill up, which is the only machine worth naming here.
+function renderFullestDisk(hosts) {
+  const reported = hosts.filter(
+    (host) => host.disk_usage !== null && host.disk_usage !== undefined,
+  );
+  const tile = document.querySelector("#fullest-disk");
+  if (reported.length === 0) {
+    tile.textContent = "--";
+    return;
+  }
+  const worst = reported.reduce((a, b) => (b.disk_usage > a.disk_usage ? b : a));
+  // The machine is context; the number is the measurement, so it stays the headline.
+  tile.innerHTML = `${Number(worst.disk_usage).toFixed(1)}%<span class="metric-note">${escapeHtml(
+    worst.hostname ?? worst.host_id,
+  )}${worst.disk_path ? ` ${escapeHtml(worst.disk_path)}` : ""}</span>`;
 }
 
 async function showHostDetail(hostId) {
@@ -167,7 +196,7 @@ async function showHostDetail(hostId) {
     first seen ${escapeHtml(new Date(host.first_seen).toLocaleString())} ·
     last seen ${escapeHtml(new Date(host.last_seen).toLocaleString())}</p>
     <p>Last ${Number(host.averages.window)} events: CPU ${Number(host.averages.cpu).toFixed(1)}% ·
-    RAM ${Number(host.averages.ram).toFixed(1)}%</p>
+    RAM ${Number(host.averages.ram).toFixed(1)}% · disk ${describeDisk(host)} (latest)</p>
     <p class="alert-meta">${levels || "No events"}</p>
     <div class="host-detail-columns">
       <div><strong>Active alerts</strong><ul>${alerts}</ul></div>
@@ -194,10 +223,11 @@ function renderEvents(events) {
     <td class="host-tag" title="${escapeHtml(event.host_id ?? "")}">${escapeHtml(event.hostname ?? event.host_id ?? "unknown")}</td>
     <td title="${escapeHtml(event.msg)}">${escapeHtml(event.msg)}</td>
     <td>${escapeHtml(new Date(event.timestamp).toLocaleString())}</td><td>${Number(event.cpu_usage).toFixed(1)}%</td>
-    <td>${Number(event.ram_usage).toFixed(1)}%</td></tr>`,
+    <td>${Number(event.ram_usage).toFixed(1)}%</td>
+    <td>${event.disk_usage === null || event.disk_usage === undefined ? "--" : `${Number(event.disk_usage).toFixed(1)}%`}</td></tr>`,
       )
       .join("") ||
-    '<tr><td colspan="6" class="empty">No events found.</td></tr>';
+    '<tr><td colspan="7" class="empty">No events found.</td></tr>';
 }
 
 function renderAlerts(alerts) {
@@ -300,7 +330,9 @@ function showSignedIn(state) {
 // Signing out has to take the telemetry off the screen too: leaving the last view rendered on a
 // shared machine hands it to whoever sits down next.
 function clearPanels() {
-  for (const id of ["#host-count", "#total-events", "#active-alerts", "#average-cpu", "#average-ram"]) {
+  for (const id of [
+    "#host-count", "#total-events", "#active-alerts", "#average-cpu", "#average-ram", "#fullest-disk",
+  ]) {
     document.querySelector(id).textContent = "--";
   }
   eventsBody.innerHTML = "";

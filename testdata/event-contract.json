@@ -9,5 +9,7 @@
   "msg": "High CPU Saturation Alert",
   "timestamp": "2026-09-04T18:46:00Z",
   "cpu_usage": 88.4,
-  "ram_usage": 12.1
+  "ram_usage": 12.1,
+  "disk_usage": 91.7,
+  "disk_path": "/var"
 }

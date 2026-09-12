@@ -27,6 +27,8 @@ public class SqliteDialect implements SqlDialect {
                     queue_depth INTEGER,
                     cpu_usage REAL NOT NULL,
                     ram_usage REAL NOT NULL,
+                    disk_usage REAL,
+                    disk_path TEXT,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
                 """,
@@ -96,8 +98,8 @@ public class SqliteDialect implements SqlDialect {
     public String insertEventIgnoringDuplicates() {
         return "INSERT OR IGNORE INTO telemetry_events "
                 + "(event_id, level, message, event_timestamp, host_id, hostname, agent_version, queue_depth, "
-                + "cpu_usage, ram_usage) "
-                + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                + "cpu_usage, ram_usage, disk_usage, disk_path) "
+                + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
     }
 
     @Override
@@ -109,6 +111,8 @@ public class SqliteDialect implements SqlDialect {
         addColumn(statement, "ALTER TABLE alerts ADD COLUMN host_id TEXT");
         addColumn(statement, "ALTER TABLE telemetry_events ADD COLUMN agent_version TEXT");
         addColumn(statement, "ALTER TABLE telemetry_events ADD COLUMN queue_depth INTEGER");
+        addColumn(statement, "ALTER TABLE telemetry_events ADD COLUMN disk_usage REAL");
+        addColumn(statement, "ALTER TABLE telemetry_events ADD COLUMN disk_path TEXT");
     }
 
     private void addColumn(Statement statement, String ddl) throws SQLException {

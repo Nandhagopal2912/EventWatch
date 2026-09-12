@@ -13,6 +13,7 @@ public record EngineConfiguration(
         String logFormat,
         double cpuThreshold,
         double ramThreshold,
+        double diskThreshold,
         int repeatedErrorThreshold,
         boolean notificationsEnabled,
         String notificationWebhookUrl,
@@ -75,6 +76,7 @@ public record EngineConfiguration(
                 value(dotenv, "LOG_FORMAT", "json"),
                 doubleValue(dotenv, "CPU_ALERT_THRESHOLD", 85.0),
                 doubleValue(dotenv, "RAM_ALERT_THRESHOLD", 80.0),
+                doubleValue(dotenv, "DISK_ALERT_THRESHOLD", 90.0),
                 intValue(dotenv, "REPEATED_ERROR_THRESHOLD", 5),
                 Boolean.parseBoolean(value(dotenv, "NOTIFICATIONS_ENABLED", "false")),
                 value(dotenv, "NOTIFICATION_WEBHOOK_URL", ""),
@@ -112,7 +114,7 @@ public record EngineConfiguration(
      */
     public static EngineConfiguration forTesting(String databaseUrl, String apiKey) {
         return new EngineConfiguration(0, databaseUrl, apiKey, "text",
-                85.0, 80.0, 5, false, "", 1, 1, 1, 0, 0, "", "", 2, 0, 60, 100,
+                85.0, 80.0, 90.0, 5, false, "", 1, 1, 1, 0, 0, "", "", 2, 0, 60, 100,
                 false, "", "", "PKCS12", "", false, 10, 168, 60, "", 60, 5, 720, 10, true);
     }
 

@@ -20,6 +20,10 @@ class LogEntry {
     Instant timestamp;
     double cpuUsage;
     double ramUsage;
+    // Null when the agent could not read any filesystem. An unknown disk is not an empty one,
+    // so it stays absent rather than becoming a zero the rules would read as healthy.
+    Double diskUsage;
+    String diskPath;
 
     LogEntry(String eventId, String level, String message, Instant timestamp,
             double cpuUsage, double ramUsage) {

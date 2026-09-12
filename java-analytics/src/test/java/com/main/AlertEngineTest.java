@@ -30,7 +30,7 @@ class AlertEngineTest {
         database = TestSupport.openDatabase(temporaryDirectory, "alerts.db");
         alerts = new AlertRepository(database.connections());
         // A null notification service keeps these tests focused on the rules themselves.
-        engine = new AlertEngine(alerts, null, WINDOW, AlertRules.defaultsOnly(85.0, 80.0, 3, 10, WINDOW));
+        engine = new AlertEngine(alerts, null, WINDOW, AlertRules.defaultsOnly(85.0, 80.0, 90.0, 3, 10, WINDOW));
     }
 
     @AfterEach
@@ -55,6 +55,19 @@ class AlertEngineTest {
 
     private String key(String rule) {
         return AlertEngine.alertKey(rule, HOST);
+    }
+
+    /** A window whose readings each carry a disk level, oldest first. */
+    private List<LogEntry> diskWindow(String mount, double... readings) {
+        List<LogEntry> events = new ArrayList<>();
+        for (int index = 0; index < readings.length; index++) {
+            LogEntry event = new LogEntry(HOST + "-d" + index, "INFO", "m",
+                    Instant.parse("2026-09-11T10:00:00Z").plusSeconds(index), HOST, HOST, 1.0, 1.0);
+            event.diskUsage = readings[index];
+            event.diskPath = mount;
+            events.add(event);
+        }
+        return events;
     }
 
     @Test
@@ -227,5 +240,66 @@ class AlertEngineTest {
 
         assertEquals(2, alerts.findActive().size(), "one CPU alert and one RAM alert");
         assertEquals(3, alerts.findByKey(key("cpu-high")).getOccurrenceCount());
+    }
+
+    @Test
+    void diskAlertsOnTheNewestReadingRatherThanTheWindowAverage() throws SQLException {
+        // Four healthy readings then one full disk: the average is 39%, well under the threshold,
+        // but the machine is full right now. CPU is averaged because it is spiky; a filesystem is
+        // a level, and averaging it would only delay the alert.
+        engine.evaluate(diskWindow("/var", 10.0, 10.0, 10.0, 80.0, 95.0));
+
+        AlertRecord raised = alerts.findByKey(key("disk-high"));
+        assertNotNull(raised, "the newest reading is over the threshold, so the disk is full now");
+        assertTrue(raised.getMessage().contains("/var"),
+                "a percentage is only actionable with the mount: " + raised.getMessage());
+        assertTrue(raised.getMessage().contains("95.0"), raised.getMessage());
+    }
+
+    @Test
+    void aRecoveredDiskResolvesOnTheNextReading() throws SQLException {
+        engine.evaluate(diskWindow("/var", 95.0));
+        assertEquals(AlertStatus.OPEN, alerts.findByKey(key("disk-high")).getStatus());
+
+        engine.evaluate(diskWindow("/var", 20.0));
+        assertEquals(AlertStatus.RESOLVED, alerts.findByKey(key("disk-high")).getStatus(),
+                "space was freed, so the alert closes itself like CPU and RAM do");
+    }
+
+    @Test
+    void aFullDiskInTheWindowDoesNotAlertOnceItIsNoLongerTheNewest() throws SQLException {
+        // The mirror of the first test: a spike that has already been cleared must not alert.
+        engine.evaluate(diskWindow("/var", 99.0, 99.0, 99.0, 99.0, 10.0));
+        assertNull(alerts.findByKey(key("disk-high")),
+                "the machine has space now; an old reading is history, not an alert");
+    }
+
+    @Test
+    void anEventWithoutADiskReadingLeavesAnExistingAlertAlone() throws SQLException {
+        engine.evaluate(diskWindow("/var", 95.0));
+        assertEquals(AlertStatus.OPEN, alerts.findByKey(key("disk-high")).getStatus());
+
+        // An agent that cannot read its filesystem, or one older than this feature, reports no
+        // disk at all. Silence is not a recovery, so the alert must not be resolved by it.
+        engine.evaluate(window(5.0, 5.0, 1));
+
+        assertEquals(AlertStatus.OPEN, alerts.findByKey(key("disk-high")).getStatus(),
+                "no reading is not the same claim as a healthy reading");
+    }
+
+    @Test
+    void aMachineThatNeverReportsDiskNeverRaisesADiskAlert() throws SQLException {
+        engine.evaluate(window(5.0, 5.0, 5));
+        assertNull(alerts.findByKey(key("disk-high")));
+    }
+
+    @Test
+    void aDiskReadingWithoutAMountStillAlerts() throws SQLException {
+        List<LogEntry> events = diskWindow(null, 97.0);
+        engine.evaluate(events);
+
+        AlertRecord raised = alerts.findByKey(key("disk-high"));
+        assertNotNull(raised, "the reading is what matters; the mount is context");
+        assertTrue(raised.getMessage().startsWith("disk is"), raised.getMessage());
     }
 }

@@ -37,7 +37,7 @@ class AgentSilenceMonitorTest {
         events = new EventRepository(database.connections(), database.dialect());
         alerts = new AlertRepository(database.connections());
         rules = new AlertRules(new AlertRuleRepository(database.connections()),
-                85.0, 80.0, 5, SILENCE_MINUTES, 5);
+                85.0, 80.0, 90.0, 5, SILENCE_MINUTES, 5);
         metrics = new Metrics();
         monitor = new AgentSilenceMonitor(events, alerts, rules, null, metrics, 200, Duration.ofDays(7));
     }

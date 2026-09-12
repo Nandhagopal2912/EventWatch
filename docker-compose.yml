@@ -42,6 +42,7 @@ services:
       LOG_FORMAT: ${LOG_FORMAT:-json}
       CPU_ALERT_THRESHOLD: ${CPU_ALERT_THRESHOLD:-85}
       RAM_ALERT_THRESHOLD: ${RAM_ALERT_THRESHOLD:-80}
+      DISK_ALERT_THRESHOLD: ${DISK_ALERT_THRESHOLD:-90}
       REPEATED_ERROR_THRESHOLD: ${REPEATED_ERROR_THRESHOLD:-5}
       NOTIFICATIONS_ENABLED: ${NOTIFICATIONS_ENABLED:-false}
       NOTIFICATION_WEBHOOK_URL: ${NOTIFICATION_WEBHOOK_URL:-}
@@ -71,6 +72,9 @@ services:
       PENDING_EVENTS_DIR: /queue
       QUEUE_CAPACITY: ${QUEUE_CAPACITY:-1000}
       QUEUE_RETRY_SECONDS: ${QUEUE_RETRY_SECONDS:-5}
+      # Unset, the agent measures its own container filesystem. Mount the host and
+      # name the path here to watch the real disks instead.
+      DISK_PATHS: ${DISK_PATHS:-}
       LOG_FORMAT: ${LOG_FORMAT:-json}
     volumes:
       - collector-queue:/queue

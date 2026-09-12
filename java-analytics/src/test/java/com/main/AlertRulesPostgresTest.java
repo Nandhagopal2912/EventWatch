@@ -29,7 +29,7 @@ class AlertRulesPostgresTest {
         String url = System.getenv("EVENTWATCH_TEST_POSTGRES_URL");
         Assumptions.assumeTrue(url != null && !url.isBlank(), "no PostgreSQL server configured");
         database = Database.open(new EngineConfiguration(0, url, "rules-secret", "text",
-                85.0, 80.0, 5, false, "", 1, 1, 1, 0, 0,
+                85.0, 80.0, 90.0, 5, false, "", 1, 1, 1, 0, 0,
                 System.getenv("EVENTWATCH_TEST_POSTGRES_USER"),
                 System.getenv("EVENTWATCH_TEST_POSTGRES_PASSWORD"),
                 2, 0, 60, 100, false, "", "", "PKCS12", "", false, 10, 168, 60, "", 60, 5, 720, 10, true));
@@ -39,7 +39,7 @@ class AlertRulesPostgresTest {
             statement.executeUpdate("DELETE FROM alert_rules");
         }
         repository = new AlertRuleRepository(database.connections());
-        rules = new AlertRules(repository, 85.0, 80.0, 5, 10, 5);
+        rules = new AlertRules(repository, 85.0, 80.0, 90.0, 5, 10, 5);
     }
 
     @AfterEach

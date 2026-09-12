@@ -37,20 +37,22 @@ class ContractTest {
         JsonNode contract = contract();
         for (String field : new String[] {
                 "event_id", "correlation_id", "host_id", "hostname", "agent_version", "queue_depth",
-                "level", "msg", "timestamp", "cpu_usage", "ram_usage"}) {
+                "level", "msg", "timestamp", "cpu_usage", "ram_usage", "disk_usage", "disk_path"}) {
             assertTrue(contract.hasNonNull(field), "the contract must document " + field);
         }
-        assertEquals(11, contract.size(), "an undocumented field was added to the contract fixture");
+        assertEquals(13, contract.size(), "an undocumented field was added to the contract fixture");
         assertTrue(contract.path("timestamp").asText().endsWith("Z"), "timestamps are UTC");
         assertEquals(Instant.parse("2026-09-04T18:46:00Z"), Instant.parse(contract.path("timestamp").asText()));
     }
 
     @Test
     void theContractRemainsValidWithoutItsOptionalFields() throws IOException {
-        // The collector omits correlation_id when it is empty, and an agent older than
-        // phase 12 sends no identity at all; both must still validate.
+        // The collector omits correlation_id when it is empty, an agent older than phase 12 sends
+        // no identity at all, and a machine whose filesystems cannot be read sends no disk. All
+        // of them must still validate.
         for (String optional : new String[] {
-                "correlation_id", "host_id", "hostname", "agent_version", "queue_depth"}) {
+                "correlation_id", "host_id", "hostname", "agent_version", "queue_depth",
+                "disk_usage", "disk_path"}) {
             ObjectNode without = ((ObjectNode) contract()).deepCopy();
             without.remove(optional);
             assertNull(EventValidation.validate(without), "removing " + optional + " must still validate");
@@ -72,6 +74,16 @@ class ContractTest {
         negativeQueue.put("queue_depth", -1);
         assertTrue(EventValidation.validate(negativeQueue) != null,
                 "a negative queue depth is not a measurement");
+
+        ObjectNode impossibleDisk = ((ObjectNode) contract()).deepCopy();
+        impossibleDisk.put("disk_usage", 140.0);
+        assertTrue(EventValidation.validate(impossibleDisk) != null,
+                "disk usage is a percentage like the other two");
+
+        ObjectNode oversizedMount = ((ObjectNode) contract()).deepCopy();
+        oversizedMount.put("disk_path", "/".repeat(129));
+        assertTrue(EventValidation.validate(oversizedMount) != null,
+                "a mount path is bounded like every other text field");
     }
 
     @Test

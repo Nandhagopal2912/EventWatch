@@ -55,7 +55,7 @@ class DashboardServingTest {
     private EngineConfiguration configuration(String dashboardDirectory) {
         return new EngineConfiguration(0,
                 TestSupport.databaseUrl(temporaryDirectory, "dashboard.db"), API_KEY, "text",
-                85.0, 80.0, 5, false, "", 1, 1, 1, 0, 0, "", "", 2, 0, 60, 100,
+                85.0, 80.0, 90.0, 5, false, "", 1, 1, 1, 0, 0, "", "", 2, 0, 60, 100,
                 false, "", "", "PKCS12", dashboardDirectory, false, 10, 168, 60, "", 60, 5, 720, 10, true);
     }
 

@@ -45,7 +45,7 @@ class EngineLifecycleTest {
             int rateLimit, int poolSize) {
         return new EngineConfiguration(0,
                 TestSupport.databaseUrl(temporaryDirectory, fileName), API_KEY, "text",
-                85.0, 80.0, 5, false, "", 1, 1, 1, 0,
+                85.0, 80.0, 90.0, 5, false, "", 1, 1, 1, 0,
                 shutdownGraceSeconds, "", "", poolSize, 0, 60, rateLimit,
                 false, "", "", "PKCS12", "", false, 10, 168, 60, "", 60, 5, 720, 10, true);
     }
@@ -67,7 +67,7 @@ class EngineLifecycleTest {
     void aMissingApiKeyIsRejectedWithoutOpeningAPool() {
         EngineConfiguration withoutKey = new EngineConfiguration(0,
                 TestSupport.databaseUrl(temporaryDirectory, "nokey.db"), "  ", "text",
-                85.0, 80.0, 5, false, "", 1, 1, 1, 0, 0, "", "", 4, 0, 60, 100,
+                85.0, 80.0, 90.0, 5, false, "", 1, 1, 1, 0, 0, "", "", 4, 0, 60, 100,
                 false, "", "", "PKCS12", "", false, 10, 168, 60, "", 60, 5, 720, 10, true);
 
         Database.forgetLastOpened();
@@ -80,7 +80,7 @@ class EngineLifecycleTest {
     void anUnusableDatabaseUrlFailsWithoutLeakingAPool() {
         EngineConfiguration unusable = new EngineConfiguration(0,
                 "jdbc:mysql://localhost/eventwatch", API_KEY, "text",
-                85.0, 80.0, 5, false, "", 1, 1, 1, 0, 0, "", "", 4, 0, 60, 100,
+                85.0, 80.0, 90.0, 5, false, "", 1, 1, 1, 0, 0, "", "", 4, 0, 60, 100,
                 false, "", "", "PKCS12", "", false, 10, 168, 60, "", 60, 5, 720, 10, true);
 
         Database.forgetLastOpened();
@@ -126,7 +126,7 @@ class EngineLifecycleTest {
         }
 
         engine = AnalyticsEngine.start(new EngineConfiguration(0, databaseUrl, API_KEY, "text",
-                85.0, 80.0, 5, false, "", 1, 1, 1, 0, 0, "", "", 4, 0, 60, 100,
+                85.0, 80.0, 90.0, 5, false, "", 1, 1, 1, 0, 0, "", "", 4, 0, 60, 100,
                 false, "", "", "PKCS12", "", false, 10, 168, 60, "", 60, 5, 720, 10, true));
 
         try (Connection connection = DriverManager.getConnection(databaseUrl);
@@ -144,7 +144,7 @@ class EngineLifecycleTest {
         // from there on has to release it. A missing keystore is the cheapest way to get there.
         EngineConfiguration missingKeystore = new EngineConfiguration(0,
                 TestSupport.databaseUrl(temporaryDirectory, "keystore.db"), API_KEY, "text",
-                85.0, 80.0, 5, false, "", 1, 1, 1, 0, 0, "", "", 4, 0, 60, 100,
+                85.0, 80.0, 90.0, 5, false, "", 1, 1, 1, 0, 0, "", "", 4, 0, 60, 100,
                 true, temporaryDirectory.resolve("absent.p12").toString(), "changeit", "PKCS12",
                 "", false, 10, 168, 60, "", 60, 5, 720, 10, true);
 
@@ -161,7 +161,7 @@ class EngineLifecycleTest {
         // a non-positive delay, so RETENTION_SWEEP_MINUTES=0 with retention on killed startup.
         EngineConfiguration zeroSweep = new EngineConfiguration(0,
                 TestSupport.databaseUrl(temporaryDirectory, "sweep.db"), API_KEY, "text",
-                85.0, 80.0, 5, false, "", 1, 1, 1, 0, 0, "", "", 0, 7, 0, 0,
+                85.0, 80.0, 90.0, 5, false, "", 1, 1, 1, 0, 0, "", "", 0, 7, 0, 0,
                 false, "", "", "PKCS12", "", false, 10, 168, 60, "", 60, 5, 720, 10, true);
 
         assertEquals(60, zeroSweep.retentionSweepMinutes(), "a non-positive period falls back");

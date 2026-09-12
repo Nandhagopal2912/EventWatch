@@ -32,7 +32,7 @@ class AlertRulesTest {
                 TestSupport.databaseUrl(temporaryDirectory, "rules.db"), "rules-secret"));
         database.initializeSchema();
         repository = new AlertRuleRepository(database.connections());
-        rules = new AlertRules(repository, 85.0, 80.0, 5, 10, WINDOW);
+        rules = new AlertRules(repository, 85.0, 80.0, 90.0, 5, 10, WINDOW);
     }
 
     @AfterEach
@@ -102,7 +102,7 @@ class AlertRulesTest {
         rules.save(AlertRules.HIGH_CPU, "web-01", 91.0, true);
         rules.save(AlertRules.HIGH_CPU, null, 60.0, true);
 
-        AlertRules reloaded = new AlertRules(repository, 85.0, 80.0, 5, 10, WINDOW);
+        AlertRules reloaded = new AlertRules(repository, 85.0, 80.0, 90.0, 5, 10, WINDOW);
         assertEquals(91.0, reloaded.effective(AlertRules.HIGH_CPU, "web-01").threshold());
         assertEquals(60.0, reloaded.effective(AlertRules.HIGH_CPU, "db-01").threshold());
         assertTrue(reloaded.all().stream().anyMatch(AlertRule::fleetWide));
@@ -164,7 +164,7 @@ class AlertRulesTest {
 
     @Test
     void aConfigurationOnlyRuleSetResolvesButCannotBeChanged() {
-        AlertRules configurationOnly = AlertRules.defaultsOnly(85.0, 80.0, 5, 10, WINDOW);
+        AlertRules configurationOnly = AlertRules.defaultsOnly(85.0, 80.0, 90.0, 5, 10, WINDOW);
         assertEquals(85.0, configurationOnly.effective(AlertRules.HIGH_CPU, "web-01").threshold());
         assertThrows(IllegalStateException.class,
                 () -> configurationOnly.save(AlertRules.HIGH_CPU, null, 50.0, true));
@@ -175,5 +175,24 @@ class AlertRulesTest {
                 () -> rules.save(ruleType, hostId, threshold, true));
         assertTrue(failure.getMessage().contains(reasonFragment),
                 "expected the reason to mention \"" + reasonFragment + "\", got: " + failure.getMessage());
+    }
+
+    @Test
+    void diskIsAPercentageRuleLikeCpuAndRam() throws SQLException {
+        assertEquals(90.0, rules.effective(AlertRules.HIGH_DISK, "web-01").threshold(),
+                "the .env default is the bottom tier for disk too");
+        assertEquals(AlertRules.Source.DEFAULT, rules.effective(AlertRules.HIGH_DISK, "web-01").source());
+
+        rules.save(AlertRules.HIGH_DISK, "web-01", 70.0, true);
+        assertEquals(70.0, rules.effective(AlertRules.HIGH_DISK, "web-01").threshold());
+        assertEquals(AlertRules.Source.HOST, rules.effective(AlertRules.HIGH_DISK, "web-01").source());
+        assertEquals(90.0, rules.effective(AlertRules.HIGH_DISK, "db-01").threshold(),
+                "one machine's override must not move the fleet");
+    }
+
+    @Test
+    void aDiskThresholdOutsideAPercentageIsRefused() {
+        assertRejected(AlertRules.HIGH_DISK, null, 140.0, "percentage");
+        assertRejected(AlertRules.HIGH_DISK, null, -1.0, "percentage");
     }
 }

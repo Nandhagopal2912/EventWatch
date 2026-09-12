@@ -2,16 +2,16 @@
 
 EventWatch is a self-hosted fleet monitor for a small number of machines — a homelab, a handful of
 VPSes, a lab network. A lightweight Go agent runs on each host and reports that machine's events
-together with its CPU and RAM usage. A Java analytics service keeps per-host history, evaluates
-alert rules scoped to each machine, notices when a machine stops reporting, and notifies an
-operator. A static dashboard shows the fleet.
+together with its CPU, RAM, and disk usage. A Java analytics service keeps per-host history,
+evaluates alert rules scoped to each machine, notices when a machine stops reporting, and notifies
+an operator. A static dashboard shows the fleet.
 
 It is built without web frameworks, an ORM, or a DI container on either side, so every mechanism —
 retries, queueing, deduplication, alert state, delivery — is visible in the code rather than hidden
 behind configuration.
 
-**Status:** Phases 1–20 complete — the whole planned roadmap. 302 tests pass: 241 Java, 57 Go
-agent, 4 load harness, plus a scripted two-process outage test that runs in CI on every push.
+**Status:** Phases 1–21 complete. 323 tests pass: 255 Java, 64 Go agent, 4 load harness, plus a
+scripted two-process outage test that runs in CI on every push.
 `CLAUDE.md` is the working guide for contributors and records what is deliberately deferred.
 
 **Scope:** built for roughly 5–50 machines. It is not an APM, a log aggregator, or a metrics
@@ -25,8 +25,8 @@ live TLS handshake and a live cookie inspection rather than trusted on paper.
 
 Past that scope, the gap is specific rather than vague. There is no user identity: every signed-in
 operator is equivalent, so there is no record of *who* acknowledged or resolved an alert. There is
-one shared credential across the whole fleet until per-agent tokens land. There is exactly one
-analytics instance with no failover — an accepted tradeoff, not an oversight, but a real one.
+exactly one analytics instance with no failover — an accepted tradeoff, not an oversight, but a
+real one.
 Sessions live in memory, so restarting the service signs every operator out. And there is no
 secrets manager, no encryption at rest, and no tested restore procedure — just a database file you
 are responsible for. None of that is a defect to be fixed quietly; it is the honest boundary of
@@ -36,9 +36,9 @@ what a system built and reviewed by one person, at this scope, can claim.
 
 ## What it does
 
-**Collects.** Each agent accepts events on `GET /capture`, samples its own machine's CPU and RAM,
-and stamps every event with a stable host identity, a correlation ID, its own version, and its
-pending-queue depth. One agent runs per machine.
+**Collects.** Each agent accepts events on `GET /capture`, samples its own machine's CPU, RAM, and
+fullest filesystem, and stamps every event with a stable host identity, a correlation ID, its own
+version, and its pending-queue depth. One agent runs per machine.
 
 **Never loses an event.** If the analytics service is unreachable, the agent retries with bounded
 attempts, then writes the event atomically to a durable file queue. A background worker drains the
@@ -52,17 +52,21 @@ summaries, hosts, and alerts are queryable over a bounded JSON API. `RETENTION_D
 history when set.
 
 **Alerts per machine.** The engine evaluates each machine's last five events independently, so one
-busy host never drags an idle one into an alert. It raises `HIGH_CPU`, `HIGH_RAM`, `REPEATED_ERROR`,
-and `AGENT_SILENT` alerts, each keyed to the machine it concerns. Thresholds are rules you can set
-fleet-wide or for one machine.
+busy host never drags an idle one into an alert. It raises `HIGH_CPU`, `HIGH_RAM`, `HIGH_DISK`,
+`REPEATED_ERROR`, and `AGENT_SILENT` alerts, each keyed to the machine it concerns. Thresholds are
+rules you can set fleet-wide or for one machine.
+
+**Watches the disk that will fill first.** The agent reports its fullest filesystem and names the
+mount, so an alert reads `C: is 96.6% (threshold 90.0%)` rather than a percentage with no home. A
+full disk is the most common way a service dies quietly on a small fleet.
 
 **Notices silence.** A machine that stops reporting is invisible to every rule that needs an event.
 A background sweep raises `agent-silent@{host}` once a machine has been quiet past its threshold,
 and the machine's next event resolves the alert automatically.
 
 **Tracks an incident's life.** Alerts move through `OPEN` → `ACKNOWLEDGED` → `RESOLVED`. Further
-occurrences increment the count but never undo an acknowledgement. CPU and RAM alerts resolve
-themselves when the average recovers.
+occurrences increment the count but never undo an acknowledgement. CPU, RAM, and disk alerts
+resolve themselves once the machine recovers.
 
 **Notifies.** Every lifecycle change is POSTed as versioned JSON to a webhook, with bounded retries
 and a cooldown so a sustained alert reminds rather than floods. Every delivery attempt — successful
@@ -186,7 +190,14 @@ own class over a shared context, and the cross-cutting work every route repeated
 the method check, the API key, and turning a bad parameter into 400 and unreachable storage into 503
 — lives in one base class. The test that proves it starts two engines side by side.
 
-**17. A credential should bind an identity, not just gate a request.** A per-agent token is minted
+**17. A level is judged on its newest reading; a rate is judged on a window.** CPU and RAM are
+averaged over the last five events because they are spiky and the average is a noise filter. Disk is
+not: a filesystem moves over hours, so averaging only delays the alert — and because the window is
+counted in events rather than minutes, a machine that reports rarely would alert on an average
+spanning hours, blending two different mounts if the fullest one changed. Disk therefore alerts on
+the latest reading, and the dashboard says "(latest)" where it says "last 5 events" for the others.
+
+**18. A credential should bind an identity, not just gate a request.** A per-agent token is minted
 for one host, and ingestion stamps every event with that host regardless of what the payload
 claims — the token is the source of truth, not the message. This closes a gap the shared key could
 never close: with one key for the whole fleet, any caller holding it could claim to be any machine.
@@ -298,7 +309,9 @@ Agent → analytics, `POST /receive`, `Content-Type: application/json`:
   "msg": "High CPU Saturation Alert",
   "timestamp": "2026-09-04T18:46:00Z",
   "cpu_usage": 88.4,
-  "ram_usage": 12.1
+  "ram_usage": 12.1,
+  "disk_usage": 91.7,
+  "disk_path": "/var"
 }
 ```
 
@@ -310,6 +323,10 @@ when present; `queue_depth` must be zero or more. Bodies are limited to 64 KiB.
 Authenticating with a per-agent token overrides `host_id` regardless of what the body claims: the
 token is the source of truth for identity, not the payload. `host_id` can be left out entirely when
 a token is in use — the identity comes from which credential was presented.
+
+`disk_usage` is the fullest filesystem the agent can see, and `disk_path` names that mount. Both are
+omitted entirely when no filesystem can be read — never sent as `0`, which would read as the
+healthiest possible machine.
 
 ---
 
@@ -473,6 +490,10 @@ Thresholds are rules stored in the database rather than fixed values in `.env`. 
 2. a fleet-wide rule,
 3. the `.env` default (`CPU_ALERT_THRESHOLD`, `RAM_ALERT_THRESHOLD`, `REPEATED_ERROR_THRESHOLD`,
    `AGENT_SILENCE_MINUTES`).
+
+`HIGH_DISK` is judged on the machine's latest reading rather than the five-event average the other
+percentage rules use — a filesystem is a level, not a spike, and averaging it would only delay the
+alert.
 
 With no rules stored, every machine uses the defaults. Manage them from the dashboard's **Alert
 rules** panel or the API:
@@ -787,6 +808,8 @@ in-code fallback, so an absent key is never fatal.
 | `SESSION_RATE_LIMIT_PER_MINUTE` | `10` | Sign-in attempts allowed per address |
 | `AGENT_TOKEN` | empty | This agent's own credential; falls back to the shared key |
 | `SHARED_KEY_INGESTION_ENABLED` | `true` | Whether the fleet-wide key still authenticates ingestion |
+| `DISK_ALERT_THRESHOLD` | `90` | Percentage at which the fullest filesystem alerts |
+| `DISK_PATHS` | empty | Mounts the agent measures; empty means every real filesystem |
 | `METRICS_REQUIRE_KEY` | `false` | Close the analytics `/metrics` endpoint |
 | `HOST_ID` / `HOSTNAME_OVERRIDE` / `HOST_ID_FILE` | empty | Pin agent identity, rename it, or relocate its file |
 | `PENDING_EVENTS_DIR` | `pending-events` | Durable queue location |
@@ -834,6 +857,13 @@ in-code fallback, so an absent key is never fatal.
   rejection, not queued or retried, so a revoked agent's very next event fails outright — but
   nothing pushes that fact to the agent process itself. It keeps trying and logging the rejection
   until an operator notices and fixes its configuration.
+- **Disk is one reading per machine, not one per mount.** The agent reports its fullest
+  filesystem, so a machine raises a single disk alert naming the mount that is worst right now.
+  Acknowledging mounts independently would need the mount in the alert key, which has not been
+  needed at this scale.
+- **Network and custom application metrics were refused, not deferred.** Network has no natural
+  alerting threshold, and arbitrary user-defined metrics are the line between this and a metrics
+  warehouse; `CLAUDE.md` records the reasoning and what would justify reopening either.
 - **The watchdog still needs somewhere to point.** Phase 16 closed the silent-death gap from
   both directions, but the heartbeat has to reach an endpoint you run or subscribe to. That is
   the correct boundary — a monitor cannot be its own last line of defence — but it does mean
@@ -870,6 +900,7 @@ The project was built in phases; each is a single commit.
 | 18 | Operator session | Same-origin dashboard, HttpOnly session cookie, no CORS |
 | 19 | Per-agent credentials | Mint, bind, and revoke per-machine ingestion tokens |
 | 20 | Cleanup and closing gaps | Scripted outage test in CI, `/stress` removed |
+| 21 | Disk usage | Fullest-mount sampling, `HIGH_DISK` judged on the latest reading |
 
 `agent.md` is the original roadmap, kept for history. `CLAUDE.md` is the current authority on state,
 conventions, and what comes next.

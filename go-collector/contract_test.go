@@ -12,6 +12,9 @@ import (
 // are checked against one canonical event.
 const contractFixture = "../testdata/event-contract.json"
 
+// Addressable because the contract carries disk usage as an optional pointer.
+var contractDiskUsage = 91.7
+
 func loadContract(t *testing.T) map[string]any {
 	t.Helper()
 	contents, err := os.ReadFile(filepath.FromSlash(contractFixture))
@@ -40,6 +43,8 @@ func TestCollectorPayloadMatchesTheSharedContract(t *testing.T) {
 		Time:          "2026-09-04T18:46:00Z",
 		CPUUsage:      88.4,
 		RAMUsage:      12.1,
+		DiskUsage:     &contractDiskUsage,
+		DiskPath:      "/var",
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
@@ -60,7 +65,7 @@ func TestCollectorPayloadMatchesTheSharedContract(t *testing.T) {
 	}
 }
 
-func TestCorrelationIdIsTheOnlyOptionalField(t *testing.T) {
+func TestOptionalFieldsAreOmittedRatherThanSentEmpty(t *testing.T) {
 	// Everything else must always be sent, so Java validation cannot fail on a well-formed event.
 	encoded, err := json.Marshal(LogPayload{
 		EventID:  "e1",
@@ -76,8 +81,11 @@ func TestCorrelationIdIsTheOnlyOptionalField(t *testing.T) {
 		t.Fatalf("invalid JSON: %v", err)
 	}
 
-	if _, present := produced["correlation_id"]; present {
-		t.Error("an empty correlation id should be omitted, not sent as an empty string")
+	// An unreadable disk must be absent, not 0 - zero percent would read as an empty disk.
+	for _, optional := range []string{"correlation_id", "disk_usage", "disk_path"} {
+		if _, present := produced[optional]; present {
+			t.Errorf("unset optional field %q should be omitted, not sent empty", optional)
+		}
 	}
 	for _, required := range []string{
 		"event_id", "host_id", "hostname", "agent_version", "queue_depth",
