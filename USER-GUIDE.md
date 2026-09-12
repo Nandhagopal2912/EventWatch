@@ -84,7 +84,7 @@ Wait for a line containing `analytics engine started`.
 5. It registered its HTTP routes and started serving the dashboard from `../dashboard` at the same
    port as the API. Same-origin is what makes the login cookie possible at all.
 6. It started background timers: sweeping expired rate-limit windows, checking for machines that
-   have gone silent, and pruning old data if you ever set `RETENTION_DAYS`.
+   have gone silent, and pruning telemetry older than `RETENTION_DAYS` (30 by default).
 
 The service is now listening on **http://localhost:8080**. Leave this terminal running.
 

@@ -297,7 +297,7 @@ Phase 22 fixed the gap that made the phrase "fleet monitor" an overstatement: th
 itself on a timer instead of only when something calls `/capture`. Section 20 explains why that
 repaired three features rather than adding one.
 
-**Nothing is planned after this.** Section 21 records what was refused and the trigger that would
+**Nothing is planned after this.** Section 22 records what was refused and the trigger that would
 justify reopening each.
 
 B1–B18 in section 21 are all fixed.
@@ -918,17 +918,16 @@ have noticed.
 
 ### Remaining quality work
 
-- **Timestamps.** Go now sends UTC `Z` values so lexical order matches chronological order, but rows
-  written by older builds may carry a local offset. A one-off normalization pass would make range
-  filters exact for that history.
 - **Notification reminders are per-process.** `NotificationService` keeps a `reminderScheduledAt` map
   in memory alongside the SQL `lastDeliveredAt` lookup; a restart falls back to the SQL value, which
   is correct but means an in-flight reservation is lost. Fine for one instance, wrong for two.
 
 ## 22. Roadmap and deferred work
 
-**The phase roadmap (1–15) is complete.** What follows is hardening for real use rather than new
-capability. Phases 16–20 are planned, one commit each, in this order.
+**The phase roadmap (1–15) is complete**, and so is the hardening that followed it: phases 16–22
+each landed as one commit, in the order below. Nothing remains planned. What follows is kept as the
+record of why each was built the way it was, and — from "Host samples considered and refused"
+onward — what was deliberately not built and what would justify reopening it.
 
 **Phase 16 — Watchdog.** Done (see section 14). The monitor cannot be the only thing that knows it is alive. Two
 independent halves, neither needing another service:
