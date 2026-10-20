@@ -9,7 +9,7 @@ COPY *.go ./
 # A static binary needs no libc in the runtime image.
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/collector .
 
-FROM alpine:3.20
+FROM alpine:3.24
 RUN apk add --no-cache wget \
     && addgroup -S eventwatch && adduser -S eventwatch -G eventwatch
 WORKDIR /app
